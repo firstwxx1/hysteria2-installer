@@ -14,16 +14,17 @@
 #   全流程每一步都可读、可改、可单独重跑，**不下载任何第三方安装脚本**。
 #
 # ─────────────────────────────────────────────────────────────────────────
-# 它做了什么（8 步，每步都有回显）
+# 它做了什么（9 步，每步都有回显）
 #
 #   1. 环境检查：确认是 Alpine、是 root、有可用的目标磁盘
 #   2. 联网检查：确认能访问 Debian 镜像站（不通就给出修复提示）
 #   3. 抽取当前网络配置：网卡 / IP / 网关 / 掩码 / DNS（★ 防止重启后失联）
-#   4. 分区并格式化：单分区 MBR + ext4（对齐阿里云常见形态，不建 swap）
-#   5. debootstrap：从官方源释放 Debian 12 bookworm 最小根文件系统
-#   6. chroot 配置：装 cloud 内核 + GRUB + ssh，设密码、开 root 登录
-#   7. 写 fstab / 网络配置 / DNS / 主机名 / 时区
-#   8. 装 GRUB 引导（BIOS 模式）→ 卸载 → 重启
+#   4. 装工具：sfdisk / mkfs.ext4 / debootstrap 等（★ 必须在分区之前）
+#   5. 分区并格式化：单分区 MBR + ext4（对齐阿里云常见形态，不建 swap）
+#   6. debootstrap：从官方源释放 Debian 12 bookworm 最小根文件系统
+#   7. chroot 配置：装 cloud 内核 + GRUB + ssh，设密码、开 root 登录
+#   8. 写 fstab / 网络配置 / DNS / 主机名 / 时区
+#   9. 装 GRUB 引导（BIOS 模式）→ 卸载 → 重启
 #
 # ─────────────────────────────────────────────────────────────────────────
 # 用法
@@ -110,7 +111,7 @@ while [ $# -gt 0 ]; do
 done
 
 # ── 第 1 步：环境检查 ────────────────────────────────────────────────────
-info "第 1/8 步：检查运行环境"
+info "第 1/9 步：检查运行环境"
 
 [ "$(id -u)" = "0" ] || die "必须以 root 运行"
 
@@ -148,7 +149,7 @@ fi
 [ -n "$ROOT_PWD" ] || die "root 密码不能为空"
 
 # ── 第 2 步：联网检查 ────────────────────────────────────────────────────
-info "第 2/8 步：检查网络与外网连通性"
+info "第 2/9 步：检查网络与外网连通性"
 
 # Alpine 救援模式下网卡默认没有 IP，这里先尝试自动获取
 if ! ip route show default >/dev/null 2>&1 || [ -z "$(ip route show default 2>/dev/null)" ]; then
@@ -182,7 +183,7 @@ if ! nslookup "$DNS_HOST" >/dev/null 2>&1 && ! getent hosts "$DNS_HOST" >/dev/nu
 fi
 
 # ── 第 3 步：抽取网络配置（★ 防失联的关键）─────────────────────────────
-info "第 3/8 步：抽取当前网络配置（重装后用于恢复，防止失联）"
+info "第 3/9 步：抽取当前网络配置（重装后用于恢复，防止失联）"
 
 MAIN_IFACE=$(ip route show default 2>/dev/null | awk '{print $5}' | head -n1 | tr -d '[:space:]')
 MAIN_IP=$(ip -4 addr show "$MAIN_IFACE" 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1 | head -n1 | tr -d '[:space:]')
@@ -210,16 +211,47 @@ if [ "$ASSUME_YES" != "1" ] && [ "$DRY_RUN" != "1" ]; then
     [ "$_ans" = "yes" ] || die "已取消"
 fi
 
-# ── 第 4 步：分区 + 格式化 ───────────────────────────────────────────────
-info "第 4/8 步：分区并格式化 $DISK"
+# ── 第 4 步：先装工具（★ 必须在分区之前）────────────────────────────────
+#
+# ★ 实测踩坑：最初把 apk add 放在第 5 步（debootstrap 之前），结果第 4 步
+#   分区时就报 `sfdisk: not found` —— 因为 Alpine 救援模式是最小系统，
+#   sfdisk 属于 util-linux 包，默认没装。工具必须先装再用。
+info "第 4/9 步：安装所需工具"
+
+run apk update
+run apk add --no-cache debootstrap bash coreutils util-linux e2fsprogs \
+    grub grub-bios sfdisk parted openssl
+
+# 装完立刻确认关键命令都在，缺了就直接停下来（不要等到分区时才炸）
+if [ "$DRY_RUN" != "1" ]; then
+    _missing=""
+    for _c in sfdisk fdisk mkfs.ext4 debootstrap chroot blkid; do
+        command -v "$_c" >/dev/null 2>&1 || _missing="$_missing $_c"
+    done
+    if [ -n "$_missing" ]; then
+        die "以下命令缺失：$_missing
+       请检查网络后重试：apk update && apk add util-linux e2fsprogs debootstrap"
+    fi
+    ok "工具已就绪（sfdisk / fdisk / mkfs.ext4 / debootstrap 等）"
+fi
+
+# ── 第 5 步：分区 + 格式化 ───────────────────────────────────────────────
+info "第 5/9 步：分区并格式化 $DISK"
 
 # 先卸载可能已挂载的分区
 for p in "${DISK}"*; do
     [ -b "$p" ] && run umount "$p" 2>/dev/null || true
 done
 
-# 关掉可能存在的 swap
+# 关掉可能存在的 swap（alpine 救援模式常把磁盘当 swap 用，这会导致 Resource busy）
 run sh -c "swapoff -a 2>/dev/null || true"
+
+# 如果磁盘上有 LVM / mdraid，也一起停掉（同样会造成 Resource busy）
+run sh -c "vgchange -an 2>/dev/null || true"
+run sh -c "mdadm --stop --scan 2>/dev/null || true"
+
+# 等一小会儿，让上面这些操作真正释放设备
+[ "$DRY_RUN" != "1" ] && sleep 1
 
 # 单分区 MBR：一个从 2048 扇区开始、占满整盘的 83 类型分区。
 #
@@ -234,11 +266,34 @@ run sh -c "swapoff -a 2>/dev/null || true"
 if [ "$DRY_RUN" = "1" ]; then
     printf '    %s[dry-run]%s sfdisk %s  <<< ",,83,*"\n' "$c_ylw" "$c_rst" "$DISK"
 else
-    if ! printf ',,83,*\n' | sfdisk --label dos --no-reread "$DISK"; then
-        warn "sfdisk 分区失败，尝试 fdisk 兜底"
-        printf 'o\nn\np\n1\n2048\n\n\na\n1\nw\n' | fdisk "$DISK" || die "分区失败，请手动分区"
+    # 先清干净旧分区表（防止旧表残留导致 sfdisk 判断成"已存在"而跳过）
+    run sh -c "dd if=/dev/zero of='$DISK' bs=512 count=1 conv=notrunc 2>/dev/null || true"
+
+    _parted_ok=0
+    if printf ',,83,*\n' | sfdisk --label dos --no-reread "$DISK"; then
+        _parted_ok=1
     fi
+
+    if [ "$_parted_ok" = "0" ]; then
+        warn "sfdisk 分区失败，尝试 fdisk 兜底"
+        # 新版 fdisk 用 `printf` 喂交互序列确实不稳，改用 --no-reread 明确告诉它别去重读
+        if printf 'o\nn\np\n1\n2048\n\n\nw\n' | fdisk --no-reread "$DISK"; then
+            _parted_ok=1
+        fi
+    fi
+
+    [ "$_parted_ok" = "1" ] || die "分区失败。请手动执行 fdisk $DISK 分区后再重跑本脚本"
     ok "分区表已写入（MBR，单分区）"
+
+    # 明确通知内核重读分区表（用多个手段，总有一个能成）
+    partprobe "$DISK" 2>/dev/null || \
+    blockdev --rereadpt "$DISK" 2>/dev/null || \
+    hdparm -z "$DISK" >/dev/null 2>&1 || \
+    true
+    # reread 失败不致命：下面会用 partx 兜底把分区节点造出来
+    if ! [ -b "${DISK}1" ] && ! [ -b "${DISK}p1" ]; then
+        partx -a "$DISK" 2>/dev/null || true
+    fi
 fi
 
 # 确定分区设备名：
@@ -253,8 +308,6 @@ case "$DISK" in
 esac
 ok "根分区：$ROOT_PART"
 
-# 让内核重新读取分区表
-run sh -c "partprobe '$DISK' 2>/dev/null || blockdev --rereadpt '$DISK' 2>/dev/null || true"
 if [ "$DRY_RUN" != "1" ]; then
     # 等分区设备节点出现（最多等 10 秒）
     _w=0
@@ -268,13 +321,8 @@ fi
 info "格式化 $ROOT_PART 为 ext4"
 run mkfs.ext4 -F -L debian "$ROOT_PART"
 
-# ── 第 5 步：debootstrap ─────────────────────────────────────────────────
-info "第 5/8 步：安装 debootstrap 并释放 Debian 根文件系统"
-
-# Alpine 里装 debootstrap 所需工具
-run apk update
-run apk add --no-cache debootstrap bash coreutils util-linux e2fsprogs \
-    grub grub-bios sfdisk parted openssl
+# ── 第 6 步：debootstrap ─────────────────────────────────────────────────
+info "第 6/9 步：释放 Debian 根文件系统"
 
 run mkdir -p "$MOUNT_DIR"
 run mount "$ROOT_PART" "$MOUNT_DIR"
@@ -298,8 +346,8 @@ nameserver 8.8.8.8"
     info "非阿里云内网环境，将使用公共 DNS 223.5.5.5 / 8.8.8.8"
 fi
 
-# ── 第 6 步：chroot 配置 ─────────────────────────────────────────────────
-info "第 6/8 步：chroot 进新系统做配置"
+# ── 第 7 步：chroot 配置 ─────────────────────────────────────────────────
+info "第 7/9 步：chroot 进新系统做配置"
 
 # 把必要的虚拟文件系统挂进去，chroot 才能正常工作
 for fs in dev proc sys; do
@@ -380,8 +428,8 @@ else
     ok "chroot 配置完成"
 fi
 
-# ── 第 7 步：网络配置 + swap ─────────────────────────────────────────────
-info "第 7/8 步：写网络配置"
+# ── 第 8 步：网络配置 + swap ─────────────────────────────────────────────
+info "第 8/9 步：写网络配置"
 
 NET_CFG=$(cat <<NET_EOF
 # 由 alpine2debian.sh 生成
@@ -416,8 +464,8 @@ else
     info "SWAP_MB=0，不创建 swap（对齐最小化系统）"
 fi
 
-# ── 第 8 步：装 GRUB ─────────────────────────────────────────────────────
-info "第 8/8 步：安装 GRUB 引导（BIOS 模式）"
+# ── 第 9 步：装 GRUB ─────────────────────────────────────────────────────
+info "第 9/9 步：安装 GRUB 引导（BIOS 模式）"
 
 if [ "$DRY_RUN" = "1" ]; then
     printf '    %s[dry-run]%s grub-install --target=i386-pc %s\n' "$c_ylw" "$c_rst" "$DISK"
