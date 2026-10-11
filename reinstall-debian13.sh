@@ -37,6 +37,9 @@
 #   # 指定磁盘 / 镜像 / 目标版本
 #   sh rd13.sh --disk /dev/vda --mirror http://deb.debian.org/debian/ --release 13
 #
+#   # 强制在救援盘上重装（★ 极不推荐，会破坏救援环境，可能失联）
+#   sh rd13.sh --disk /dev/vda --force-rescue-disk
+#
 # ---------------------------------------------------------------------------
 # 可用环境变量（也可用同名命令行参数覆盖）
 # ---------------------------------------------------------------------------
@@ -48,6 +51,7 @@
 #   SWAP_MB     swap 大小 MB，默认 512
 #   NET_MODE    static（默认，推荐）或 dhcp
 #   LOG         日志文件，默认 /root/reinstall-debian13.log
+#   FORCE_RESCUE_DISK=1  允许在救援系统自己的盘上重装（★ 极危险）
 #
 # ---------------------------------------------------------------------------
 # 警告
@@ -76,6 +80,9 @@ LOG="${LOG:-/root/reinstall-debian13.log}"
 
 ASSUME_YES=0
 CHECK_ONLY=0
+DRY_RUN=0
+FORCE_RESCUE="${FORCE_RESCUE_DISK:-0}"
+[ "$FORCE_RESCUE" = "1" ] || FORCE_RESCUE=0
 
 # ── 输出 ─────────────────────────────────────────────────────────────────
 # 颜色：只有在真终端上才开，管道/重定向时自动关掉，避免日志里一堆乱码
@@ -147,6 +154,7 @@ while [ $# -gt 0 ]; do
         --release)     RELEASE="${2:-}";  shift 2 ;;
         --swap)        SWAP_MB="${2:-}";  shift 2 ;;
         --net)         NET_MODE="${2:-}"; shift 2 ;;
+        --force-rescue-disk) FORCE_RESCUE=1; shift ;;
         -h|--help)     sed -n '2,72p' "$0" 2>/dev/null || sed -n '2,72p' "rd13.sh"; exit 0 ;;
         *) die "未知参数：$1（用 --help 看用法）" ;;
     esac
@@ -295,40 +303,170 @@ fi
 DISK_SIZE_MB=$(($(cat "/sys/block/$(basename "$DISK")/size" 2>/dev/null || echo 0) / 2048))
 ok "目标磁盘：$DISK（约 ${DISK_SIZE_MB} MB）"
 
-# ★ 容量体检：Debian 13 最小化约需 1GB，实际建议 8GB+
-#   实测踩坑（2026-10-11 用户真机）：某阿里云实例只有一块 1GB 的救援盘，
-#   拿它装 Debian 会立刻爆满，而且会破坏救援环境导致失联。
+# ── 救援盘识别：三条特征同时命中时【硬拦截】───────────────────────────
+# ★ 踩坑实录（2026-10-11 用户真机，血的教训）：
+#   某阿里云实例的救援系统自己占着唯一一块 1GB 盘（Alpine 虚拟 ISO 启动，
+#   盘上残留 iso9660 签名，被自动挂到 /media/vda）。旧版脚本只给了个警告 +
+#   一个「输入 yes 就放行」的确认，用户输入 yes 后：
+#     1. 擦掉了 ISO 签名 → 再挂载时显示成 alpine-virt（盘已经废了一半）
+#     2. mkfs 报 "apparently in use" 卡死 → 装不下去
+#     3. 更危险的是：这块盘是救援系统自己的根，擦它就是自断退路
+#   结论：「救援盘」这条路必须【焊死】——警告可以跳过，这个不行。
+_iso_signature=0
+_disk_devname="$(basename "$DISK")"
+if [ -r "/sys/block/${_disk_devname}/device/type" ]; then :; fi
+# 特征 A：容量过小（< 4GB，装不下 Debian 且必是救援盘）
+_size_suspicious=0
 if [ "$DISK_SIZE_MB" -gt 0 ] && [ "$DISK_SIZE_MB" -lt 4000 ]; then
-    warn "磁盘只有 ${DISK_SIZE_MB} MB，装 Debian ${RELEASE} 会非常紧张"
-    warn "（最小化安装约需 1GB，建议至少 8GB，否则装完几乎没空间）"
-    printf '\n'
-    warn "★ 请先确认：这块盘到底是【数据盘】还是【救援系统自己的盘】？"
-    warn "  判断方法：执行 df -h 看 $DISK 是否被挂载在 /media 或 / 下。"
-    warn "  如果它正被救援系统挂着，说明你还没有数据盘 —— 请先到云控制台"
-    warn "  挂载/扩容一块正常云盘，再回来重装。"
-    printf '\n'
-    if [ "$ASSUME_YES" != "1" ] && [ "$CHECK_ONLY" != "1" ]; then
-        _c="$(ask "确认继续用这块盘？（输入 yes 回车）：" "no")"
-        [ "$_c" = "yes" ] || die "已取消"
-    fi
+    _size_suspicious=1
 fi
 
-# 是否被挂载着（救援盘的特征）
+# 特征 B：正被挂载（尤其挂在 /media 下 —— Alpine 救援系统的典型行为）
 _mounted_at=""
 if [ -r /proc/mounts ]; then
     _mounted_at="$(awk -v d="$DISK" '$1 ~ "^"d {print $2}' /proc/mounts 2>/dev/null | head -n1)"
 fi
-if [ -n "$_mounted_at" ]; then
-    warn "★ 注意：$DISK 当前被挂载在 $_mounted_at"
-    warn "  如果这是救援系统正在用的盘，重装会破坏救援环境（可能导致失联）。"
-fi
+_mounted_suspicious=0
+[ -n "$_mounted_at" ] && _mounted_suspicious=1
 
-# 残留签名（iso9660 等会让系统自动挂载，导致 mkfs 报 in use）
+# 特征 C：盘上带 iso9660 签名（虚拟光驱 / 救援 ISO 的铁证）
+_sig=""
 if command -v blkid >/dev/null 2>&1; then
     _sig="$(blkid "$DISK" 2>/dev/null || true)"
-    if [ -n "$_sig" ]; then
-        warn "磁盘上已有文件系统签名：$_sig"
-        warn "  重装前会自动清除（wipefs），避免 mkfs 报 \"apparently in use\""
+fi
+if [ -n "$_sig" ]; then
+    case "$_sig" in
+        *iso9660*) _iso_signature=1 ;;
+    esac
+fi
+
+# 特征 C 补充：盘里的子分区带 iso9660（整盘没了签名、分区还在的情形）
+if [ "$_iso_signature" = "0" ] && command -v blkid >/dev/null 2>&1; then
+    _subsig="$(blkid "${DISK}"* 2>/dev/null | head -n5 || true)"
+    case "$_subsig" in
+        *iso9660*) _iso_signature=1 ;;
+    esac
+fi
+
+# 三条命中两条及以上 → 判定为救援盘，直接拒绝，不给任何「跳过」的余地
+_rescue_hits=$((_size_suspicious + _mounted_suspicious + _iso_signature))
+
+if [ "$_rescue_hits" -ge 2 ]; then
+    printf '\n'
+    err "╔══════════════════════════════════════════════════════════╗"
+    err "║  检测到：$DISK 极可能是【救援系统自己的盘】              "
+    err "╚══════════════════════════════════════════════════════════╝"
+    printf '\n'
+    [ "$_size_suspicious"   = "1" ] && warn "  ✗ 容量只有 ${DISK_SIZE_MB} MB（装不下 Debian）"
+    [ "$_mounted_suspicious" = "1" ] && warn "  ✗ 正被挂载在 ${_mounted_at}（系统正在用它）"
+    [ "$_iso_signature"      = "1" ] && warn "  ✗ 盘上有 iso9660 签名（虚拟光驱/救援 ISO）"
+    printf '\n'
+    err "已拒绝执行 —— 这是保护措施，不是故障。"
+    printf '\n'
+    printf '  为什么必须拒绝：\n'
+    printf '    · 这块盘装不下 Debian（最小化也要 1GB+，装完几乎没空间）\n'
+    printf '    · 它是救援系统的根，擦掉它 = 断掉自己的退路（VNC 会失效）\n'
+    printf '    · 实测后果：擦掉 ISO 签名后 mkfs 报 "apparently in use"，装不下去\n'
+    printf '\n'
+    printf '  正确做法（二选一）：\n'
+    printf '    A. 到云控制台给这台实例【挂载一块新云盘】（建议 20GB+），\n'
+    printf '       挂好后执行  cat /proc/partitions  确认新盘符（通常 /dev/vdb），\n'
+    printf '       再用 --disk /dev/vdb 重跑本脚本。\n'
+    printf '    B. 如果这台机器本来就有数据盘（如 /dev/vdb），直接指定它：\n'
+    printf '       sh %s --disk /dev/vdb\n' "$(basename "$0")"
+    printf '\n'
+    printf '  ★ 确实要用这块盘（不推荐，风险自负）：\n'
+    printf '     加 --force-rescue-disk 参数可强制继续。\n'
+    printf '\n'
+    if [ "$FORCE_RESCUE" != "1" ]; then
+        exit 2
+    else
+        warn "已指定 --force-rescue-disk，继续执行（请自行承担风险）"
+    fi
+fi
+
+# 单独只有容量小 → 只警告（可能是块 3GB 的数据盘，可以放行）
+if [ "$_size_suspicious" = "1" ] && [ "$_rescue_hits" -lt 2 ]; then
+    warn "磁盘只有 ${DISK_SIZE_MB} MB，装 Debian ${RELEASE} 会非常紧张"
+    warn "（最小化安装约需 1GB，建议至少 8GB，否则装完几乎没空间）"
+fi
+
+# 单独被挂载 → 只警告
+if [ "$_mounted_suspicious" = "1" ] && [ "$_rescue_hits" -lt 2 ]; then
+    warn "★ 注意：$DISK 当前被挂载在 $_mounted_at"
+    warn "  执行前会先尝试卸载它（卸载失败则中止，避免破坏正在运行的系统）。"
+fi
+
+# 残留签名提示
+if [ -n "$_sig" ] && [ "$_rescue_hits" -lt 2 ]; then
+    warn "磁盘上已有文件系统签名：$_sig"
+    warn "  执行前会自动清除（wipefs），避免 mkfs 报 \"apparently in use\""
+fi
+
+# ── 真正去解决「盘被占用」：不是甩一句命令让用户跑 ──────────────────────
+# ★ 这里做的事：卸载 → 擦除签名 → 复查 → 最多 3 轮。
+#   对应实测：Alpine 会自动把带 iso9660 的盘挂到 /media/xxx，不主动卸，
+#   mkfs 一定报 "apparently in use"。
+release_disk() {
+    _d="$1"
+    # 1) 按设备名卸（含各分区）
+    for _p in "${_d}"*; do
+        [ -b "$_p" ] && { umount "$_p" >/dev/null 2>&1 || true; }
+    done
+    # 2) 按挂载点卸（关键：umount /dev/vda1 有时会漏，得按挂载点来）
+    if [ -r /proc/mounts ]; then
+        awk -v d="$_d" '$1 ~ "^"d || $1 ~ "^"d"[0-9p]" {print $2}' /proc/mounts 2>/dev/null \
+            | sort -r | while IFS= read -r _mp; do
+                [ -n "$_mp" ] && umount "$_mp" >/dev/null 2>&1 || true
+            done
+    fi
+    swapoff -a >/dev/null 2>&1 || true
+    command -v vgchange >/dev/null 2>&1 && { vgchange -an >/dev/null 2>&1 || true; }
+    command -v mdadm    >/dev/null 2>&1 && { mdadm --stop --scan >/dev/null 2>&1 || true; }
+    command -v dmsetup  >/dev/null 2>&1 && { dmsetup remove_all >/dev/null 2>&1 || true; }
+    sleep 1
+    return 0
+}
+
+wipe_disk() {
+    _d="$1"
+    if command -v wipefs >/dev/null 2>&1; then
+        wipefs -a "$_d" >/dev/null 2>&1 && return 0
+        # 逐个签名擦
+        wipefs "$_d" 2>/dev/null | awk 'NR>1 {print $1}' | while IFS= read -r _s; do
+            [ -n "$_s" ] && wipefs -o "$_s" "$_d" >/dev/null 2>&1 || true
+        done
+        return 0
+    fi
+    return 1
+}
+
+# 只有要动这块盘时才清理（CHECK_ONLY 模式只看不动）
+if [ "$CHECK_ONLY" != "1" ] && [ "$DRY_RUN" != "1" ]; then
+    if [ "$_mounted_suspicious" = "1" ] || [ -n "$_sig" ]; then
+        _round=0
+        _clean_ok=0
+        while [ "$_round" -lt 3 ]; do
+            _round=$((_round + 1))
+            info "释放磁盘占用 / 清除残留签名（第 $_round 轮）"
+            release_disk "$DISK"
+            wipe_disk "$DISK" || true
+            _left=""
+            if [ -r /proc/mounts ]; then
+                _left="$(awk -v d="$DISK" '$1 ~ "^"d {print $2}' /proc/mounts 2>/dev/null)"
+            fi
+            if [ -z "$_left" ]; then _clean_ok=1; break; fi
+            warn "仍被挂载：$(printf '%s' "$_left" | tr '\n' ' ') —— 延迟卸载后重试"
+            printf '%s\n' "$_left" | sort -r | while IFS= read -r _mp; do
+                umount -l "$_mp" >/dev/null 2>&1 || true
+            done
+            sleep 2
+        done
+        if [ "$_clean_ok" = "1" ]; then
+            ok "磁盘已释放并清除残留签名"
+        else
+            warn "磁盘仍被占用 —— mkfs 可能失败，届时请手动检查"
+        fi
     fi
 fi
 

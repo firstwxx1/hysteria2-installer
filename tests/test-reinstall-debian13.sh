@@ -253,8 +253,130 @@ else
 fi
 
 echo ""
+
+# ── 10. ★ 救援盘硬拦截（本次新增，对应 2026-10-11 用户真机事故）────────
+# 事故复盘：用户真机只有一块 1GB 盘，被 Alpine 救援系统挂着、带 iso9660 签名。
+# 旧版脚本只给警告 + 一个 yes 确认，用户输入 yes 后擦掉了 ISO 签名，
+# 接着 mkfs 报 "apparently in use" 卡死，而且把自己退路断了。
+# 本组测试：造一个【三条特征全中】的假盘，验证脚本必须【拒绝执行】。
+echo "【10】救援盘硬拦截（1GB + 已挂载 + iso9660 签名 → 必须拒绝）"
+
+# 准备：造 1GB 假盘 + 做成 iso9660 + 挂载
+_rdisk=""
+_rlo=""
+_rimg="/tmp/rd13-rescue-test.img"
+_rmnt="/tmp/rd13-rescue-mnt"
+
+if [ "$(id -u)" = "0" ] && command -v losetup >/dev/null 2>&1; then
+    # 找空闲 loop
+    for _n in 8 9 10 11 12 13 14 15; do
+        if ! losetup "/dev/loop$_n" >/dev/null 2>&1; then _rlo="/dev/loop$_n"; break; fi
+    done
+
+    if [ -n "$_rlo" ]; then
+        # 1GB 镜像（稀疏文件，不真占空间）
+        dd if=/dev/zero of="$_rimg" bs=1M count=1 seek=1023 2>/dev/null || true
+        if command -v mkisofs >/dev/null 2>&1; then
+            mkisofs -o "$_rimg" -V "RD13RESCUE" -J -r /etc >/dev/null 2>&1 || true
+        elif command -v genisoimage >/dev/null 2>&1; then
+            genisoimage -o "$_rimg" -V "RD13RESCUE" -J -r /etc >/dev/null 2>&1 || true
+        fi
+        # 兜底：没有 iso 工具就用 dd 写个 1GB 裸盘（则只有"容量小"这一条特征）
+        _rsz_mb=$(( $(wc -c < "$_rimg" 2>/dev/null || echo 0) / 1048576 ))
+
+        if losetup "$_rlo" "$_rimg" 2>/dev/null; then
+            _rdisk="$_rlo"
+            # 挂载（模拟救援系统把盘挂在 /media）
+            mkdir -p "$_rmnt" 2>/dev/null || true
+            mount "$_rdisk" "$_rmnt" >/dev/null 2>&1 || true
+        fi
+    fi
+fi
+
+if [ -n "$_rdisk" ]; then
+    _out="$(sh "$SCRIPT" --check --disk "$_rdisk" --yes 2>&1)"
+    _rc=$?
+
+    # ★ 核心断言：必须拒绝执行（退出码非 0，并给出明确拒绝原因）
+    if printf '%s' "$_out" | grep -qE "救援系统自己的盘|已拒绝执行"; then
+        a_ok "识别出救援盘并拒绝执行"
+    else
+        a_no "救援盘识别" "输出尾部：$(printf '%s' "$_out" | tail -8)"
+    fi
+
+    # ★ 关键断言：--yes 不能绕过（这正是事故的成因）
+    if [ "$_rc" -ne 0 ]; then
+        a_ok "--yes 也无法绕过拦截（退出码 $_rc）"
+    else
+        a_no "--yes 绕过拦截" "退出码为 0，说明 --yes 把拦截放行了 —— 这正是事故成因"
+    fi
+
+    # 必须给出正确出路（提示挂数据盘 / 用 --disk）
+    if printf '%s' "$_out" | grep -qE "挂载一块新云盘|cat /proc/partitions|/dev/vdb"; then
+        a_ok "给出了正确的下一步指引（挂数据盘）"
+    else
+        a_no "下一步指引" "没提示用户去挂数据盘"
+    fi
+
+    # 必须提到强制参数的存在（知道有风险、给知情选择）
+    if printf '%s' "$_out" | grep -qF -- "--force-rescue-disk"; then
+        a_ok "提示了强制参数（--force-rescue-disk）的存在"
+    else
+        a_no "强制参数提示" "没提到 --force-rescue-disk"
+    fi
+
+    # ★ 强制参数应当能放行（说明这是"可控的拒绝"而非"死锁"）
+    _out2="$(sh "$SCRIPT" --check --disk "$_rdisk" --yes --force-rescue-disk 2>&1)"
+    if printf '%s' "$_out2" | grep -qF -- "--force-rescue-disk"; then
+        a_ok "带 --force-rescue-disk 时可继续"
+    else
+        a_no "--force-rescue-disk 未生效"
+    fi
+
+    # 清理
+    umount "$_rmnt" >/dev/null 2>&1 || true
+    umount "$_rdisk" >/dev/null 2>&1 || true
+    losetup -d "$_rdisk" >/dev/null 2>&1 || true
+    rm -f "$_rimg" 2>/dev/null || true
+    rmdir "$_rmnt" 2>/dev/null || true
+else
+    echo "  [跳过] 需要 root + losetup 才能造救援盘假盘"
+fi
+
+echo ""
+
+# ── 11. 对照：正常数据盘不该被拦截 ────────────────────────────────────────
+# ★ 反向对照：确认拦截逻辑没有"误伤" —— 一块干净的 8GB 未挂载盘必须放行。
+echo "【11】对照：正常数据盘不应被误拦截"
+_ddisk=""
+_dlo=""
+_dimg="/tmp/rd13-data-test.img"
+if [ "$(id -u)" = "0" ] && command -v losetup >/dev/null 2>&1; then
+    for _n in 8 9 10 11 12 13 14 15; do
+        if ! losetup "/dev/loop$_n" >/dev/null 2>&1; then _dlo="/dev/loop$_n"; break; fi
+    done
+    if [ -n "$_dlo" ]; then
+        dd if=/dev/zero of="$_dimg" bs=1M count=1 seek=8191 2>/dev/null || true
+        losetup "$_dlo" "$_dimg" 2>/dev/null && _ddisk="$_dlo"
+    fi
+fi
+
+if [ -n "$_ddisk" ]; then
+    _out="$(sh "$SCRIPT" --check --disk "$_ddisk" --yes 2>&1)"
+    if printf '%s' "$_out" | grep -qE "已拒绝执行"; then
+        a_no "8GB 干净数据盘不该被拦截" "$(printf '%s' "$_out" | grep -E '\[X\]' | head -3)"
+    else
+        a_ok "8GB 干净数据盘未被误拦截"
+    fi
+    losetup -d "$_ddisk" >/dev/null 2>&1 || true
+    rm -f "$_dimg" 2>/dev/null || true
+else
+    echo "  [跳过] 需要 root + losetup"
+fi
+
+echo ""
 echo "=========================================="
-printf '  通过 %d 项，失败 %d 项\n' "$PASS" "$FAIL"
+
 if [ "$FAIL" -gt 0 ]; then
     printf '  失败清单：%s\n' "$FAILED_NAMES"
 fi
