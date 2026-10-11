@@ -250,19 +250,105 @@ fi
 # ── 第 5 步：分区 + 格式化 ───────────────────────────────────────────────
 info "第 5/9 步：分区并格式化 $DISK"
 
-# 先卸载可能已挂载的分区
-for p in "${DISK}"*; do
-    [ -b "$p" ] && run umount "$p" 2>/dev/null || true
-done
+# ── 5.0 彻底释放磁盘占用（★ 这一步不做干净，后面一定失败）───────────────
+#
+# ★★ 实测踩坑（2026-10-11，用户真机 + Alpine 容器双重复现）：
+#   磁盘上如果残留**旧文件系统签名**（尤其 iso9660 —— 阿里云某些救援
+#   镜像会把磁盘当"光盘"用），系统会**自动把它挂载起来**。于是：
+#     · sfdisk 重读分区表 → `Re-reading the partition table failed: Resource busy`
+#     · mkfs.ext4        → `/dev/vda1 is apparently in use by the system;
+#                            will not make a filesystem here!`
+#   两条路都被堵死，重装就断在这里。**清签名（wipefs）才是根治**，
+#   只 umount 不擦签名的话，系统可能立刻又把它挂回去。
+#
+#   顺序很重要：先解占用 → 再擦签名 → 再分区。反过来 wipefs 也会被拒。
+release_disk() {
+    _d="$1"
 
-# 关掉可能存在的 swap（alpine 救援模式常把磁盘当 swap 用，这会导致 Resource busy）
-run sh -c "swapoff -a 2>/dev/null || true"
+    # (1) 先按分区设备名卸
+    for _p in "${_d}"*; do
+        [ -b "$_p" ] && { umount "$_p" >/dev/null 2>&1 || true; }
+    done
 
-# 如果磁盘上有 LVM / mdraid，也一起停掉（同样会造成 Resource busy）
-run sh -c "vgchange -an 2>/dev/null || true"
-run sh -c "mdadm --stop --scan 2>/dev/null || true"
+    # (2) 再**按挂载点**卸 —— 关键补充！`umount /dev/vda1` 在设备节点
+    #     和挂载源不完全一致时（比如通过 loop / udev 别名挂的）会漏掉，
+    #     必须从 /proc/mounts 里把这些设备的所有挂载点全捞出来卸干净。
+    if [ -r /proc/mounts ]; then
+        awk -v d="$_d" '$1 ~ "^"d || $1 ~ "^"d"[0-9p]" {print $2}' /proc/mounts 2>/dev/null \
+            | sort -r | while IFS= read -r _mp; do
+                [ -n "$_mp" ] && umount "$_mp" >/dev/null 2>&1 || true
+            done
+    fi
 
-# 等一小会儿，让上面这些操作真正释放设备
+    # (3) 关 swap（救援模式常把磁盘当 swap 用，会让设备一直"忙"）
+    swapoff -a >/dev/null 2>&1 || true
+
+    # (4) 停 LVM / mdraid（同样造成 Resource busy）
+    command -v vgchange >/dev/null 2>&1 && { vgchange -an >/dev/null 2>&1 || true; }
+    command -v mdadm    >/dev/null 2>&1 && { mdadm --stop --scan >/dev/null 2>&1 || true; }
+    command -v dmsetup  >/dev/null 2>&1 && { dmsetup remove_all >/dev/null 2>&1 || true; }
+
+    # (5) 如果是 loop 设备，先 detach（省得还占着底层文件）
+    case "$_d" in
+        /dev/loop*)
+            losetup -d "$_d" >/dev/null 2>&1 || true
+            ;;
+    esac
+
+    sleep 1
+}
+
+# ── 5.1 擦掉磁盘上所有残留签名（★ 根治 Resource busy / in use）──────────
+#
+# wipefs -a 会把磁盘头部所有已知文件系统签名（iso9660 / ext4 / xfs / LVM /
+# RAID / swap...）一次性清掉。**不清的话，系统一发现签名就可能自动挂载，
+# 于是 mkfs.ext4 永远说"设备正忙"。**
+#
+# 注意：部分发行版的 busybox 版 wipefs 不支持 -a，所以要加兼容判断。
+wipe_disk() {
+    _d="$1"
+    if command -v wipefs >/dev/null 2>&1; then
+        if wipefs -a "$_d" >/dev/null 2>&1; then
+            return 0
+        fi
+        # busybox 版不支持 -a，退化成逐个签名擦
+        wipefs "$_d" 2>/dev/null | awk 'NR>1 {print $1}' | while IFS= read -r _sig; do
+            [ -n "$_sig" ] && wipefs -o "$_sig" "$_d" >/dev/null 2>&1 || true
+        done
+        return 0
+    fi
+    return 1
+}
+
+if [ "$DRY_RUN" = "1" ]; then
+    printf '    %s[dry-run]%s 释放 %s 上所有挂载 / swap / LVM\n' "$c_ylw" "$c_rst" "$DISK"
+    printf '    %s[dry-run]%s wipefs -a %s   （清掉 iso9660 等残留签名）\n' "$c_ylw" "$c_rst" "$DISK"
+else
+    info "释放磁盘占用（挂载 / swap / LVM / loop）"
+    release_disk "$DISK"
+    ok "占用已释放"
+
+    info "清除磁盘上的残留文件系统签名"
+    if wipe_disk "$DISK"; then
+        ok "签名已清除（避免 mkfs 报 \"/dev/xxx is apparently in use\"）"
+    else
+        warn "wipefs 不可用，跳过签名清除（若后续 mkfs 报 in use，请手动执行 wipefs -a $DISK）"
+    fi
+
+    # 擦完再确认一遍没有任何挂载残留（有人可能又挂回去了）
+    _still_mounted=0
+    if [ -r /proc/mounts ]; then
+        grep -qE "^${DISK}" /proc/mounts && _still_mounted=1
+    fi
+    if [ "$_still_mounted" = "1" ]; then
+        warn "检测到 $DISK 仍被挂载，再强行卸一次"
+        awk -v d="$DISK" '$1 ~ "^"d {print $2}' /proc/mounts | sort -r | \
+            while IFS= read -r _mp; do umount -l "$_mp" >/dev/null 2>&1 || true; done
+        sleep 1
+    fi
+fi
+
+# 等设备真正闲置下来
 [ "$DRY_RUN" != "1" ] && sleep 1
 
 # 单分区 MBR：一个从 2048 扇区开始、占满整盘的 83 类型分区。
@@ -418,7 +504,34 @@ if [ "$DRY_RUN" != "1" ]; then
 fi
 
 info "格式化 $ROOT_PART 为 ext4"
-run mkfs.ext4 -F -L debian "$ROOT_PART"
+
+# ★ 双保险：即使前面已经擦过整盘签名，分区节点**自己**也可能还带着旧签名
+#   （分区表是全新的，但扇区里的残留内容不会因为"重新分区"就消失）。
+#   mkfs.ext4 见到就会拒绝：
+#       /dev/vda1 is apparently in use by the system;
+#       will not make a filesystem here!
+#   所以格式化之前，先对着**分区**再擦一次签名、再卸一次挂载。
+if [ "$DRY_RUN" != "1" ]; then
+    umount "$ROOT_PART" >/dev/null 2>&1 || true
+    command -v wipefs >/dev/null 2>&1 && { wipefs -a "$ROOT_PART" >/dev/null 2>&1 || true; }
+
+    if ! mkfs.ext4 -F -L debian "$ROOT_PART" 2>&1; then
+        warn "格式化失败，可能仍被占用 —— 再尝试一次彻底释放后重做"
+        umount "$ROOT_PART" >/dev/null 2>&1 || true
+        swapoff -a >/dev/null 2>&1 || true
+        command -v wipefs >/dev/null 2>&1 && { wipefs -a "$ROOT_PART" >/dev/null 2>&1 || true; }
+        sleep 2
+        mkfs.ext4 -F -L debian "$ROOT_PART" || die "格式化 $ROOT_PART 失败。
+       请手动执行以下命令后重跑本脚本：
+           umount $ROOT_PART
+           swapoff -a
+           wipefs -a $ROOT_PART
+           mkfs.ext4 -F -L debian $ROOT_PART"
+    fi
+    ok "格式化完成（ext4）"
+else
+    run mkfs.ext4 -F -L debian "$ROOT_PART"
+fi
 
 # ── 第 6 步：debootstrap ─────────────────────────────────────────────────
 info "第 6/9 步：释放 Debian 根文件系统"
