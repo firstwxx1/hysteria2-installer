@@ -529,7 +529,32 @@ download_installnet() {
 if ! command -v wget >/dev/null 2>&1 && ! command -v curl >/dev/null 2>&1; then
     info "安装下载工具"
     apk update >/dev/null 2>&1 || true
-    apk add --no-cache wget curl bash iproute2 gawk ipcalc >/dev/null 2>&1 || true
+    apk add --no-cache wget curl iproute2 gawk ipcalc >/dev/null 2>&1 || true
+fi
+
+# ★ 必须确保 bash 存在 —— InstallNET.sh 是 bash 脚本，用 sh 跑会报
+#   `sh: bash: not found`（退出码 127）。
+#   踩坑实录（2026-10-11 用户真机）：上一版把 bash 混在"没有 wget 时"才装的
+#   那个分支里，而 Alpine Live ISO 自带 wget → 该分支被跳过 → bash 从未安装
+#   → 脚本跑到最后一步才失败，前面的体检全部白做。
+#   现在：无条件检查并安装 bash（以及 InstallNET 依赖的基础工具）。
+_missing_tools=""
+for _t in bash; do
+    command -v "$_t" >/dev/null 2>&1 || _missing_tools="$_missing_tools $_t"
+done
+if [ -n "$_missing_tools" ]; then
+    info "安装缺失的基础工具：$_missing_tools"
+    apk update >/dev/null 2>&1 || true
+    # 分开装，避免某个包名不存在时整批失败
+    for _t in $_missing_tools; do
+        apk add --no-cache "$_t" >/dev/null 2>&1 || true
+    done
+fi
+if command -v bash >/dev/null 2>&1; then
+    ok "bash 已就绪（$(command -v bash)）"
+else
+    warn "bash 安装失败 —— InstallNET.sh 需要 bash 才能运行"
+    warn "如果下面失败，请手动执行：apk add --no-cache bash"
 fi
 
 info "下载 InstallNET.sh"
@@ -568,6 +593,15 @@ printf '\n'
 log_line "执行：bash InstallNET.sh $*"
 
 # 交给 InstallNET
+# ★ 兜底：明确检查 bash 存在，避免只留下一句 `sh: bash: not found`（退出码 127）
+if ! command -v bash >/dev/null 2>&1; then
+    err "系统里没有 bash —— InstallNET.sh 是 bash 脚本，无法用 sh 运行"
+    printf '\n'
+    printf '  请先执行：apk add --no-cache bash\n'
+    printf '  然后重新运行本脚本。\n\n'
+    exit 127
+fi
+
 if bash "$IN_FILE" "$@"; then
     printf '\n'
     ok "重装流程已启动"
@@ -580,7 +614,8 @@ else
     printf '  1. 网络中断      —— 检查网络后重试\n'
     printf '  2. 空间不足      —— 确认磁盘容量（df -h / blkid %s）\n' "$DISK"
     printf '  3. 磁盘被占用    —— 执行 wipefs -a %s 后重试\n' "$DISK"
-    printf '  4. 上游脚本变更  —— 可到 leitbogioro/Tools 仓库查看最新说明\n'
+    printf '  4. 缺 bash       —— 执行 apk add --no-cache bash\n'
+    printf '  5. 上游脚本变更  —— 可到 leitbogioro/Tools 仓库查看最新说明\n'
     printf '\n完整日志：%s\n\n' "$LOG"
     exit "$_rc"
 fi

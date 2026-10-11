@@ -375,6 +375,83 @@ else
 fi
 
 echo ""
+
+# ── 12. bash 依赖（本次新增，对应 2026-10-11 用户真机事故）──────────────
+# 事故复盘：Alpine Live ISO 自带 wget 但**不带 bash**，而上一版脚本把
+# "装 bash" 混在"没有 wget 时才执行"的分支里 → 该分支被跳过 → bash 从未装上
+# → 脚本跑到最后一步（第 6 步）才报 `sh: bash: not found`（退出码 127）。
+#
+# ★ 验证策略（踩过两次坑，记录在此）：
+#   坑1：写静态 grep → 反向验证不报红（脚本末尾兜底检查还在，静态断言照样过）
+#   坑2：用 --check 真跑 → --check 在第 5 步就结束，**永远走不到第 6 步**
+#        （bash 检查在第 6 步），所以测不到
+#   正确做法：不要跑整个脚本，而是**把第 6 步的 bash 保障逻辑单独提取出来
+#   执行** —— 检查"没有 bash 时这段逻辑会不会报出可操作提示"。
+echo "【12】bash 依赖保障（提取逻辑独立验证）"
+
+# 从被测脚本里提取"bash 保障"段落（从标识注释到 InstallNET 下载前）
+_scr="$SCRIPT"
+_extract="/tmp/rd13-bash-seg.sh"
+{
+    echo '#!/bin/sh'
+    echo 'ok()   { printf "[OK] %s\n" "$*"; }'
+    echo 'warn() { printf "[!] %s\n" "$*"; }'
+    echo 'info() { printf "[*] %s\n" "$*"; }'
+    echo 'err()  { printf "[X] %s\n" "$*"; }'
+    echo 'set -u'
+    # 取出"必须确保 bash 存在"到"下载 InstallNET.sh"之间的整段
+    awk '/必须确保 bash 存在/{f=1} f{print} /^info "下载 InstallNET\.sh"/{exit}' "$_scr"
+} > "$_extract" 2>/dev/null
+
+if [ -s "$_extract" ] && grep -q 'command -v bash' "$_extract"; then
+    # 场景 A：环境里有 bash → 应报"bash 已就绪"
+    _out="$(sh "$_extract" 2>&1 || true)"
+    if printf '%s' "$_out" | grep -qE "bash 已就绪"; then
+        a_ok "有 bash 时报「bash 已就绪」"
+    else
+        a_no "有 bash 时未正确识别" "输出：$(printf '%s' "$_out" | head -3)"
+    fi
+
+    # 场景 B：★ 屏蔽 bash → 必须报出可操作提示（这是事故的直接防呆）
+    #   构造一个不含 bash 的 PATH，让 'command -v bash' 失败。
+    _sb="/tmp/rd13-nobash-path"
+    rm -rf "$_sb" 2>/dev/null || true
+    mkdir -p "$_sb" 2>/dev/null || true
+    for _t in sh awk sed grep cut tr wc cat ls mkdir rm cp env id printf echo od; do
+        _p="$(command -v "$_t" 2>/dev/null)" || continue
+        [ -n "$_p" ] && ln -sf "$_p" "$_sb/$_t" 2>/dev/null || true
+    done
+    # apk **不放**进来 → 安装必然失败 → 走"bash 安装失败"分支
+    if ! PATH="$_sb" "$_sb/sh" -c 'command -v bash' >/dev/null 2>&1; then
+        _out="$(PATH="$_sb" "$_sb/sh" "$_extract" 2>&1 || true)"
+        if printf '%s' "$_out" | grep -qE "apk add --no-cache bash"; then
+            a_ok "缺 bash 时报出可操作提示（apk add --no-cache bash）"
+        else
+            a_no "缺 bash 时无提示" "输出：$(printf '%s' "$_out" | head -4)"
+        fi
+    else
+        echo "  [跳过] 无法构造无 bash 的 PATH"
+    fi
+    rm -rf "$_sb" 2>/dev/null || true
+else
+    a_no "无法提取 bash 保障段落" "提取文件为空或找不到 command -v bash"
+fi
+rm -f "$_extract" 2>/dev/null || true
+
+# 静态补强：兜底检查必须存在（防止将来有人只删兜底不删主逻辑）
+_scr2="$(grep -vE '^[[:space:]]*#' "$SCRIPT")"
+if printf '%s' "$_scr2" | grep -qE 'command -v bash'; then
+    a_ok "脚本里有 bash 存在性检查（静态确认）"
+else
+    a_no "bash 检查缺失" "脚本没有任何 command -v bash 检查"
+fi
+if printf '%s' "$_scr2" | grep -qE 'apk add[^|]*\bbash\b'; then
+    a_ok "有 apk add bash 的自动安装动作（静态确认）"
+else
+    a_no "bash 自动安装缺失"
+fi
+
+echo ""
 echo "=========================================="
 
 if [ "$FAIL" -gt 0 ]; then
