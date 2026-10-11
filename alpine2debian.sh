@@ -297,14 +297,97 @@ else
     [ "$_parted_ok" = "1" ] || die "分区失败。请手动执行 fdisk $DISK 分区后再重跑本脚本"
     ok "分区表已写入（MBR，单分区）"
 
-    # 明确通知内核重读分区表（用多个手段，总有一个能成）
-    partprobe "$DISK" 2>/dev/null || \
-    blockdev --rereadpt "$DISK" 2>/dev/null || \
-    hdparm -z "$DISK" >/dev/null 2>&1 || \
-    true
-    # reread 失败不致命：下面会用 partx 兜底把分区节点造出来
-    if ! [ -b "${DISK}1" ] && ! [ -b "${DISK}p1" ]; then
-        partx -a "$DISK" 2>/dev/null || true
+    # ── 让分区设备节点 /dev/xxx1 出现 ────────────────────────────────────
+    #
+    # ★★ 这是整个脚本**最容易失败**的一步，踩坑记录（2026-10-11 用
+    #    Alpine 3.24 容器 + loop 假盘真实复现，不是推演）：
+    #
+    #   原方案：`partprobe || blockdev --rereadpt || hdparm -z`
+    #   实测：sfdisk 写完表后会提示
+    #       Re-reading the partition table failed.: Invalid argument
+    #       The kernel still uses the old table.
+    #   也就是说 —— **内核拒绝重读分区表**，于是 /dev/loop0p1 永远不出现，
+    #   脚本在第 5 步 die「分区设备未出现」→ 用户看到的「重装不了」。
+    #
+    #   更细的实测结论（很重要，和直觉相反）：
+    #     · 即使 partprobe **命令存在且返回 0**，节点**依然不出现**。
+    #       所以"把工具装全"解决不了这个问题。
+    #     · 但 /proc/partitions 和 /sys/class/block/loop0p1/dev **都已经有了**
+    #       （内核其实知道这个分区，只是没帮我们建 /dev 节点）。
+    #     ⇒ **唯一可靠的办法：自己用 mknod 按 sysfs 里的主:次号把节点造出来。**
+    #
+    #   因此下面把 mknod 提为**第一优先**，其余手段只是"顺手试一下"，
+    #   试完不管成不成都要 fall through 到 mknod。
+    mk_partnode() {
+        _node="$1"; _disk="$2"; _pnum="$3"
+        [ -b "$_node" ] && return 0
+
+        _base="$(basename "$_disk")"
+        # 分区节点的 sysfs 路径（两种命名都可能）
+        _sysdev="/sys/class/block/${_base}${_pnum}/dev"
+        [ -f "$_sysdev" ] || _sysdev="/sys/class/block/${_base}p${_pnum}/dev"
+
+        # ---- 先试"正规"手段，让内核对（走通就省事，走不通也没关系）----
+        command -v partprobe >/dev/null 2>&1 && \
+            { partprobe "$_disk" >/dev/null 2>&1 || true; }
+        command -v partx >/dev/null 2>&1 && \
+            { partx -a -n "${_pnum}:${_pnum}" "$_disk" >/dev/null 2>&1 || true; }
+        # busybox 的 mdev -s 会按 sysfs 内容补全 /dev 下的设备节点
+        command -v mdev >/dev/null 2>&1 && { mdev -s >/dev/null 2>&1 || true; }
+        sleep 1
+        [ -b "$_node" ] && return 0
+
+        # ---- ★ 真正管用的一招：按 sysfs 的设备号手工 mknod ----
+        _maj=""; _min=""
+        if [ -f "$_sysdev" ]; then
+            _majmin="$(cat "$_sysdev" 2>/dev/null)"
+            _maj="${_majmin%%:*}"; _min="${_majmin##*:}"
+        fi
+        # sysfs 里没有就直接问内核要（/proc/partitions 第 1、2 列）
+        if [ -z "$_maj" ] || [ -z "$_min" ]; then
+            set -- $(awk -v n="${_base}p${_pnum}" -v m="${_base}${_pnum}" \
+                '$4==n || $4==m {print $1, $2; exit}' /proc/partitions 2>/dev/null)
+            _maj="${1:-}"; _min="${2:-}"
+        fi
+
+        if [ -n "$_maj" ] && [ -n "$_min" ]; then
+            # 先删掉可能存在的坏节点，再重建
+            [ -e "$_node" ] && rm -f "$_node" 2>/dev/null || true
+            if mknod "$_node" b "$_maj" "$_min" 2>/dev/null; then
+                chmod 660 "$_node" 2>/dev/null || true
+                sleep 1
+                [ -b "$_node" ] && return 0
+            fi
+            # mknod 失败（容器里 /dev 只读等）→ 换 busybox 风格再试一次
+            busybox mknod "$_node" b "$_maj" "$_min" 2>/dev/null || true
+            sleep 1
+            [ -b "$_node" ] && return 0
+        fi
+
+        return 1
+    }
+
+    # 分区号固定为 1（本脚本就是单分区）
+    _nodeprefix="$DISK"
+    case "$DISK" in
+        *nvme*|*mmcblk*|*loop*) _node="${DISK}p1" ;;
+        *)                      _node="${DISK}1"  ;;
+    esac
+
+    info "通知内核加载分区表..."
+    if mk_partnode "$_node" "$DISK" 1; then
+        ok "分区设备已出现：$_node"
+    else
+        # 再等一会儿（有些云盘/慢设备需要更久）
+        _w=0
+        while [ ! -b "$_node" ] && [ "$_w" -lt 15 ]; do
+            sleep 1; _w=$((_w + 1))
+        done
+        [ -b "$_node" ] || die "分区设备 $_node 未能创建。
+       分区表本身已写入成功，但内核没能识别出新分区。请手动执行：
+           partx -a -n 1:1 $DISK     # 若报 Resource busy 就先 umount / swapoff -a
+       成功后重新运行本脚本。"
+        ok "分区设备已出现：$_node"
     fi
 fi
 
@@ -321,12 +404,16 @@ esac
 ok "根分区：$ROOT_PART"
 
 if [ "$DRY_RUN" != "1" ]; then
-    # 等分区设备节点出现（最多等 10 秒）
-    _w=0
-    while [ ! -b "$ROOT_PART" ] && [ "$_w" -lt 10 ]; do
-        sleep 1; _w=$((_w + 1))
-    done
-    [ -b "$ROOT_PART" ] || die "分区设备 $ROOT_PART 未出现，分区可能未生效"
+    # 分区节点的创建在上一段（第 5 步）已经做完了，这里只做最终确认。
+    # 之所以再查一次，是因为极慢的云盘可能在"创建成功"之后仍需几秒才真正可用。
+    if [ ! -b "$ROOT_PART" ]; then
+        _w=0
+        while [ ! -b "$ROOT_PART" ] && [ "$_w" -lt 10 ]; do
+            sleep 1; _w=$((_w + 1))
+        done
+    fi
+    [ -b "$ROOT_PART" ] || die "分区设备 $ROOT_PART 未就绪，无法继续格式化。
+       请手动执行 `partx -a -n 1:1 $DISK` 后重跑本脚本。"
     ok "分区设备已就绪：$ROOT_PART"
 fi
 
