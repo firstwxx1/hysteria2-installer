@@ -151,20 +151,32 @@ fi
 # ── 第 2 步：联网检查 ────────────────────────────────────────────────────
 info "第 2/9 步：检查网络与外网连通性"
 
-# Alpine 救援模式下网卡默认没有 IP，这里先尝试自动获取
+# Alpine 救援模式下网卡默认没有 IP，这里先尝试自动获取。
+#
+# ★ 实测踩坑：网卡默认是 DOWN 状态，直接 udhcpc 会报
+#     udhcpc: sendto: Network is down
+#   所以必须先 `ip link set <网卡> up` 把网卡启起来，再要 IP。
 if ! ip route show default >/dev/null 2>&1 || [ -z "$(ip route show default 2>/dev/null)" ]; then
-    warn "尚未获取到默认路由，尝试 DHCP..."
+    warn "尚未获取到默认路由，先启用网卡再尝试 DHCP..."
     for ifc in $(ls /sys/class/net | grep -v '^lo$'); do
-        info "对 $ifc 尝试 udhcpc"
-        run udhcpc -i "$ifc" -q -n -t 5 2>/dev/null || true
+        # 先启用网卡（DOWN 状态下 DHCP 一定失败）
+        if [ "$DRY_RUN" = "1" ]; then
+            printf '    %s[dry-run]%s ip link set %s up\n' "$c_ylw" "$c_rst" "$ifc"
+            printf '    %s[dry-run]%s udhcpc -i %s -q -n -t 10\n' "$c_ylw" "$c_rst" "$ifc"
+        else
+            info "启用 $ifc 并尝试 DHCP"
+            ip link set "$ifc" up 2>/dev/null || true
+            udhcpc -i "$ifc" -q -n -t 10 2>/dev/null || true
+        fi
         ip route show default >/dev/null 2>&1 && break
     done
 fi
 
 if ! ip route show default >/dev/null 2>&1; then
     die "仍然没有默认路由。请先在 VNC 里手动联网：
-       ip link                      # 看网卡名
-       udhcpc -i <网卡> -q -n        # 获取地址
+       ip link                    # 看网卡名，确认状态是 DOWN 还是 UP
+       ip link set <网卡> up      # ★ DOWN 的话先启用
+       udhcpc -i <网卡> -q -n     # 再获取地址
        然后重新运行本脚本"
 fi
 
