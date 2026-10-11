@@ -324,27 +324,44 @@ if [ "$DRY_RUN" = "1" ]; then
     printf '    %s[dry-run]%s 释放 %s 上所有挂载 / swap / LVM\n' "$c_ylw" "$c_rst" "$DISK"
     printf '    %s[dry-run]%s wipefs -a %s   （清掉 iso9660 等残留签名）\n' "$c_ylw" "$c_rst" "$DISK"
 else
-    info "释放磁盘占用（挂载 / swap / LVM / loop）"
-    release_disk "$DISK"
-    ok "占用已释放"
+    # ★★ 关键：清干净要**反复来几轮**，不能只做一次。
+    #   实测（2026-10-11 用户真机）：磁盘带 iso9660 签名时，系统会自动
+    #   把它挂载成一个"光盘"。此时：
+    #     · 只 umount   → 系统可能立刻又挂回去（因为是自动挂载）
+    #     · 只 wipefs   → 设备正忙，wipefs 自己也可能被拒
+    #   正确顺序是「卸 → 擦 → 复查 → 若又挂回来了就再来一轮」，
+    #   直到确认磁盘既没挂载、也没签名为止。最多试 3 轮。
+    _round=0
+    _clean_ok=0
+    while [ "$_round" -lt 3 ]; do
+        _round=$((_round + 1))
+        info "清理磁盘占用（第 $_round 轮）"
 
-    info "清除磁盘上的残留文件系统签名"
-    if wipe_disk "$DISK"; then
-        ok "签名已清除（避免 mkfs 报 \"/dev/xxx is apparently in use\"）"
+        release_disk "$DISK"
+        wipe_disk "$DISK" || true
+
+        # 复查：还有挂载吗？
+        _mnt_left=""
+        if [ -r /proc/mounts ]; then
+            _mnt_left="$(awk -v d="$DISK" '$1 ~ "^"d {print $2}' /proc/mounts 2>/dev/null)"
+        fi
+
+        if [ -z "$_mnt_left" ]; then
+            _clean_ok=1
+            break
+        fi
+
+        warn "磁盘仍被挂载：$(printf '%s' "$_mnt_left" | tr '\n' ' ') —— 强制卸载后重试"
+        printf '%s\n' "$_mnt_left" | sort -r | while IFS= read -r _mp; do
+            umount -l "$_mp" >/dev/null 2>&1 || true   # -l 懒卸载，绕开"设备忙"
+        done
+        sleep 2
+    done
+
+    if [ "$_clean_ok" = "1" ]; then
+        ok "磁盘已释放干净（无挂载、无残留签名）"
     else
-        warn "wipefs 不可用，跳过签名清除（若后续 mkfs 报 in use，请手动执行 wipefs -a $DISK）"
-    fi
-
-    # 擦完再确认一遍没有任何挂载残留（有人可能又挂回去了）
-    _still_mounted=0
-    if [ -r /proc/mounts ]; then
-        grep -qE "^${DISK}" /proc/mounts && _still_mounted=1
-    fi
-    if [ "$_still_mounted" = "1" ]; then
-        warn "检测到 $DISK 仍被挂载，再强行卸一次"
-        awk -v d="$DISK" '$1 ~ "^"d {print $2}' /proc/mounts | sort -r | \
-            while IFS= read -r _mp; do umount -l "$_mp" >/dev/null 2>&1 || true; done
-        sleep 1
+        warn "仍有挂载残留，但继续尝试分区（下一步格式化时还有一次兜底）"
     fi
 fi
 
