@@ -7,6 +7,7 @@ import threading
 import time
 from datetime import datetime, timezone
 
+ACCOUNTING_REVISION = "2026-10-12-real-usage-v2"
 ROOT = pathlib.Path(__file__).parent
 
 def load(name, filename):

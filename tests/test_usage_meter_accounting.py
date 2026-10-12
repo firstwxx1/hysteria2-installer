@@ -170,6 +170,35 @@ class MeterAccountingTest(unittest.TestCase):
             self.assertIn(marker, content)
             self.assertGreaterEqual(len(content), minimum)
 
+    def test_version_endpoint_reports_all_bundle_hashes_and_running_revision(self):
+        import hashlib
+        import json
+        import subprocess
+        import urllib.request
+        tree = ast.parse((ROOT / 'portal.py').read_text(encoding='utf-8'))
+        fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)
+                  and n.name == '_h_get_check_version')
+        def blob(path):
+            content = Path(path).read_bytes()
+            return hashlib.sha1(b'blob ' + str(len(content)).encode() + b'\0' + content).hexdigest()
+        env = {'Path': Path, 'PORTAL_SELF': ROOT / 'portal.py', 'AWG_CTL': ROOT / 'awgctl.sh',
+               '_local_blob_sha': blob, '_version_triple': lambda path, name: ('current', 'latest', True),
+               '_usage_runtime': runtime, 'usage_meter': self.meter,
+               'usage_summary': self.meter.summary, 'MASTER_USER_ID': 'admin_master',
+               'subprocess': subprocess, 'urllib': urllib, 'json': json}
+        exec(compile(ast.Module(body=[fn], type_ignores=[]), 'version-bundle', 'exec'), env)
+        class Handler:
+            def is_authenticated(self): return True
+            def reply_json(self, code, payload): return payload
+        with patch.object(subprocess, 'run', side_effect=OSError('no binary')), \
+             patch.object(urllib.request, 'urlopen', side_effect=OSError('offline')):
+            result = env['_h_get_check_version'](Handler(), '')
+        bundle = result['portal_bundle']
+        self.assertEqual(len(bundle['files']), 6)
+        self.assertEqual(bundle['files']['portal.py'], blob(ROOT / 'portal.py'))
+        self.assertEqual(bundle['runtime_revision'], runtime.ACCOUNTING_REVISION)
+        self.assertTrue(bundle['meter_initialized'])
+
 
 if __name__ == '__main__':
     unittest.main()

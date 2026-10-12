@@ -5920,6 +5920,16 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 'portal_current': portal_curr,
                 'portal_latest': portal_latest,
                 'portal_has_update': portal_has_update,
+                'portal_bundle': {
+                    'files': {name: _local_blob_sha(PORTAL_SELF.parent / name) for name in (
+                        'portal.py', 'portal_assets.py', 'usage-meter-core-20261007-v1.py',
+                        'usage-meter-readers-20261007-v1.py', 'usage-meter-runtime-20261007-v1.py',
+                        'usage-meter-xray-config-20261007-v1.py')},
+                    'runtime_revision': getattr(_usage_runtime, 'ACCOUNTING_REVISION', '')
+                                        if usage_meter is not None else '',
+                    'meter_initialized': usage_meter is not None,
+                    'measurement': usage_summary(MASTER_USER_ID),
+                },
                 'awg_installed': Path(AWG_CTL).exists(),
                 'awg_current': awg_curr,
                 'awg_latest': awg_latest,
