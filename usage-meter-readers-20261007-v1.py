@@ -189,6 +189,8 @@ def read_live_connections():
             allusers=json.loads(cmd([binary,'api','statsgetallonlineusers','--server='+address]))
             names=allusers.get('users',[]) if isinstance(allusers,dict) else allusers
             if not isinstance(names,list):raise ValueError('invalid_online_users')
+            if any(not isinstance(name,str) for name in names):raise ValueError('invalid_online_user_name')
+            names=[name.split('>>>')[1] if name.startswith('user>>>') and name.endswith('>>>online') and len(name.split('>>>'))==3 else name for name in names]
             for uid,out in output['users'].items():
                 out['reality_ok']=True
                 if uid not in names:continue
