@@ -123,6 +123,7 @@ def read_live_connections():
     users=portal.get('users',{})
     output={'users':{},'sampled_at':int(time.time())}
     for uid in users:output['users'][uid]={'ips':[],'ok':False,'error':'Hy2 online IP unavailable','hysteria_ok':False,'reality_ok':False}
+    core_counts=None
     try:
         h=cfg['hysteria']
         parsed=urlparse(h['url'])
@@ -142,6 +143,7 @@ def read_live_connections():
                 out['ips']=[{'ip':str(ipaddress.ip_address(ip)),'protocol':'Hy2','last_seen':output['sampled_at']} for ip in row['ips']]
         else:
             online=read_hysteria_online(h['url'],h['secret'])
+            core_counts=online
             if all(online.get(uid,0)==0 for uid in output['users']):
                 for out in output['users'].values():out.update(ok=True,hysteria_ok=True,error='',hysteria_count=0)
             else:
@@ -170,7 +172,10 @@ def read_live_connections():
                     out['hysteria_ok']=True;out['ok']=True;out['error']=''
                     out['ips']=[{'ip':ip,'protocol':'Hy2','last_seen':output['sampled_at']} for ip in sorted(set(known))]
     except Exception as exc:
-        for out in output['users'].values():out['error']='Hy2在线IP采集失败：'+type(exc).__name__
+        for uid,out in output['users'].items():
+            if core_counts is not None and core_counts.get(uid,0)==0:
+                out.update(ok=True,hysteria_ok=True,error='',hysteria_count=0)
+            else:out['error']='Hy2在线IP采集失败：'+type(exc).__name__
     # Reality 若已启用核心在线统计则读取；未启用时明确说明，不用历史access日志猜。
     rcfg=cfg.get('reality',{})
     binary=rcfg.get('binary','')

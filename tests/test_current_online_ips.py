@@ -21,6 +21,14 @@ class LiveTests(unittest.TestCase):
    self.assertTrue(result['user']['hysteria_ok']);self.assertEqual(result['user']['hysteria_count'],2)
    self.assertEqual(result['user']['ips'][0]['ip'],'203.0.113.8');self.assertTrue(result['offline']['hysteria_ok']);self.assertEqual(result['offline']['ips'],[])
   finally:server.shutdown();server.server_close();thread.join()
+ def test_core_zero_survives_other_users_journal_failure(self):
+  from urllib.error import HTTPError
+  cfg={'hysteria':{'url':'http://127.0.0.1:19996','secret':'test-secret'}}
+  def read(path,*args,**kwargs):return json.dumps(cfg if path.name=='usage-meter-config.json' else {'users':{'offline':{},'active':{}}})
+  with patch.object(m.pathlib.Path,'read_text',read),patch.object(m.urllib.request,'urlopen',side_effect=HTTPError('http://127.0.0.1:19996/online/ips',404,'missing',{},None)),patch.object(m,'read_hysteria_online',return_value={'active':2}),patch.object(m,'cmd',side_effect=ValueError('journal unavailable')):
+   result=m.read_live_connections()['users']
+  self.assertTrue(result['offline']['hysteria_ok']);self.assertEqual(result['offline']['ips'],[])
+  self.assertFalse(result['active']['hysteria_ok'])
  def test_long_connection_does_not_expire(self):self.assertEqual(m.parse_events([row('client connected')]),{('user','203.0.113.8:1234'):'203.0.113.8'})
  def test_core_zero_removes_ghost(self):self.assertEqual(m.confirmed_ips({('user','203.0.113.8:1'):'203.0.113.8'},'user',0),[])
  def test_count_mismatch_unknown(self):self.assertIsNone(m.confirmed_ips({},'user',1))
