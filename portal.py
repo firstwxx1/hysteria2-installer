@@ -13,6 +13,7 @@ import platform
 import random
 import re
 import secrets
+import shlex
 import shutil
 import socket
 import subprocess
@@ -1906,9 +1907,8 @@ def pin_sha256_of_file(cert_file):
 def _config_tls_cert_path(config_path='/etc/hysteria/config.yaml'):
     """Return the leaf/fullchain cert path that Hysteria actually serves with.
 
-    Reads `tls.cert:` from config.yaml. When the node uses the `acme:` block
-    (Let's Encrypt managed in-process) there is no file, so '' is returned and
-    the caller must fall back to cert/server.crt.
+    Reads `tls.cert:` from config.yaml. ACME caches are resolved separately
+    by _config_acme_cert_path; they are not the self-signed server.crt.
     """
     try:
         text = Path(config_path).read_text(encoding='utf-8')
@@ -1979,11 +1979,75 @@ def _parse_cert_subject(cert_file):
         return '', [], False
 
 
+def _config_acme_cert_path(config_path):
+    """读取内置 ACME 缓存；None 表示非 ACME，缺文件则返回预期路径。
+
+    安装器的服务 WorkingDirectory 为配置目录，默认缓存为 ./acme。
+    只匹配配置域名，不拿旧自签证书或别的域名掩盖申请失败。
+    """
+    try:
+        text = Path(config_path).read_text(encoding='utf-8')
+    except OSError:
+        return None
+    in_acme = False
+    found_acme = False
+    in_domains = False
+    domains = []
+    storage = ''
+    ca = 'letsencrypt'
+    for raw in text.splitlines():
+        if not raw.strip() or raw.lstrip().startswith('#'):
+            continue
+        if not raw.startswith((' ', '\t')):
+            in_acme = raw.split(':', 1)[0].strip() == 'acme'
+            found_acme = found_acme or in_acme
+            in_domains = False
+            continue
+        if not in_acme:
+            continue
+        line = raw.strip()
+        if line.startswith('-') and in_domains:
+            values = shlex.split(line[1:].strip(), comments=True)
+            if values:
+                domains.append(values[0].lower())
+            continue
+        key, sep, value = line.partition(':')
+        if not sep:
+            continue
+        in_domains = key == 'domains'
+        values = shlex.split(value.strip(), comments=True)
+        scalar = ' '.join(values)
+        if key == 'dir':
+            storage = scalar
+        elif key == 'ca':
+            ca = scalar.lower()
+        elif key == 'domains' and scalar.startswith('[') and scalar.endswith(']'):
+            domains.extend(d.strip().lower() for d in scalar[1:-1].split(',') if d.strip())
+    if not found_acme:
+        return None
+    base = Path(storage or os.environ.get('HYSTERIA_ACME_DIR') or 'acme')
+    if not base.is_absolute():
+        base = Path(config_path).parent / base
+    # CertMagic 的存储键把通配符替换为 wildcard_。
+    domains = [d.replace('*', 'wildcard_') for d in domains
+               if d and '/' not in d and '\\' not in d and d not in ('.', '..')]
+    issuer = ('acme.zerossl.com-v2-dv90' if ca == 'zerossl'
+              else 'acme-v02.api.letsencrypt.org-directory')
+    if ca.startswith(('http://', 'https://')):
+        issuer = ca.split('://', 1)[1].strip('/').replace('/', '-')
+    for domain in domains:
+        candidate = base / 'certificates' / issuer / domain / (domain + '.crt')
+        if candidate.is_file():
+            return candidate
+    domain = domains[0] if domains else 'unknown-domain'
+    return base / 'certificates' / issuer / domain / (domain + '.crt')
+
+
 def _resolve_live_cert(root, config_path='/etc/hysteria/config.yaml'):
     """返回 (cert_path, cn, sans, self_signed) —— 门户实际在用的那张证书。
 
     与 sync_cert_trust 共用同一套解析规则（读 config.yaml 的 tls.cert，
-    相对路径按配置目录解析，读不到退回 cert/server.crt），保证
+    相对路径按配置目录解析；ACME 读缓存，非 ACME 退回 cert/server.crt），保证
     「自愈用的证书」和「界面显示的证书」永远是同一张 —— 否则卡片显示
     A、自愈修 B，又是一轮新的不一致。
     """
@@ -1995,6 +2059,8 @@ def _resolve_live_cert(root, config_path='/etc/hysteria/config.yaml'):
             candidate = Path(config_path).parent / candidate
         if candidate.exists():
             cert_file = candidate
+    if cert_file is None:
+        cert_file = _config_acme_cert_path(config_path)
     if cert_file is None:
         cert_file = Path(root) / 'cert' / 'server.crt'
     cn, sans, self_signed = _parse_cert_subject(cert_file)

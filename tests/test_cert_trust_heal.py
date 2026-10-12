@@ -182,8 +182,11 @@ class TestPortalSyncCertTrust(unittest.TestCase):
             (td / "config.yaml").write_text(
                 "listen: :443\nacme:\n  domains:\n    - node.example.com\n"
                 "  email: a@b.c\n  type: http\n")
-            # acme mode: no tls.cert, fall back to cert/server.crt -> put one there
-            shutil.copy(td / "cert" / "fullchain.pem", td / "cert" / "server.crt")
+            # ACME 的真实缓存布局，没有 tls.cert，也不会生成自签路径。
+            cache = (td / 'acme/certificates/acme-v02.api.letsencrypt.org-directory'
+                     / 'node.example.com/node.example.com.crt')
+            cache.parent.mkdir(parents=True)
+            shutil.copy(td / "cert" / "fullchain.pem", cache)
             meta = {"public_ip": "5.6.7.8", "server_name": "node.example.com",
                     "cert_type": "custom", "is_insecure": False, "pin_sha256": ""}
             (td / "client_meta.json").write_text(json.dumps(meta))
