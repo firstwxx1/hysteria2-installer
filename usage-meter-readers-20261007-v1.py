@@ -141,30 +141,34 @@ def read_live_connections():
                 out.update(ok=True,hysteria_ok=True,error='',hysteria_count=row['connections'])
                 out['ips']=[{'ip':str(ipaddress.ip_address(ip)),'protocol':'Hy2','last_seen':output['sampled_at']} for ip in row['ips']]
         else:
-            epoch=cmd(['systemctl','show','hysteria-server','--property=InvocationID','--value']).strip()
-            if not re.fullmatch('[a-f0-9]{32}',epoch):raise ValueError('missing_service_epoch')
-            journal=cmd(['journalctl','--no-pager','-o','json','--grep=client (connected|disconnected)', '_SYSTEMD_INVOCATION_ID='+epoch,'-n','20001'])
-            if len(journal)>8*1024*1024:raise ValueError('journal_response_too_large')
-            rows=[json.loads(line) for line in journal.splitlines() if line]
-            if len(rows)>20000:raise ValueError('journal_history_truncated')
-            connections=parse_events(rows)
-            h=cfg['hysteria']
-            parsed=urlparse(h['url'])
-            if parsed.scheme!='http' or parsed.hostname not in ('127.0.0.1','::1') or parsed.path not in ('','/'):raise ValueError('stats_not_loopback')
-            req=urllib.request.Request(h['url'].rstrip('/')+'/online',headers={'Authorization':h['secret']})
-            with urllib.request.urlopen(req,timeout=4) as r:online=json.load(r)
-            if not isinstance(online,dict) or any(type(x)!=int or x<0 for x in online.values()):raise ValueError('invalid_online_counts')
-            after=cmd(['systemctl','show','hysteria-server','--property=InvocationID','--value']).strip()
-            if after!=epoch:raise ValueError('service_changed_during_sample')
-            for uid,out in output['users'].items():
-                count=online.get(uid,0)
-                known=confirmed_ips(connections,uid,count)
-                out['hysteria_count']=count
-                if known is None:
-                    out['error']='Hy2连接日志与核心计数暂不一致，无法完整确定IP'
-                    continue
-                out['hysteria_ok']=True;out['ok']=True;out['error']=''
-                out['ips']=[{'ip':ip,'protocol':'Hy2','last_seen':output['sampled_at']} for ip in sorted(set(known))]
+            online=read_hysteria_online(h['url'],h['secret'])
+            if all(online.get(uid,0)==0 for uid in output['users']):
+                for out in output['users'].values():out.update(ok=True,hysteria_ok=True,error='',hysteria_count=0)
+            else:
+                epoch=cmd(['systemctl','show','hysteria-server','--property=InvocationID','--value']).strip()
+                if not re.fullmatch('[a-f0-9]{32}',epoch):raise ValueError('missing_service_epoch')
+                journal=cmd(['journalctl','--no-pager','-o','json','--grep=client (connected|disconnected)', '_SYSTEMD_INVOCATION_ID='+epoch,'-n','20001'])
+                if len(journal)>8*1024*1024:raise ValueError('journal_response_too_large')
+                rows=[json.loads(line) for line in journal.splitlines() if line]
+                if len(rows)>20000:raise ValueError('journal_history_truncated')
+                connections=parse_events(rows)
+                h=cfg['hysteria']
+                parsed=urlparse(h['url'])
+                if parsed.scheme!='http' or parsed.hostname not in ('127.0.0.1','::1') or parsed.path not in ('','/'):raise ValueError('stats_not_loopback')
+                req=urllib.request.Request(h['url'].rstrip('/')+'/online',headers={'Authorization':h['secret']})
+                with urllib.request.urlopen(req,timeout=4) as r:online=json.load(r)
+                if not isinstance(online,dict) or any(type(x)!=int or x<0 for x in online.values()):raise ValueError('invalid_online_counts')
+                after=cmd(['systemctl','show','hysteria-server','--property=InvocationID','--value']).strip()
+                if after!=epoch:raise ValueError('service_changed_during_sample')
+                for uid,out in output['users'].items():
+                    count=online.get(uid,0)
+                    known=confirmed_ips(connections,uid,count)
+                    out['hysteria_count']=count
+                    if known is None:
+                        out['error']='Hy2连接日志与核心计数暂不一致，无法完整确定IP'
+                        continue
+                    out['hysteria_ok']=True;out['ok']=True;out['error']=''
+                    out['ips']=[{'ip':ip,'protocol':'Hy2','last_seen':output['sampled_at']} for ip in sorted(set(known))]
     except Exception as exc:
         for out in output['users'].values():out['error']='Hy2在线IP采集失败：'+type(exc).__name__
     # Reality 若已启用核心在线统计则读取；未启用时明确说明，不用历史access日志猜。
