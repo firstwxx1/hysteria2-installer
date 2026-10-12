@@ -34,6 +34,9 @@ class PortalMeter:
         self.sample_times={}
         self.online_counts=None
         self.online_sampled_at=0
+        self.live_snapshot=None
+        self.live_sampled_at=0
+        self.live_next_at=0
 
     def enabled_sources(self):
         sources=[s for s in ("hysteria", "reality") if self.config.get(s)]
@@ -56,6 +59,17 @@ class PortalMeter:
         return readers.read_xray(cfg['binary'],cfg['address'])
 
     def poll(self):
+        if self.read == self._read and time.monotonic() >= self.live_next_at:
+            self.live_next_at=time.monotonic()+15
+            try:
+                snapshot=readers.read_live_connections()
+                with self.lock:
+                    self.live_snapshot=snapshot
+                    self.live_sampled_at=time.time()
+            except Exception:
+                with self.lock:
+                    self.live_snapshot=None
+                    self.live_sampled_at=0
         for source in self.enabled_sources():
             cfg=self.config.get(source)
             now=datetime.now(timezone.utc).isoformat()
@@ -119,6 +133,7 @@ class PortalMeter:
                 'measurement_ok':initialized and fresh and not m.get('gaps'),
                 'measurement_current_ok': initialized and fresh,
                 'measurement_complete': initialized and not m.get('gaps'),
+                'current_online': copy.deepcopy(self.live_snapshot.get('users',{}).get(uid,{})) if self.live_snapshot is not None and time.time()-self.live_sampled_at < 45 else {'ips': [], 'ok': False, 'hysteria_ok': False, 'reality_ok': False, 'error':'current online IP unavailable'},
                 'online_ip_scope': 'recent_authentication',
                 'online_devices': self.online_counts.get(uid, 0) if self.online_counts is not None and time.time()-self.online_sampled_at < 30 else None,
                 'online_devices_scope': 'hysteria_core_instances_only',
