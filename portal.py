@@ -4420,8 +4420,18 @@ if __name__ == '__main__':
                 body = self.rfile.read(length).decode('utf-8')
                 form = parse_qs(body)
                 target = form.get('target', [''])[0]
-                if target not in ('core', 'portal', 'awg'):
+                if target not in ('core', 'portal', 'awg', 'reality-online'):
                     return self.reply_json(400, {'ok': False, 'error': 'Invalid target'})
+
+                if target == 'reality-online':
+                    cfg_path = portal_path.parent / 'usage-meter-config.json'
+                    cfg = json.loads(cfg_path.read_text(encoding='utf-8')).get('reality', {})
+                    spec = importlib.util.spec_from_file_location('reality_online_config', Path(__file__).parent / 'usage-meter-xray-config-20261007-v1.py')
+                    module = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(module)
+                    with data_lock:
+                        outcome = module.enable_reality_online(str(portal_path.parent / 'xray.json'), cfg['binary'], cfg['address'])
+                    return self.reply_json(200, {'ok': True, 'reality_online': outcome})
 
                 if target == 'portal':
                     ref = form.get('ref', ['main'])[0]
