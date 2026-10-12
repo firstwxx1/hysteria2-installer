@@ -1,6 +1,7 @@
 import unittest,json,importlib.util,threading
 from http.server import HTTPServer,BaseHTTPRequestHandler
 from unittest.mock import patch
+from urllib.error import HTTPError
 from pathlib import Path
 s=importlib.util.spec_from_file_location('live',Path(__file__).resolve().parents[1] / 'usage-meter-readers-20261007-v1.py');m=importlib.util.module_from_spec(s);s.loader.exec_module(m)
 def row(event,addr='203.0.113.8:1234',uid='user',time=1,binary=False):
@@ -29,6 +30,19 @@ class LiveTests(unittest.TestCase):
    result=m.read_live_connections()['users']
   self.assertTrue(result['offline']['hysteria_ok']);self.assertEqual(result['offline']['ips'],[])
   self.assertFalse(result['active']['hysteria_ok'])
+ def test_reality_counter_names_resolve_to_user_ids(self):
+  cfg={'hysteria':{'url':'http://127.0.0.1:19996','secret':'test-secret'},'reality':{'binary':'/usr/local/bin/xray','address':'127.0.0.1:19997'}}
+  def read(path,*args,**kwargs):
+   if path.name=='usage-meter-config.json':return json.dumps(cfg)
+   if path.name=='xray.json':return json.dumps({'policy':{'levels':{'0':{'statsUserOnline':True}}}})
+   return json.dumps({'users':{'active':{}}})
+  def command(args):
+   if 'statsgetallonlineusers' in args:return json.dumps({'users':['user>>>active>>>online']})
+   if 'statsonlineiplist' in args:return json.dumps({'ips':{'203.0.113.12':12345}})
+   raise AssertionError(args)
+  with patch.object(m.pathlib.Path,'read_text',read),patch.object(m.pathlib.Path,'is_file',return_value=True),patch.object(m.urllib.request,'urlopen',side_effect=HTTPError('http://127.0.0.1:19996/online/ips',404,'missing',{},None)),patch.object(m,'read_hysteria_online',return_value={}),patch.object(m,'cmd',side_effect=command):
+   result=m.read_live_connections()['users']['active']
+  self.assertTrue(result['reality_ok']);self.assertEqual(result['ips'][0]['protocol'],'Reality');self.assertEqual(result['ips'][0]['ip'],'203.0.113.12')
  def test_long_connection_does_not_expire(self):self.assertEqual(m.parse_events([row('client connected')]),{('user','203.0.113.8:1234'):'203.0.113.8'})
  def test_core_zero_removes_ghost(self):self.assertEqual(m.confirmed_ips({('user','203.0.113.8:1'):'203.0.113.8'},'user',0),[])
  def test_count_mismatch_unknown(self):self.assertIsNone(m.confirmed_ips({},'user',1))
