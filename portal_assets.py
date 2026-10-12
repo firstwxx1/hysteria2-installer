@@ -1603,6 +1603,22 @@ async function pollTrafficSpeed() {
     if (rxTagEl) rxTagEl.className = (json.node_rx > 1024) ? 'speed-badge active' : 'speed-badge';
     if (txTagEl) txTagEl.className = (json.node_tx > 1024) ? 'speed-badge active' : 'speed-badge';
 
+    // 累计用量同样实时更新，避免只能刷新页面后看到新值。
+    const fmtUsage = value => {
+      let n = Number(value || 0), i = 0;
+      const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+      while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+      return (i ? n.toFixed(2) : n.toFixed(0)) + ' ' + units[i];
+    };
+    const totalUsage = document.getElementById('total-used-bytes');
+    if (totalUsage) totalUsage.textContent = fmtUsage(json.total_used_bytes);
+    document.querySelectorAll('[data-user-usage]').forEach(el => {
+      const u = (json.users || {})[el.dataset.userUsage];
+      if (!u) return;
+      el.textContent = u.measured_bytes === null ? '计量未就绪' : fmtUsage(u.used_bytes);
+      el.title = u.measurement_ok ? '真实累计用量（自计量开始）' : '计量异常或存在统计缺口；保留最近累计值';
+    });
+
     // 更新各个用户的实时速率标签
     if (json.users) {
       document.querySelectorAll('[data-user-speed]').forEach(badge => {

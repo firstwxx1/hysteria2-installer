@@ -1,0 +1,175 @@
+"""真实累计同步、实际采样间隔、可选来源与持久化回滚回归测试。"""
+import ast
+import copy
+import importlib.util
+from pathlib import Path
+import threading
+import time
+import unittest
+from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parents[1]
+spec = importlib.util.spec_from_file_location('meter_runtime_test', ROOT / 'usage-meter-runtime-20261007-v1.py')
+runtime = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(runtime)
+
+
+class MeterAccountingTest(unittest.TestCase):
+    def setUp(self):
+        self.data = {'users': {'admin_master': {'used_bytes': 99, 'limit_bytes': 1024, 'password': 'unchanged'}}}
+        self.counters = {'hysteria': {'admin_master': {'tx': 0, 'rx': 0}}, 'reality': {}}
+        self.samples = []
+        self.meter = runtime.PortalMeter(
+            self.data, threading.RLock(), lambda: None,
+            {'hysteria': {'test': True}},
+            read=lambda source, cfg: copy.deepcopy(self.counters[source]),
+            epoch=lambda service: 'epoch-1', on_speed=lambda *args: self.samples.append(args))
+
+    def test_real_total_updates_display_and_quota_preserving_legacy(self):
+        self.meter.poll()
+        self.counters['hysteria']['admin_master'] = {'tx': 1048576, 'rx': 2097152}
+        self.meter.poll()
+        user = self.data['users']['admin_master']
+        self.assertEqual(user['used_bytes'], 3145728)
+        self.assertGreaterEqual(user['used_bytes'], user['limit_bytes'])
+        self.assertEqual(user['legacy_auth_value'], 99)
+        self.assertEqual(user['password'], 'unchanged')
+        self.assertEqual(self.meter.summary('admin_master')['measured_bytes'], user['used_bytes'])
+        self.meter.poll()
+        self.assertEqual(user['used_bytes'], 3145728)
+        self.assertEqual(self.samples[-1][1:3], (0, 0))
+
+    def test_actual_interval_and_idle_zero(self):
+        with patch.object(runtime.time, 'monotonic', side_effect=[100, 105, 112]):
+            self.meter.poll()
+            self.counters['hysteria']['admin_master']['tx'] = 5 * 1048576
+            self.meter.poll()
+            self.meter.poll()
+        self.assertEqual(self.samples[0][3:], (5, 'hysteria'))
+        self.assertEqual(self.samples[0][1] / self.samples[0][3], 1048576)
+        self.assertEqual(self.samples[1][1:4], (0, 0, 7))
+
+    def test_optional_reality_and_no_sources(self):
+        self.meter.poll()
+        self.assertTrue(self.meter.summary('admin_master')['measurement_ok'])
+        self.meter.config = {}
+        self.assertFalse(self.meter.summary('admin_master')['measurement_ok'])
+        self.assertIsNone(self.meter.summary('admin_master')['measured_bytes'])
+
+    def test_default_reader_skips_uninstalled_xray(self):
+        self.meter.read = self.meter._read
+        self.meter.config['reality'] = {'binary': str(ROOT / 'nonexistent-xray')}
+        self.assertEqual(self.meter.enabled_sources(), ['hysteria'])
+
+    def test_failed_save_rolls_back_usage_and_emits_no_speed(self):
+        self.meter.poll()
+        before = copy.deepcopy(self.data)
+        self.counters['hysteria']['admin_master']['tx'] = 5000
+        self.meter.save = lambda: (_ for _ in ()).throw(OSError('disk failure'))
+        self.meter.poll()
+        self.assertEqual(self.data, before)
+        self.assertEqual(self.samples, [])
+
+    def test_protocol_totals_and_restart_do_not_double_count(self):
+        self.meter.config['reality'] = {'test': True}
+        self.counters['reality'] = {'admin_master': {'tx': 0, 'rx': 0}}
+        self.meter.poll()
+        self.counters['hysteria']['admin_master']['tx'] = 10
+        self.counters['reality']['admin_master']['rx'] = 20
+        self.meter.poll()
+        self.assertEqual(self.data['users']['admin_master']['used_bytes'], 30)
+        # 门户重启保持游标，重复读取不重复计费。
+        self.meter.sample_times = {}
+        self.meter.poll()
+        self.assertEqual(self.data['users']['admin_master']['used_bytes'], 30)
+
+    def test_service_epoch_and_counter_regression(self):
+        self.meter.poll()
+        self.counters['hysteria']['admin_master']['tx'] = 10
+        self.meter.poll()
+        self.meter.epoch = lambda service: 'epoch-2'
+        self.counters['hysteria']['admin_master']['tx'] = 3
+        self.meter.poll()
+        self.assertEqual(self.data['users']['admin_master']['used_bytes'], 13)
+        self.counters['hysteria']['admin_master']['tx'] = 1
+        self.meter.poll()
+        self.assertEqual(self.data['users']['admin_master']['used_bytes'], 13)
+        self.assertFalse(self.meter.summary('admin_master')['measurement_ok'])
+
+    def test_real_portal_speed_functions_sum_sources_and_expire(self):
+        tree = ast.parse((ROOT / 'portal.py').read_text(encoding='utf-8'))
+        names = {'_meter_speed_sample', '_h_get_traffic_speed'}
+        functions = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name in names]
+        env = {'time': time, 'data_lock': threading.RLock(), 'speed_tracker': {},
+               'SPEED_WINDOW_SECONDS': 15, 'data': self.data,
+               'usage_summary': lambda uid: self.meter.summary(uid)}
+        exec(compile(ast.Module(body=functions, type_ignores=[]), 'portal-speed', 'exec'), env)
+        class Handler:
+            def is_authenticated(self): return True
+            def reply_json(self, code, payload): return payload
+        with patch.object(time, 'monotonic', return_value=100):
+            env['_meter_speed_sample']('admin_master', 5 * 1048576, 0, 5, 'hysteria')
+            env['_meter_speed_sample']('admin_master', 0, 10 * 1048576, 5, 'reality')
+            result = env['_h_get_traffic_speed'](Handler(), '')
+        self.assertEqual(result['node_tx'], 1048576)
+        self.assertEqual(result['node_rx'], 2097152)
+        with patch.object(time, 'monotonic', return_value=116):
+            result = env['_h_get_traffic_speed'](Handler(), '')
+        self.assertEqual(result['node_tx'], 0)
+        self.assertEqual(result['node_rx'], 0)
+
+    def test_actual_auth_handler_rejects_quota_and_page_shows_real_usage(self):
+        import io
+        import json
+        import sys
+        sys.path.insert(0, str(ROOT))
+        import portal
+        self.data['users']['admin_master'].update(status='active', expires_at=9999999999)
+        self.meter.poll()
+        self.counters['hysteria']['admin_master']['tx'] = 3145728
+        self.meter.poll()
+        tree = ast.parse((ROOT / 'portal.py').read_text(encoding='utf-8'))
+        auth = next(n for n in ast.walk(tree) if isinstance(n, ast.If)
+                    and ast.unparse(n.test) == "self.path == '/auth'")
+        fn = ast.parse('def handle(self):\n    pass').body[0]
+        fn.body = [auth]
+        env = {'json': json, 'time': time, 'data_lock': threading.RLock(), 'data': self.data}
+        exec(compile(ast.fix_missing_locations(ast.Module(body=[fn], type_ignores=[])), 'auth-quota', 'exec'), env)
+        body = json.dumps({'auth': 'unchanged', 'addr': '127.0.0.1:1234'}).encode()
+        class Handler:
+            path = '/auth'
+            headers = {'Content-Length': str(len(body))}
+            rfile = io.BytesIO(body)
+            def auth_rate_limited(self): return False
+            def reply_json(self, code, payload): return payload
+        response = env['handle'](Handler())
+        self.assertFalse(response['ok'])
+        self.assertEqual(response['msg'], 'Traffic quota exceeded')
+        meta = {'public_ip': '1.2.3.4', 'server_name': 'h.example.com',
+                'subscription_port': 8443, 'listen_port': 1, 'hop_port_range': '',
+                'auth_password': 'p', 'obfs_password': '', 'cert_type': 'acme',
+                'is_insecure': False, 'pin_sha256': ''}
+        page = portal.page_html(meta, 'hysteria2://x@h:1/', '#s', 'c', '{}',
+                                users=self.data['users'], token='t', session_secret='s')
+        self.assertIn('data-user-usage="admin_master">3.00 MB</span>', page)
+        self.assertIn('id="total-used-bytes">3.00 MB</span>', page)
+
+    def test_portal_self_update_includes_all_meter_modules(self):
+        tree = ast.parse((ROOT / 'portal.py').read_text(encoding='utf-8'))
+        fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)
+                  and n.name == '_h_post_do_upgrade')
+        loop = next(n for n in ast.walk(fn) if isinstance(n, ast.For)
+                    and isinstance(n.target, ast.Tuple)
+                    and [x.id for x in n.target.elts] == ['fname', 'marker', 'minsize'])
+        files = ast.literal_eval(loop.iter)
+        self.assertEqual({item[0] for item in files},
+                         {'portal.py', 'portal_assets.py'} |
+                         {p.name for p in ROOT.glob('usage-meter-*-v1.py')})
+        for name, marker, minimum in files:
+            content = (ROOT / name).read_bytes()
+            self.assertIn(marker, content)
+            self.assertGreaterEqual(len(content), minimum)
+
+
+if __name__ == '__main__':
+    unittest.main()

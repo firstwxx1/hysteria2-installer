@@ -54,9 +54,8 @@ def apply_sample(state, source, epoch, counters, sampled_at):
         #   - 方向不可知（新 epoch 或该用户首次出现）时不采样。那种情况下
         #     delta 是「自服务启动起的累计」而非本轮增量，当成 5 秒的增量
         #     会算出荒谬的速率尖峰。
-        #   - 零字节样本不记：/traffic-speed 用「样本时间差」做分母，
-        #     插零值会把平均速率稀释到接近 0。
-        if delta > 0 and old is not None and not new_epoch:
+        #   - 零字节增量也通知速率端点，及时清除上一轮非零速度。
+        if old is not None and not new_epoch and not first_sample and uid not in reset_users:
             deltas[uid] = (pair['tx'] - old['tx'], pair['rx'] - old['rx'])
     # 消失的用户保持旧游标：临时空响应不能让再次出现的累计值重复计数。
     sources[source] = {'epoch': epoch, 'counters': cursors, 'sampled_at': sampled_at}

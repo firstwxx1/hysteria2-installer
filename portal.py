@@ -7,6 +7,7 @@ import hashlib
 import hmac
 import html
 import json
+import importlib.util
 import os
 import platform
 import random
@@ -788,10 +789,10 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
         if limit_bytes > 0:
             percent = min(round((used_bytes / limit_bytes) * 100), 100)
             bar_class = "danger" if percent >= 90 else ""
-            traffic_display = f"""<div>{format_bytes(used_bytes)} / {format_bytes(limit_bytes)} <span style="font-size:11px;color:var(--muted)">({percent}%)</span></div>
+            traffic_display = f"""<div><span data-user-usage="{html.escape(uid)}">{format_bytes(used_bytes)}</span> / {format_bytes(limit_bytes)} <span style="font-size:11px;color:var(--muted)">({percent}%)</span></div>
             <div class="traffic-bar"><div class="traffic-fill {bar_class}" style="width:{percent}%"></div></div>"""
         else:
-            traffic_display = f"""<div>{format_bytes(used_bytes)} <span style="font-size:11px;color:var(--muted)">(不限)</span></div>"""
+            traffic_display = f"""<div><span data-user-usage="{html.escape(uid)}">{format_bytes(used_bytes)}</span> <span style="font-size:11px;color:var(--muted)">(不限)</span></div>"""
 
         note = u.get("note") or "-"
         user_key = user_view_key(session_secret, uid) if session_secret else ""
@@ -940,7 +941,7 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
       <div><h2>多用户、流量与 IP 限制管理</h2><p style="font-size:13px">实时监控当前节点有效用户、到期时间、实时流量消耗与在线 IP 限制</p></div>
       <div class="user-stats">
         <span class="badge-count">有效用户: {active_count} / {len(users)}</span>
-        <span class="badge-count" style="background:#f0f7f6">总已用流量: {format_bytes(total_used_bytes)}</span>
+        <span class="badge-count" style="background:#f0f7f6">总已用流量: <span id="total-used-bytes">{format_bytes(total_used_bytes)}</span></span>
       </div>
     </div>
 
@@ -2904,42 +2905,22 @@ def serve(path):
                     disk_temp.chmod(0o600)
                     disk_temp.replace(disk_path)
 
-    # 真实字节增量 → speed_tracker（2026-10-08）。
-    #
-    # ⚠️ 为什么不能用 auth 请求里的 tx/rx：那是客户端**带宽声明**，
-    # 不是实际传输字节。真实增量由计量模块从单调计数器算出来。
-    # ⚠️ 写入前必须持 data_lock：speed_tracker 是 serve() 里的普通 dict，
-    # 而采样来自计量线程（daemon thread），不锁会与 /traffic-speed 并发读写。
-    # ⚠️ 只在有字节流动时记样本：/traffic-speed 用「样本时间差」做分母，
-    # 插入零字节样本会把平均速率稀释到接近 0。
-    # ⚠️ 窗口取10 秒的依据：计量线程每 5 秒轮询一次（runtime 的 stop.wait(5)），
-    # 而 /traffic-speed 只取 6 秒内样本。若保留窗口 < 一个轮询周期，
-    # 样本会间歇性为空 → 速率在 0 与真实值之间剧烈跳动。
-    # 10 秒 = 至少两个采样点，滑动平均才稳定。
-    # ⚠️ 这个值必须 ≥ runtime 的轮询间隔，也必须与速率端点的过滤窗口协调：
-    # 端点取 6 秒、这里留 10 秒，是为了保证端点每次都能取到至少 1 个样本。
-    SPEED_WINDOW_SECONDS = 10
+    # 每个来源使用实际采样间隔计算速率，不能把 5 秒增量除以固定 3 秒。
+    SPEED_WINDOW_SECONDS = 15
 
-    def _meter_speed_sample(uid, tx, rx):
-        if tx <= 0 and rx <= 0:
+    def _meter_speed_sample(uid, tx, rx, elapsed, source):
+        if elapsed <= 0:
             return
-        cur = time.monotonic()
         with data_lock:
-            samples = speed_tracker.setdefault(uid, [])
-            samples.append((cur, tx, rx))
-            # 保留窗口内样本；顺手清掉空条目，避免字典无限增长。
-            cutoff = cur - SPEED_WINDOW_SECONDS
-            if len(samples) > 256:
-                del samples[:len(samples) - 128]
-            speed_tracker[uid] = [s for s in samples if s[0] >= cutoff]
+            speed_tracker.setdefault(uid, {})[source] = (
+                time.monotonic(), tx / elapsed, rx / elapsed)
 
-    # 独立计量模块不改变客户 UUID/密码/状态/旧记账值。
+    # 计量模块不改变 UUID/密码/状态；旧记账值另存，used_bytes 同步真实累计。
     usage_meter = None
     try:
-        import importlib.util as _usage_import
         _usage_runtime_path = Path(__file__).parent / 'usage-meter-runtime-20261007-v1.py'
-        _usage_spec = _usage_import.spec_from_file_location('portal_usage_runtime', _usage_runtime_path)
-        _usage_runtime = _usage_import.module_from_spec(_usage_spec)
+        _usage_spec = importlib.util.spec_from_file_location('portal_usage_runtime', _usage_runtime_path)
+        _usage_runtime = importlib.util.module_from_spec(_usage_spec)
         _usage_spec.loader.exec_module(_usage_runtime)
         usage_meter = _usage_runtime.from_file(data, data_lock, save_data,
                                               portal_path.parent / 'usage-meter-config.json',
@@ -3749,10 +3730,9 @@ if __name__ == '__main__':
                     _address = _meter_reality['address']
                     if not _address.startswith('127.0.0.1:'):
                         raise ValueError('统计接口必须为回环地址')
-                    import importlib.util as _stats_import
                     _stats_path = Path(__file__).parent / 'usage-meter-xray-config-20261007-v1.py'
-                    _stats_spec = _stats_import.spec_from_file_location('portal_stats_cfg', _stats_path)
-                    _stats_mod = _stats_import.module_from_spec(_stats_spec)
+                    _stats_spec = importlib.util.spec_from_file_location('portal_stats_cfg', _stats_path)
+                    _stats_mod = importlib.util.module_from_spec(_stats_spec)
                     _stats_spec.loader.exec_module(_stats_mod)
                     xray_json = _stats_mod.add_stats(xray_json, int(_address.rsplit(':', 1)[1]))
             Path('/etc/hysteria/xray.json').write_text(
@@ -4362,7 +4342,7 @@ if __name__ == '__main__':
                     return self.reply_json(400, {'ok': False, 'error': 'Invalid target'})
 
                 if target == 'portal':
-                    # 面板由【两个文件】组成：portal.py（后端）+ portal_assets.py（前端资源）。
+                    # 门户前后端与四个计量模块必须一起更新，避免新旧回调接口不兼容。
                     # 🔴 必须成对更新 —— 门户同时是 Hysteria 的鉴权后端，
                     # 只换其中一个会让它起不来、所有客户端连不上。
                     # 所以流程是：两个都取回 → 都做语法校验 → 再一起原子替换；
@@ -4378,7 +4358,11 @@ if __name__ == '__main__':
                     # 现在 portal_assets.py 用 b'SCRIPT = r'：既确实存在，
                     # 又顺带校验了「JS 常量仍是原始字符串」这个关键属性。
                     for fname, marker, minsize in (('portal.py', b'hysteria2-installer', 20000),
-                                                   ('portal_assets.py', b'SCRIPT = r', 10000)):
+                                                   ('portal_assets.py', b'SCRIPT = r', 10000),
+                                                   ('usage-meter-core-20261007-v1.py', b'def apply_sample', 1024),
+                                                   ('usage-meter-readers-20261007-v1.py', b'def read_hysteria', 1024),
+                                                   ('usage-meter-runtime-20261007-v1.py', b'class PortalMeter', 1024),
+                                                   ('usage-meter-xray-config-20261007-v1.py', b'def add_stats', 1024)):
                         content = _fetch_repo_file(fname, marker=marker, min_size=minsize)
                         if content is None:
                             return self.reply_json(500, {'ok': False, 'error':
@@ -5850,29 +5834,26 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             user_speeds = {}
 
             with data_lock:
-                for uid, samples in list(speed_tracker.items()):
-                    # 过滤 6 秒内的样本
-                    recent = [(t, tx, rx) for (t, tx, rx) in samples if cur_mono - t <= 6]
+                for uid, sources in list(speed_tracker.items()):
+                    recent = {source: sample for source, sample in sources.items()
+                              if cur_mono - sample[0] <= SPEED_WINDOW_SECONDS}
                     speed_tracker[uid] = recent
-                    if not recent:
-                        user_speeds[uid] = {'tx': 0, 'rx': 0}
-                        continue
-
-                    sum_tx = sum(tx for _, tx, _ in recent)
-                    sum_rx = sum(rx for _, _, rx in recent)
-                    dt = max(recent[-1][0] - recent[0][0], 1.0) if len(recent) > 1 else 3.0
-                    u_tx_speed = sum_tx / dt
-                    u_rx_speed = sum_rx / dt
-
+                    u_tx_speed = sum(sample[1] for sample in recent.values())
+                    u_rx_speed = sum(sample[2] for sample in recent.values())
                     total_tx_speed += u_tx_speed
                     total_rx_speed += u_rx_speed
                     user_speeds[uid] = {'tx': u_tx_speed, 'rx': u_rx_speed}
+                for uid, user in data.get('users', {}).items():
+                    entry = user_speeds.setdefault(uid, {'tx': 0, 'rx': 0})
+                    entry.update(usage_summary(uid))
+                    entry['used_bytes'] = user.get('used_bytes', 0)
 
             return self.reply_json(200, {
                 'ok': True,
                 'node_tx': total_tx_speed,
                 'node_rx': total_rx_speed,
-                'users': user_speeds
+                'users': user_speeds,
+                'total_used_bytes': sum(u['used_bytes'] for u in user_speeds.values())
             })
 
         def _h_get_proxy_services(self, subpath):
