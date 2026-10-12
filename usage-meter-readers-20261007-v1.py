@@ -59,3 +59,18 @@ def read_xray(binary, address):
     r=subprocess.run([binary,'api','statsquery','--server='+address,'-pattern','user>>>','-reset=false'],
                      capture_output=True,timeout=5,check=True)
     return parse_xray(r.stdout.decode())
+
+
+def read_hysteria_online(url, secret):
+    p = urlparse(url)
+    if p.scheme != 'http' or p.hostname not in ('127.0.0.1', '::1') or p.path not in ('', '/'):
+        raise ValueError('stats endpoint must be loopback HTTP base URL')
+    req = urllib.request.Request(url.rstrip('/') + '/online', headers={'Authorization': secret})
+    with urllib.request.urlopen(req, timeout=4) as response:
+        raw = response.read(4 * 1024 * 1024 + 1)
+    if len(raw) > 4 * 1024 * 1024:
+        raise ValueError('online response too large')
+    result = json.loads(raw)
+    if not isinstance(result, dict) or any(not isinstance(uid, str) or type(count) is not int or count < 0 for uid, count in result.items()):
+        raise ValueError('invalid online counters')
+    return result

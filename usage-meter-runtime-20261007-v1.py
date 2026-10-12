@@ -32,6 +32,8 @@ class PortalMeter:
         # 每个来源每个用户各调一次。
         self.on_speed=on_speed
         self.sample_times={}
+        self.online_counts=None
+        self.online_sampled_at=0
 
     def enabled_sources(self):
         sources=[s for s in ("hysteria", "reality") if self.config.get(s)]
@@ -42,7 +44,15 @@ class PortalMeter:
         return sources
 
     def _read(self, source, cfg):
-        if source=='hysteria': return readers.read_hysteria(cfg['url'],cfg['secret'])
+        if source=='hysteria':
+            counters=readers.read_hysteria(cfg['url'],cfg['secret'])
+            try:
+                self.online_counts=readers.read_hysteria_online(cfg['url'],cfg['secret'])
+                self.online_sampled_at=time.time()
+            except Exception:
+                self.online_counts=None
+                self.online_sampled_at=0
+            return counters
         return readers.read_xray(cfg['binary'],cfg['address'])
 
     def poll(self):
@@ -107,6 +117,11 @@ class PortalMeter:
             return {'measured_bytes':core.total_bytes(m,uid) if initialized else None,
                 'measurement_started_at':m.get('started_at'),
                 'measurement_ok':initialized and fresh and not m.get('gaps'),
+                'measurement_current_ok': initialized and fresh,
+                'measurement_complete': initialized and not m.get('gaps'),
+                'online_ip_scope': 'recent_authentication',
+                'online_devices': self.online_counts.get(uid, 0) if self.online_counts is not None and time.time()-self.online_sampled_at < 30 else None,
+                'online_devices_scope': 'hysteria_core_instances_only',
                 'measurement_scope':'since_measurement_started',
                 'measurement_sources':{s:copy.deepcopy(health.get(s, {})) for s in enabled},
                 'measurement_gaps':copy.deepcopy(m.get('gaps',[])),

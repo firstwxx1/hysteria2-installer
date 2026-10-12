@@ -56,6 +56,36 @@ class MeterAccountingTest(unittest.TestCase):
         self.assertFalse(self.meter.summary('admin_master')['measurement_ok'])
         self.assertIsNone(self.meter.summary('admin_master')['measured_bytes'])
 
+    def test_hysteria_online_instances_are_exposed_separately(self):
+        """核心 /online 是实例数，不冒充 IP 数，也不包含 Reality。"""
+        online = {'admin_master': 2}
+        self.meter.config['hysteria'] = {'url': 'http://127.0.0.1:19996',
+                                         'secret': 'test'}
+        self.meter.read = self.meter._read
+        with patch.object(runtime.readers, 'read_hysteria',
+                          return_value={'admin_master': {'tx': 0, 'rx': 0}}), \
+             patch.object(runtime.readers, 'read_hysteria_online', return_value=online), \
+             patch.object(runtime.readers, 'service_epoch', return_value='epoch-1'):
+            self.meter.epoch = runtime.readers.service_epoch
+            self.meter.poll()
+        summary = self.meter.summary('admin_master')
+        self.assertEqual(summary['online_devices'], 2)
+        self.assertEqual(summary['online_devices_scope'],
+                         'hysteria_core_instances_only')
+
+    def test_hysteria_online_failure_is_unknown_not_zero(self):
+        self.meter.config['hysteria'] = {'url': 'http://127.0.0.1:19996',
+                                         'secret': 'test'}
+        self.meter.read = self.meter._read
+        with patch.object(runtime.readers, 'read_hysteria',
+                          return_value={'admin_master': {'tx': 0, 'rx': 0}}), \
+             patch.object(runtime.readers, 'read_hysteria_online',
+                          side_effect=OSError('unavailable')), \
+             patch.object(runtime.readers, 'service_epoch', return_value='epoch-1'):
+            self.meter.epoch = runtime.readers.service_epoch
+            self.meter.poll()
+        self.assertIsNone(self.meter.summary('admin_master')['online_devices'])
+
     def test_default_reader_skips_uninstalled_xray(self):
         self.meter.read = self.meter._read
         self.meter.config['reality'] = {'binary': str(ROOT / 'nonexistent-xray')}
@@ -179,7 +209,7 @@ class MeterAccountingTest(unittest.TestCase):
     def test_portal_self_update_includes_all_meter_modules(self):
         tree = ast.parse((ROOT / 'portal.py').read_text(encoding='utf-8'))
         fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)
-                  and n.name == '_h_post_do_upgrade')
+                  and n.name == '_h_post_do_upgrade_impl')
         loop = next(n for n in ast.walk(fn) if isinstance(n, ast.For)
                     and isinstance(n.target, ast.Tuple)
                     and [x.id for x in n.target.elts] == ['fname', 'marker', 'minsize'])

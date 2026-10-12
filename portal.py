@@ -2939,6 +2939,7 @@ def serve(path):
     meta_path = portal_path.parent / 'client_meta.json'
 
     data_lock = threading.RLock()
+    portal_upgrade_lock = threading.Lock()
     ip_tracker = {}
     IP_TIMEOUT_SECONDS = 180
     VALID_USER_ID_RE = re.compile(r'^[a-zA-Z0-9_\-\.]{1,64}$')
@@ -3358,7 +3359,7 @@ if __name__ == '__main__':
         except Exception:
             return False
 
-    def _fetch_repo_file(filename, marker=None, min_size=1024):
+    def _fetch_repo_file(filename, marker=None, min_size=1024, ref="main"):
         """从多个源依次尝试获取仓库里的某个文件，返回内容字节；全失败返回 None。
 
         ⚠️ 不能只用 raw.githubusercontent.com：实测 push 后数分钟仍返回旧内容，
@@ -3367,12 +3368,14 @@ if __name__ == '__main__':
         raw 滞后。顺序：API（权威）→ jsDelivr（无限速）→ raw（兜底）。
         与 install.sh 中 awg_fetch_ctl 的策略保持一致。
         """
+        if ref != "main" and not re.fullmatch(r"[0-9a-f]{40}", ref):
+            raise ValueError("invalid immutable ref")
         sources = [
-            ('https://api.github.com/repos/' + AWG_REPO + '/contents/' + filename + '?ref=main',
+            ('https://api.github.com/repos/' + AWG_REPO + '/contents/' + filename + '?ref=' + ref,
              {'User-Agent': 'Mozilla/5.0', 'Accept': 'application/vnd.github.raw'}),
-            ('https://cdn.jsdelivr.net/gh/' + AWG_REPO + '@main/' + filename,
+            ('https://cdn.jsdelivr.net/gh/' + AWG_REPO + '@' + ref + '/' + filename,
              {'User-Agent': 'Mozilla/5.0'}),
-            ('https://raw.githubusercontent.com/' + AWG_REPO + '/main/' + filename,
+            ('https://raw.githubusercontent.com/' + AWG_REPO + '/' + ref + '/' + filename,
              {'User-Agent': 'Mozilla/5.0'}),
         ]
         for url, headers in sources:
@@ -4223,7 +4226,8 @@ if __name__ == '__main__':
                                 # "停用后列表仍报 active，但客户端连不上"，
                                 # 那是最难排查的一类矛盾。两者必须同源。
                                 'active': (info.get('status', 'active') == 'active'
-                                           and info.get('expires_at', 0) > now_ts),
+                                           and info.get('expires_at', 0) > now_ts
+                                           and (int(info.get('limit_bytes', 0)) <= 0 or int(info.get('used_bytes', 0)) < int(info.get('limit_bytes', 0)))),
                                 'status': info.get('status', 'active'),
                                 'traffic_limit_bytes': info.get('limit_bytes', 0),
                                 'traffic_used_bytes': info.get('used_bytes', 0),
@@ -4398,6 +4402,16 @@ if __name__ == '__main__':
         # ==========================================================================
 
         def _h_post_do_upgrade(self, prefix):
+            if not self.is_authenticated():
+                return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
+            if not portal_upgrade_lock.acquire(blocking=False):
+                return self.reply_json(409, {'ok': False, 'error': '已有门户更新在执行，请等待核验'})
+            try:
+                return self._h_post_do_upgrade_impl(prefix)
+            finally:
+                portal_upgrade_lock.release()
+
+        def _h_post_do_upgrade_impl(self, prefix):
             """POST /do-upgrade 的处理逻辑（从 do_POST 机械搬移而来）。"""
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
@@ -4410,6 +4424,9 @@ if __name__ == '__main__':
                     return self.reply_json(400, {'ok': False, 'error': 'Invalid target'})
 
                 if target == 'portal':
+                    ref = form.get('ref', ['main'])[0]
+                    if ref != 'main' and not re.fullmatch(r'[0-9a-f]{40}', ref):
+                        return self.reply_json(400, {'ok': False, 'error': 'Invalid immutable ref'})
                     # 门户前后端与四个计量模块必须一起更新，避免新旧回调接口不兼容。
                     # 🔴 必须成对更新 —— 门户同时是 Hysteria 的鉴权后端，
                     # 只换其中一个会让它起不来、所有客户端连不上。
@@ -4431,7 +4448,7 @@ if __name__ == '__main__':
                                                    ('usage-meter-readers-20261007-v1.py', b'def read_hysteria', 1024),
                                                    ('usage-meter-runtime-20261007-v1.py', b'ACCOUNTING_REVISION = "2026-10-12-real-usage-v2"', 1024),
                                                    ('usage-meter-xray-config-20261007-v1.py', b'def add_stats', 1024)):
-                        content = _fetch_repo_file(fname, marker=marker, min_size=minsize)
+                        content = _fetch_repo_file(fname, marker=marker, min_size=minsize, ref=ref)
                         if content is None:
                             return self.reply_json(500, {'ok': False, 'error':
                                 '取不到 %s（三个源均失败）—— 已放弃更新，面板保持原样' % fname})
@@ -5620,7 +5637,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                                 'expires_at': info.get('expires_at', 0),
                                 # 与 API 通道同一判据（status + 到期），理由见那边注释。
                                 'active': (info.get('status', 'active') == 'active'
-                                           and info.get('expires_at', 0) > now_ts),
+                                           and info.get('expires_at', 0) > now_ts
+                                           and (int(info.get('limit_bytes', 0)) <= 0 or int(info.get('used_bytes', 0)) < int(info.get('limit_bytes', 0)))),
                                 'status': info.get('status', 'active'),
                                 'traffic_limit_bytes': info.get('limit_bytes', 0),
                                 'traffic_used_bytes': info.get('used_bytes', 0),
