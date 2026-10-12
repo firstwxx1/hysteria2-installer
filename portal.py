@@ -2988,6 +2988,8 @@ def serve(path):
         _usage_spec = importlib.util.spec_from_file_location('portal_usage_runtime', _usage_runtime_path)
         _usage_runtime = importlib.util.module_from_spec(_usage_spec)
         _usage_spec.loader.exec_module(_usage_runtime)
+        if getattr(_usage_runtime, 'ACCOUNTING_REVISION', None) != '2026-10-12-real-usage-v2':
+            raise RuntimeError('usage_meter_runtime_revision_mismatch')
         usage_meter = _usage_runtime.from_file(data, data_lock, save_data,
                                               portal_path.parent / 'usage-meter-config.json',
                                               on_speed=_meter_speed_sample)
@@ -4425,9 +4427,9 @@ if __name__ == '__main__':
                     # 又顺带校验了「JS 常量仍是原始字符串」这个关键属性。
                     for fname, marker, minsize in (('portal.py', b'hysteria2-installer', 20000),
                                                    ('portal_assets.py', b'SCRIPT = r', 10000),
-                                                   ('usage-meter-core-20261007-v1.py', b'def apply_sample', 1024),
+                                                   ('usage-meter-core-20261007-v1.py', b'ACCOUNTING_REVISION = "2026-10-12-real-usage-v2"', 1024),
                                                    ('usage-meter-readers-20261007-v1.py', b'def read_hysteria', 1024),
-                                                   ('usage-meter-runtime-20261007-v1.py', b'class PortalMeter', 1024),
+                                                   ('usage-meter-runtime-20261007-v1.py', b'ACCOUNTING_REVISION = "2026-10-12-real-usage-v2"', 1024),
                                                    ('usage-meter-xray-config-20261007-v1.py', b'def add_stats', 1024)):
                         content = _fetch_repo_file(fname, marker=marker, min_size=minsize)
                         if content is None:

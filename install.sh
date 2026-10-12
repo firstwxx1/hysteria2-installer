@@ -1469,56 +1469,63 @@ elif [[ "$TARGET" == "portal" ]]; then
     # 而且不把查询串算进缓存键（加 ?cb=<时间戳> 无效）。按 API → jsDelivr → raw 回退。
     # 说明：Web 控制台的面板自更新已不走本脚本（它在 portal.py 内部用同一套回退
     # 取文件并原子替换），这里保留是为了手工调用 do_upgrade.sh portal 的场景。
-    TMP_PORTAL="/tmp/portal_latest.py"
     REPO="yys9253462-gif/hysteria2-installer"
-    rm -f "$TMP_PORTAL"
-    curl -fsSL -H "Accept: application/vnd.github.raw" \
-        "https://api.github.com/repos/${REPO}/contents/portal.py?ref=main" \
-        -o "$TMP_PORTAL" 2>/dev/null || true
-    if ! grep -q 'hysteria2-installer' "$TMP_PORTAL" 2>/dev/null; then
-        curl -fsSL "https://cdn.jsdelivr.net/gh/${REPO}@main/portal.py" \
-            -o "$TMP_PORTAL" 2>/dev/null || true
-    fi
-    if ! grep -q 'hysteria2-installer' "$TMP_PORTAL" 2>/dev/null; then
-        curl -fsSL "https://raw.githubusercontent.com/${REPO}/main/portal.py" \
-            -o "$TMP_PORTAL" 2>/dev/null || true
-    fi
-    if grep -q 'hysteria2-installer' "$TMP_PORTAL" 2>/dev/null; then
-        cp -f "$HY2_DIR/portal.py" "$HY2_DIR/portal.py.bak" 2>/dev/null || true
-        mv -f "$TMP_PORTAL" "$HY2_DIR/portal.py"
-        chmod 644 "$HY2_DIR/portal.py"
-        # 计量模块一并更新（2026-10-08）。
-        # ⚠️ 只换 portal.py 会让四个计量模块永远停在旧版，而 portal.py
-        # 按固定文件名加载它们 —— 新 portal 配旧模块（或反过来）
-        # 可能因接口不匹配而静默降级为「未开始计量」。
-        _meter_upd_ok=1
-        for _m in usage-meter-core-20261007-v1.py usage-meter-readers-20261007-v1.py usage-meter-runtime-20261007-v1.py usage-meter-xray-config-20261007-v1.py; do
-            _tmp_m="/tmp/$_m.upd"
-            rm -f "$_tmp_m"
-            curl -fsSL -H "Accept: application/vnd.github.raw" "https://api.github.com/repos/${REPO}/contents/${_m}?ref=main" -o "$_tmp_m" 2>/dev/null || true
-            if ! grep -q 'usage' "$_tmp_m" 2>/dev/null; then
-                curl -fsSL "https://cdn.jsdelivr.net/gh/${REPO}@main/${_m}" -o "$_tmp_m" 2>/dev/null || true
-            fi
-            if [[ -s "$_tmp_m" ]]; then
-                if python3 -c 'import ast,sys; ast.parse(open(sys.argv[1],encoding="utf-8").read())' "$_tmp_m" 2>/dev/null; then
-                    mv -f "$_tmp_m" "$HY2_DIR/$_m"
-                    chmod 644 "$HY2_DIR/$_m"
-                else
-                    echo "计量模块 ${_m} 语法校验失败，保留旧版" >&2
-                    rm -f "$_tmp_m"
-                    _meter_upd_ok=0
-                fi
-            else
-                echo "计量模块 ${_m} 拉取失败，保留旧版" >&2
-                rm -f "$_tmp_m"
-                _meter_upd_ok=0
+    _bundle_dir="$(mktemp -d)"
+    _bundle_files="portal.py portal_assets.py usage-meter-core-20261007-v1.py usage-meter-readers-20261007-v1.py usage-meter-runtime-20261007-v1.py usage-meter-xray-config-20261007-v1.py"
+    # 全部先下载并检查；旧缓存、缺文件或语法错误不允许半更新。
+    for _m in $_bundle_files; do
+        case "$_m" in
+            portal.py) _marker='def page_html' ;;
+            portal_assets.py) _marker='SCRIPT = r' ;;
+            usage-meter-core-*|usage-meter-runtime-*) _marker='ACCOUNTING_REVISION = "2026-10-12-real-usage-v2"' ;;
+            *) _marker='def ' ;;
+        esac
+        _tmp_m="$_bundle_dir/$_m"
+        _file_ok=0
+        for _url in "https://api.github.com/repos/${REPO}/contents/${_m}?ref=main" \
+                    "https://cdn.jsdelivr.net/gh/${REPO}@main/${_m}" \
+                    "https://raw.githubusercontent.com/${REPO}/main/${_m}"; do
+            if curl -fsSL --max-time 30 -H "Accept: application/vnd.github.raw" "$_url" -o "$_tmp_m" 2>/dev/null &&
+               grep -Fq "$_marker" "$_tmp_m" &&
+               python3 -c 'import ast,sys; ast.parse(open(sys.argv[1],encoding="utf-8").read())' "$_tmp_m" 2>/dev/null; then
+                _file_ok=1; break
             fi
         done
-        if [[ "$_meter_upd_ok" == "1" ]]; then
-            echo "面板与计量模块已更新"
-        else
-            echo "面板已更新，但部分计量模块拉取失败（见上）" >&2
+        if [[ "$_file_ok" != "1" ]]; then
+            echo "门户整包校验失败: ${_m}，保留全部旧文件" >&2
+            rm -rf "$_bundle_dir"
+            exit 1
         fi
+    done
+    if [[ "$_file_ok" == "1" ]]; then
+        # 写入失败时恢复整包，避免模块接口不一致。
+        python3 - "$HY2_DIR" "$_bundle_dir" $_bundle_files <<'PYBUNDLE'
+import os, pathlib, shutil, sys, time
+dest, stage = map(pathlib.Path, sys.argv[1:3])
+files = sys.argv[3:]
+backup = dest / 'backups' / ('portal-bundle-' + time.strftime('%Y%m%d-%H%M%S'))
+backup.mkdir(parents=True, mode=0o700)
+existing = {f: (dest / f).exists() for f in files}
+for f in files:
+    if existing[f]: shutil.copy2(dest / f, backup / f)
+written = []
+try:
+    for f in files:
+        temp = dest / (f + '.bundle-new')
+        shutil.copyfile(stage / f, temp)
+        temp.chmod(0o644)
+        os.replace(temp, dest / f)
+        written.append(f)
+except Exception:
+    for f in written:
+        if existing[f]: shutil.copy2(backup / f, dest / f)
+        else: (dest / f).unlink()
+    raise
+PYBUNDLE
+        _write_rc=$?
+        rm -rf "$_bundle_dir"
+        [[ "$_write_rc" == "0" ]] || exit 1
+        echo "面板、前端与计量模块已整包更新"
         # 计量配置自愈（2026-10-08）：老装机 / 手工改过的 config.yaml 可能没有
         # trafficStats 段，于是 usage-meter-config.json 从未生成，portal 启动即
         # `真实计量未初始化: FileNotFoundError` —— 换模块也治不好。
@@ -1880,6 +1887,10 @@ portal_files_ok() {
     local m
     for m in $METER_FILES; do
         [[ -s "${dir}/${m}" ]] || return 1
+    done
+    # 语法正确不代表兼容：CDN 旧缓存可能把新面板与旧计量模块混装。
+    for m in usage-meter-core-20261007-v1.py usage-meter-runtime-20261007-v1.py; do
+        grep -q '^ACCOUNTING_REVISION = "2026-10-12-real-usage-v2"$' "${dir}/${m}" || return 1
     done
     # ast.parse 而不是 py_compile —— 后者会在源文件旁边生成 __pycache__
     # 🔴 每个文件都必须带 "${dir}/" 前缀：这里传的是【文件名】而不是【路径】。

@@ -16,6 +16,8 @@ def load(name, filename):
 
 core=load('usage_meter_core', 'usage-meter-core-20261007-v1.py')
 readers=load('usage_meter_readers', 'usage-meter-readers-20261007-v1.py')
+if getattr(core, 'ACCOUNTING_REVISION', None) != ACCOUNTING_REVISION:
+    raise RuntimeError('usage_meter_core_revision_mismatch')
 
 class PortalMeter:
     def __init__(self, data, lock, save, config, read=None, epoch=None, on_speed=None):
@@ -106,7 +108,7 @@ class PortalMeter:
                 'measurement_started_at':m.get('started_at'),
                 'measurement_ok':initialized and fresh and not m.get('gaps'),
                 'measurement_scope':'since_measurement_started',
-                'measurement_sources':copy.deepcopy(health),
+                'measurement_sources':{s:copy.deepcopy(health.get(s, {})) for s in enabled},
                 'measurement_gaps':copy.deepcopy(m.get('gaps',[])),
                 'legacy_auth_value':self.data.get('users',{}).get(uid,{}).get('legacy_auth_value', self.data.get('users',{}).get(uid,{}).get('used_bytes',0))}
 

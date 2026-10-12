@@ -4,6 +4,8 @@
 """
 import copy
 
+ACCOUNTING_REVISION = "2026-10-12-real-usage-v2"
+
 
 def apply_sample(state, source, epoch, counters, sampled_at):
     if source not in ('hysteria', 'reality'):

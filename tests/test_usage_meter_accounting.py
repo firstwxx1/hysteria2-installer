@@ -61,6 +61,28 @@ class MeterAccountingTest(unittest.TestCase):
         self.meter.config['reality'] = {'binary': str(ROOT / 'nonexistent-xray')}
         self.assertEqual(self.meter.enabled_sources(), ['hysteria'])
 
+    def test_upgrade_preserves_existing_totals_without_requiring_absent_xray(self):
+        # 真实旧部署：Hy2 已采集累计，Reality 未安装，used_bytes 却仍为 0。
+        self.meter.poll()
+        self.counters['hysteria']['admin_master']['tx'] = 12345
+        self.meter.poll()
+        self.data['users']['admin_master']['used_bytes'] = 0
+        self.data['usage_meter']['health']['reality'] = {'ok': False, 'error': 'RuntimeError'}
+        with patch.object(runtime.readers, 'read_hysteria', return_value=self.counters['hysteria']):
+            upgraded = runtime.PortalMeter(self.data, threading.RLock(), lambda: None,
+                {'hysteria': {'url': 'http://127.0.0.1:19996', 'secret': 'test'},
+                 'reality': {'binary': str(ROOT / 'nonexistent-xray')}}, epoch=lambda _: 'epoch-1')
+            upgraded.poll()
+            summary = upgraded.summary('admin_master')
+        self.assertTrue(summary['measurement_ok'])
+        self.assertEqual(summary['measured_bytes'], 12345)
+        self.assertEqual(self.data['users']['admin_master']['used_bytes'], 12345)
+        self.assertNotIn('reality', summary['measurement_sources'])
+        self.assertEqual(self.data['users']['admin_master']['password'], 'unchanged')
+
+    def test_core_and_runtime_revision_match(self):
+        self.assertEqual(runtime.core.ACCOUNTING_REVISION, runtime.ACCOUNTING_REVISION)
+
     def test_failed_save_rolls_back_usage_and_emits_no_speed(self):
         self.meter.poll()
         before = copy.deepcopy(self.data)
