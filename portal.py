@@ -2,11 +2,13 @@
 采用现代轻奢 Tab 导航系统，解耦节点连接、多用户管理（支持 IP 限制与实时流量统计）与集群 API 凭据。
 """
 import ast
+import copy
 import base64
 import hashlib
 import hmac
 import html
 import json
+import math
 import importlib.util
 import ipaddress
 import os
@@ -59,7 +61,7 @@ MASTER_USER_ID = 'admin_master'
 #
 # ⚠️ 改动 portal.py 的**能力**时记得同步 +1，否则主面板会按旧能力显示。
 # 格式固定 `PORTAL_VERSION = 'x.y'`（capabilities 端点按行首匹配解析它）。
-PORTAL_VERSION = '2.5'
+PORTAL_VERSION = '2.6'
 
 DEFAULT_WARP_DOMAINS = (
     'ipify.org', 'cloudflare.com',
@@ -292,7 +294,7 @@ def strip_managed_outbounds(cfg_text):
     return '\n'.join(out)
 
 
-def build_acl_block(mode, rules, outbounds, tail_outbound='direct'):
+def build_acl_block(mode, rules, outbounds, tail_outbound='direct', existing_names=None):
     """生成 acl.inline 块。
 
     mode='global'：全部流量走选中的出站（真正的"全局出口"）
@@ -302,6 +304,8 @@ def build_acl_block(mode, rules, outbounds, tail_outbound='direct'):
     列表第一个出站上——那通常是内建 direct_ipv4，行为不可控。
     """
     names = [ob['name'] for ob in (outbounds or [])]
+    existing = set(_existing_outbound_names() if existing_names is None else existing_names)
+    available = set(names) | existing | {'direct', 'reject'}
     acl = ['acl:', '  inline:']
 
     if mode == 'global' and names:
@@ -314,8 +318,8 @@ def build_acl_block(mode, rules, outbounds, tail_outbound='direct'):
             continue
         target = r.get('outbound') or ''
         # 出站可能已被用户删除 —— 引用不存在的名字会让 Hysteria 起不来
-        if target not in names:
-            target = 'warp_socks' if 'warp_socks' in _existing_outbound_names() else tail_outbound
+        if target not in available:
+            target = 'warp_socks' if 'warp_socks' in existing else tail_outbound
         acl.append('    - %s(suffix:%s)' % (target, dom))
 
     acl.append('    - %s(all)' % tail_outbound)
@@ -329,6 +333,15 @@ def _existing_outbound_names():
     except Exception:
         return []
     return re.findall(r'^\s*-\s*name:\s*(\S+)\s*$', cfg, re.M)
+
+
+def outbound_target_exists(target, outbounds=None, existing_names=None):
+    target = str(target or '').strip()
+    if target in ('direct', 'reject'):
+        return True
+    custom = {str(o.get('name') or '') for o in (outbounds or []) if isinstance(o, dict)}
+    configured = set(_existing_outbound_names() if existing_names is None else existing_names)
+    return bool(target) and target in custom | configured
 
 
 def build_warp_acl_config(original, enabled, rules):
@@ -367,6 +380,47 @@ def build_warp_acl_config(original, enabled, rules):
     return text.rstrip('\n') + '\n\n' + '\n'.join(lines) + '\n'
 
 
+def normalize_route_rules(rules):
+    result = []
+    for item in rules or ():
+        if isinstance(item, str):
+            item = {'domain': item, 'outbound': 'warp_socks'}
+        if not isinstance(item, dict):
+            continue
+        domain = str(item.get('domain') or '').strip().lower().strip('.')
+        if domain and re.fullmatch(r'[a-z0-9.-]+', domain):
+            result.append({'domain': domain, 'outbound': str(item.get('outbound') or 'warp_socks')})
+    return result
+
+
+def routing_state(data):
+    return {'warp_enabled': bool(data.get('warp_enabled', False)),
+            'warp_rules': copy.deepcopy(data.get('warp_rules', DEFAULT_WARP_DOMAINS if data.get('warp_enabled') else [])),
+            'custom_outbounds': copy.deepcopy(data.get('custom_outbounds', [])),
+            'outbound_mode': data.get('outbound_mode', 'rules')}
+
+
+def render_egress_config(original, state):
+    enabled = bool(state.get('warp_enabled', False))
+    # Ensure the WARP transport/sniffer, then render the one shared route table.
+    base = strip_acl_block(build_warp_acl_config(original, enabled, []))
+    outs = state.get('custom_outbounds', [])
+    base = upsert_outbound_block(base, outs)
+    existing = re.findall(r'^\s*-\s*name:\s*(\S+)\s*$', base, re.M)
+    tail = 'direct_ipv4' if 'direct_ipv4' in existing else 'direct'
+    rules = normalize_route_rules(state.get('warp_rules', []))
+    if not enabled:
+        rules = [r for r in rules if r['outbound'] not in ('warp', 'warp_socks')]
+    elif 'warp_socks' not in existing and 'warp' in existing:
+        rules = [dict(r, outbound='warp') if r['outbound'] == 'warp_socks' else r for r in rules]
+    mode = state.get('outbound_mode', 'rules')
+    if mode == 'global' and not outs:
+        mode = 'rules'
+    if not rules and not outs:
+        return base.rstrip('\n') + '\n'
+    return base.rstrip('\n') + '\n\n' + build_acl_block(mode, rules, outs, tail, existing_names=existing) + '\n'
+
+
 def _hy2_runtime_identity():
     """Return active state, PID and start timestamp for reload verification."""
     proc = subprocess.run(
@@ -391,7 +445,7 @@ def _hy2_config_loaded(config_path, identity=None):
         return False
 
 
-def apply_warp_acl_config(data, data_lock, config_path='/etc/hysteria/config.yaml'):
+def apply_egress_config(data, data_lock, config_path='/etc/hysteria/config.yaml'):
     """Apply WARP rules transactionally; success requires a new active process."""
     cfg = Path(config_path)
     try:
@@ -399,9 +453,10 @@ def apply_warp_acl_config(data, data_lock, config_path='/etc/hysteria/config.yam
     except Exception as exc:
         return False, '读取 Hysteria 配置失败: %s' % exc
     with data_lock:
-        enabled = bool(data.get('warp_enabled', False))
-        rules = list(data.get('warp_rules', DEFAULT_WARP_DOMAINS))
-    rendered = build_warp_acl_config(original, enabled, rules)
+        if data.get('outbound_mode') == 'global' and not data.get('custom_outbounds'):
+            data['outbound_mode'] = 'rules'
+        state = routing_state(data)
+    rendered = render_egress_config(original, state)
     try:
         before = _hy2_runtime_identity()
         if rendered == original and _hy2_config_loaded(cfg, before):
@@ -436,6 +491,10 @@ def apply_warp_acl_config(data, data_lock, config_path='/etc/hysteria/config.yam
     if rollback_state != 'active':
         return False, '%s；并且恢复原配置后服务状态为 %s' % (detail, rollback_state)
     return False, '%s；已回滚原配置' % detail
+
+
+def apply_warp_acl_config(data, data_lock, config_path='/etc/hysteria/config.yaml'):
+    return apply_egress_config(data, data_lock, config_path)
 
 
 def warp_acl_matches(config_text, enabled, rules):
@@ -478,165 +537,8 @@ def detect_outbound_ip(kind='auto', addr='', timeout=6):
 
 
 def apply_outbounds_config(data, data_lock, config_path='/etc/hysteria/config.yaml'):
-    """把出站配置写进 Hysteria 并安全应用。返回 (ok, error)。
-
-    🔴🔴 data / data_lock 必须由调用方（serve() 内部）传进来：
-    它们是 serve() 的闭包变量，模块级函数访问不到
-    （2026-10-09 实测踩到：NameError: data_lock is not defined，
-    且异常发生在改配置的中途，门户线程直接抛出、
-    请求连接被关闭 —— 表现为"点保存就断线"）。
-
-    🔴🔴 这段是整个自定义出站功能的**安全底线**，逻辑顺序不能改：
-      1. 先备份原文件
-      2. 写新配置
-      3. 真重启服务
-      4. 校验 is-active
-      5. 起不来 → 立刻回滚 + 再重启 → 返回失败
-
-    为什么必须这么写：ACL 里只要引用了一个不存在的出站名，
-    Hysteria 就会 `invalid config: outbound xxx not found` 启动失败。
-    面板上的一个"保存"按钮，能把整台机器的代理服务打挂。
-    历史教训：早期版本没做 is-active 校验，写完就返回成功，
-    用户看到的提示是"已保存"，实际上服务已经挂了、且无法自救。
-    """
-    cfg = Path(config_path)
-    if not cfg.exists():
-        return False, '配置文件不存在: %s' % config_path
-    try:
-        original = cfg.read_text(encoding='utf-8')
-    except Exception as e:
-        return False, '读取配置失败: %s' % e
-
-    with data_lock:
-        outs = [dict(o) for o in data.get('custom_outbounds', [])]
-        rules = [dict(r) if isinstance(r, dict) else {'domain': str(r), 'outbound': 'warp_socks'}
-                 for r in data.get('warp_rules', [])]
-        mode = data.get('outbound_mode', 'rules')
-
-    try:
-        # 1) 先清掉旧的 acl 块（保留其余全部内容，详见 strip_acl_block 注释）
-        text = strip_acl_block(original)
-        # 2) 写/更新自定义出站段（只动 out_ 前缀的，保留内建）
-        text = upsert_outbound_block(text, outs)
-        # 3) 决定兜底出站名：优先内建 direct_ipv4，其次 direct
-        existing = re.findall(r'^\s*-\s*name:\s*(\S+)\s*$', text, re.M)
-        tail = 'direct_ipv4' if 'direct_ipv4' in existing else 'direct'
-        # 4) 生成 acl
-        if mode == 'global' and not outs:
-            # 🔴 删掉最后一个自定义出站后，全局模式已无对象可指。
-            #    旧实现直接 return False，于是这次删除被整体回滚 ——
-            #    表现为"删不掉最后一个出站"，而且规则清理也被连带撤销。
-            #    正确处理：**自动退回分流模式**，让用户始终能删干净。
-            mode = 'rules'
-            try:
-                with data_lock:
-                    data['outbound_mode'] = 'rules'
-            except Exception:
-                pass
-        text = text.rstrip('\n') + '\n\n' + build_acl_block(mode, rules, outs, tail) + '\n'
-
-        # 🔴 语法预检：config.yaml 是 YAML，写坏了服务同样起不来。
-        # 这里用 hysteria 自己的 config check 能力最可靠，
-        # 但它可能不存在（旧版本无此子命令），因此失败不阻断 ——
-        # 真正的兜底是后面的 is-active 校验 + 回滚。
-        cfg.write_text(text, encoding='utf-8')
-    except Exception as e:
-        try:
-            cfg.write_text(original, encoding='utf-8')
-        except Exception:
-            pass
-        return False, '写入配置失败: %s' % e
-
-    # 🔴🔴 restart 之前**必须 reset-failed**。
-        #
-        # 真实事故（2026-10-09第 4 轮回归）：连续切几次模式后，
-        # systemd 进入 `start-limit-hit` 状态 —— 此后即使配置完全合法、
-        # 端口空闲，`systemctl start` 也会直接拒绝：
-        #     Failed to start hysteria-server.service.
-        #     hysteria-server.service: Failed with result 'start-limit-hit'.
-        # 也就是说**一次失败就把服务永久锁死**，此后所有出站操作都会
-        # 报"配置可能有误"，把用户引向完全错误的方向（真因是 systemd 限流）。
-        #
-        # 面板上的操作会连续触发 restart，所以必须每次都先清掉失败计数。
-        subprocess.run(['systemctl', 'reset-failed', 'hysteria-server'],
-                       capture_output=True, timeout=15)
-    # 🔴🔴🔴 用 stop + reset-failed + start，**不要用 restart**。
-        #
-        # 第 4 轮回归实测（真实事故）：`systemctl restart` 在连续操作时
-        # 会撞上 systemd 的 start-limit ——
-        #     Stopping ... Stopped ... Start request repeated too quickly.
-        #     hysteria-server.service: Failed with result 'start-limit-hit'.
-        # 一旦进入该状态，**后续所有 start/restart 都被直接拒绝**，
-        # 于是「配置明明合法、端口空闲、服务就是起不来」，
-        # 而错误提示却说"配置可能有误"，把用户引向完全错误的方向。
-        #
-        # `reset-failed` 才是解封手段，且必须在每次启动**之前**做
-        # （原来只在 restart 前做了一次，回滚路径里的那次 restart 没做，
-        #  结果一次失败就把服务永久锁死）。
-        _restart_hy2()
-    except subprocess.TimeoutExpired:
-        _rollback_outbounds(cfg, original)
-        return False, '重启超时（服务未响应）'
-    except Exception as e:
-        _rollback_outbounds(cfg, original)
-        return False, '重启失败: %s' % e
-
-    # 🔴 轮询等就绪而不是死等 2 秒：Hysteria 启动要解析配置、绑端口，
-    #    慢一点时 2 秒不够，会被误判成失败（又触发一次回滚，越滚越乱）。
-    state = 'unknown'
-    for _i in range(12):
-        try:
-            state = subprocess.run(['systemctl', 'is-active', 'hysteria-server'],
-                                   capture_output=True, text=True,
-                                   timeout=8).stdout.strip()
-        except Exception as e:
-            state = 'unknown(%s)' % e
-        if state == 'active':
-            break
-        # 已经是明确失败就别再等了
-        if state in ('failed', 'inactive'):
-            break
-        time.sleep(1)
-    if state == 'active':
-        # 再确认一次：连续操作时偶发"起来了又立刻挂"
-        time.sleep(1)
-        try:
-            if subprocess.run(['systemctl', 'is-active', 'hysteria-server'],
-                              capture_output=True, text=True,
-                              timeout=8).stdout.strip() != 'active':
-                state = 'unstable'
-        except Exception:
-            pass
-
-    if state != 'active':
-        # 🔴 起不来 = 配置有问题（多半是出站名拼错或地址格式不被接受）
-        #    必须回滚，否则用户的服务就废了、且面板再也连不上
-        rb_state = _rollback_outbounds(cfg, original)
-        if rb_state == 'active':
-            # 🔴 第 4 轮回归实测到的两种失败必须分开提示，
-            #    否则会把用户引向完全错误的方向：
-            #   · 配置真的写错了（出站名字段/地址格式不被 hysteria 接受）
-            #   · 配置没错，但**出站指向的代理没在跑** —— 最常见的一种，
-            #     因为 hysteria 启动后会立刻尝试连它，连不上就退出。
-            #     旧提示只说"配置可能有误 / HTTP 不支持 UDP"，
-            #     用户会去反复检查格式，永远查不出真因。
-            unreachable = _unreachable_outbounds(outs)
-            if unreachable:
-                return False, (
-                    'Hysteria 启动失败，已自动回滚到原配置。\n'
-                    '原因：**出站「%s」指向的代理连不上**（该地址没有服务在监听）。\n'
-                    '请先启动该代理，或改用其他出站。'
-                    % '」「'.join(unreachable))
-            return False, ('Hysteria 启动失败（配置可能有误，已自动回滚到原配置）。'
-                           '请检查出站地址格式；HTTP 出站不支持 UDP。')
-        # 🔴 回滚后仍起不来 = 服务真的挂了，必须直说，
-        #    否则用户只会反复重试，而真因（可能是 systemd start-limit-hit）
-        #    永远不会被发现。
-        return False, ('Hysteria 启动失败，**回滚后服务仍未恢复**（当前状态: %s）。'
-                       '请 SSH 登录执行：'
-                       'systemctl reset-failed hysteria-server && systemctl start hysteria-server'
-                       '　并查看 journalctl -u hysteria-server -n 30。' % rb_state)
-    return True, ''
+    """Custom outbounds and WARP share the same compiler, transaction and readiness check."""
+    return apply_egress_config(data, data_lock, config_path)
 
 
 def _restart_hy2():
@@ -727,6 +629,150 @@ def _rollback_outbounds(cfg, original):
     except Exception:
         pass
     return state
+
+
+def core_version_key(value):
+    match = re.search(r'(\d+)\.(\d+)\.(\d+)', str(value or ''))
+    return tuple(map(int, match.groups())) if match else ()
+
+
+def resolve_update_ref(ref):
+    if re.fullmatch(r'[0-9a-f]{40}', ref):
+        return ref
+    if ref != 'main':
+        raise ValueError('Invalid immutable ref')
+    req = urllib.request.Request('https://api.github.com/repos/' + AWG_REPO + '/commits/main',
+                                 headers={'User-Agent': 'hysteria2-installer'})
+    with urllib.request.urlopen(req, timeout=8) as response:
+        value = json.loads(response.read().decode('utf-8')).get('sha', '')
+    if not re.fullmatch(r'[0-9a-f]{40}', value):
+        raise RuntimeError('无法固定面板更新版本，未修改现有文件')
+    return value
+
+
+def upgrade_core_binary(binary='/usr/local/bin/hysteria', backup_dir='/etc/hysteria/core-backups', allow_custom=False):
+    binary = Path(binary)
+    current = subprocess.run([str(binary), 'version'], capture_output=True, text=True, timeout=5).stdout
+    current_line = next((line.split(':', 1)[1].strip() for line in current.splitlines() if line.strip().startswith('Version:')), '')
+    if '+' in current_line and not allow_custom:
+        raise RuntimeError('当前核心含定制补丁，升级官方核心需要明确确认覆盖补丁')
+    machine = platform.machine().lower()
+    arch = {'x86_64': 'amd64', 'amd64': 'amd64', 'aarch64': 'arm64', 'arm64': 'arm64', 'armv7l': 'armv7'}.get(machine)
+    if not arch:
+        raise RuntimeError('Unsupported core architecture')
+    fd, name = tempfile.mkstemp(prefix='.hysteria-update-', dir=str(binary.parent))
+    os.close(fd)
+    candidate = Path(name)
+    backup = None
+    replaced = False
+    try:
+        url = 'https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-' + arch
+        req = urllib.request.Request(url, headers={'User-Agent': 'hysteria2-installer'})
+        with urllib.request.urlopen(req, timeout=90) as source, open(candidate, 'wb') as dest:
+            shutil.copyfileobj(source, dest)
+        with candidate.open('rb') as stream:
+            if stream.read(4) != b'\x7fELF':
+                raise RuntimeError('下载内容不是 Linux 核心二进制，原核心未更改')
+        candidate.chmod(0o755)
+        verified = subprocess.run([str(candidate), 'version'], capture_output=True, text=True, timeout=8)
+        newer = next((line.split(':', 1)[1].strip() for line in verified.stdout.splitlines() if line.strip().startswith('Version:')), '')
+        if verified.returncode != 0 or not core_version_key(newer):
+            raise RuntimeError('候选核心版本校验失败，原核心未更改')
+        if core_version_key(current_line) and core_version_key(newer) <= core_version_key(current_line):
+            return {'changed': False, 'version': current_line, 'message': '当前核心版本不低于官方候选，未替换现有补丁'}
+        directory = Path(backup_dir)
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        backup = directory / ('hysteria-' + str(time.time_ns()))
+        shutil.copy2(binary, backup)
+        before = _hy2_runtime_identity()
+        os.replace(candidate, binary)
+        replaced = True
+        _restart_hy2()
+        time.sleep(1)
+        after = _hy2_runtime_identity()
+        if after[0] != 'active' or after == before:
+            raise RuntimeError('新核心未成功加载')
+        return {'changed': True, 'version': newer, 'backup': str(backup)}
+    except Exception:
+        if replaced and backup is not None:
+            shutil.copy2(backup, binary)
+            _restart_hy2()
+        raise
+    finally:
+        candidate.unlink(missing_ok=True)
+
+
+def gost_tls_paths(root):
+    """Reuse the node's existing certificate/key instead of referencing nonexistent files."""
+    root = Path(root)
+    config = root / 'config.yaml'
+    cert = _config_tls_cert_path(str(config)) or _config_acme_cert_path(str(config))
+    key = ''
+    in_tls = False
+    if config.exists():
+        for raw in config.read_text(encoding='utf-8').splitlines():
+            if not raw.strip() or raw.lstrip().startswith('#'):
+                continue
+            if not raw.startswith((' ', '\t')):
+                in_tls = raw.split(':', 1)[0] == 'tls'
+            elif in_tls and raw.strip().startswith('key:'):
+                values = shlex.split(raw.strip().split(':', 1)[1], comments=True)
+                key = values[0] if values else ''
+    if cert:
+        cert = Path(os.path.expandvars(str(cert)))
+        if not cert.is_absolute():
+            cert = root / cert
+        key = Path(os.path.expandvars(key)) if key else cert.with_suffix('.key')
+        if not key.is_absolute():
+            key = root / key
+        if cert.is_file() and key.is_file() and cert.stat().st_size and key.stat().st_size:
+            return str(cert), str(key)
+    legacy = root / 'gost-cert'
+    if (legacy / 'cert.pem').is_file() and (legacy / 'key.pem').is_file():
+        return str(legacy / 'cert.pem'), str(legacy / 'key.pem')
+    raise RuntimeError('HTTPS 代理缺少可用证书和私钥，请先配置节点证书')
+
+
+def apply_xray_config_transaction(config, config_path='/etc/hysteria/xray.json',
+                                  binary='/usr/local/bin/xray', restart=True):
+    """Validate a candidate before replacing; restore prior config on start failure."""
+    path = Path(config_path)
+    original = path.read_bytes() if path.exists() else None
+    mode = path.stat().st_mode & 0o777 if path.exists() else 0o600
+    candidate = path.with_name(path.name + '.portal-candidate.json')
+    was_active = subprocess.run(['systemctl', 'is-active', 'xray'], capture_output=True,
+                                text=True, timeout=5).stdout.strip() == 'active'
+    replaced = False
+    try:
+        candidate.write_text(json.dumps(config, indent=2), encoding='utf-8')
+        candidate.chmod(mode)
+        test = subprocess.run([binary, 'run', '-test', '-c', str(candidate)],
+                              capture_output=True, text=True, timeout=10)
+        if test.returncode != 0:
+            raise RuntimeError('Xray 配置预检失败，原配置未更改')
+        os.replace(candidate, path)
+        replaced = True
+        if restart:
+            subprocess.run(['systemctl', 'reset-failed', 'xray'], capture_output=True, timeout=5)
+            started = subprocess.run(['systemctl', 'restart', 'xray'], capture_output=True, timeout=15)
+            active = subprocess.run(['systemctl', 'is-active', 'xray'], capture_output=True,
+                                    text=True, timeout=5).stdout.strip()
+            if started.returncode != 0 or active != 'active':
+                raise RuntimeError('Xray 启动失败，已恢复原配置')
+    except Exception:
+        if replaced:
+            if original is None:
+                path.unlink(missing_ok=True)
+            else:
+                candidate.write_bytes(original)
+                candidate.chmod(mode)
+                os.replace(candidate, path)
+            if was_active and original is not None:
+                subprocess.run(['systemctl', 'reset-failed', 'xray'], capture_output=True, timeout=5)
+                subprocess.run(['systemctl', 'restart', 'xray'], capture_output=True, timeout=15)
+        raise
+    finally:
+        candidate.unlink(missing_ok=True)
 
 
 def set_outbound_apply_error(data, data_lock, save_data, msg):
@@ -1480,7 +1526,7 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
           <p class="hint">适用于 v2rayN / Shadowrocket / sing-box</p>
           <div class="qr-frame" style="max-width:220px;margin:16px auto;padding:10px"><div id="reality-qr-box" style="width:100%;height:auto"></div></div>
           <p class="hint">客户端直接扫码即可一键导入</p>
-          <div class="tags"><span class="tag">VLESS</span><span class="tag">Reality</span><span class="tag">Vision</span><span class="tag">TCP 443</span></div>
+          <div class="tags"><span class="tag">VLESS</span><span class="tag">Reality</span><span class="tag">Vision</span><span class="tag" id="reality-port-tag">TCP --</span></div>
         </section>
 
         <div class="stack">
@@ -2872,7 +2918,7 @@ def sync_pin(m, root, meta_path):
 
 def prepare(meta_path, port, node_api_key=None):
     root = Path(meta_path).parent
-    m = json.loads(Path(meta_path).read_text())
+    m = json.loads(Path(meta_path).read_text(encoding='utf-8'))
     # 先修信任模型（cert_type/server_name/is_insecure/pin），再对齐 pin。
     # 顺序不能反：sync_pin 依赖 is_insecure 判断 pin 该不该留，而 is_insecure
     # 本身可能正漂移着（自签证书被换成正式证书后仍是 true）。
@@ -2957,16 +3003,16 @@ def sync_download_artifacts(data, uri, clash, sing):
 
 def refresh(meta_path, config_path='/etc/hysteria/config.yaml'):
     root = Path(meta_path).parent
-    m = json.loads(Path(meta_path).read_text())
+    m = json.loads(Path(meta_path).read_text(encoding='utf-8'))
     # 证书可能已被带外替换（Caddy 续期 / 手工换证），先修信任模型再对齐 pin。
     # 顺序有依赖：sync_pin 依赖 is_insecure 判断 pin 去留，而 is_insecure 本身
     # 可能正漂移着（自签被换成正式证书后仍是 true）。
     sync_cert_trust(m, root, meta_path, config_path=config_path)
     sync_pin(m, root, meta_path)
 
-    access = json.loads((root / 'portal-access.json').read_text())
+    access = json.loads((root / 'portal-access.json').read_text(encoding='utf-8'))
     path = root / 'portal.json'
-    data = json.loads(path.read_text())
+    data = json.loads(path.read_text(encoding='utf-8'))
     uri, clash, sing = artifacts(m)
     host = m['public_ip'] if m['is_insecure'] else m['server_name']
     subscription = f"https://{access['username']}:{access['password']}@{host}:{resolve_subscription_port(m)[0]}/{data['token']}/clash.yaml"
@@ -3026,7 +3072,7 @@ def selfheal(meta_path, config_path='/etc/hysteria/config.yaml'):
     if not meta_file.exists():
         return False
     try:
-        m = json.loads(meta_file.read_text())
+        m = json.loads(meta_file.read_text(encoding='utf-8'))
     except (OSError, ValueError):
         return False
 
@@ -3055,14 +3101,20 @@ def selfheal(meta_path, config_path='/etc/hysteria/config.yaml'):
 
 def serve(path):
     portal_path = Path(path)
-    data = json.loads(portal_path.read_text())
+    data = json.loads(portal_path.read_text(encoding='utf-8'))
     session_secret = data.get('session_secret', data['auth_hash'])
     meta_path = portal_path.parent / 'client_meta.json'
 
     data_lock = threading.RLock()
     portal_upgrade_lock = threading.Lock()
     warp_apply_lock = threading.Lock()
-    data.pop('warp_applying', None)  # an interrupted worker cannot survive a process restart
+    reality_apply_lock = threading.Lock()
+    gost_operation_lock = threading.RLock()
+    for key in ('warp_applying', 'egress_applying', '_egress_pending'):
+        data.pop(key, None)  # pending worker threads cannot survive a process restart
+    if (data.get('core_upgrade') or {}).get('state') == 'running':
+        data['core_upgrade'] = dict(data['core_upgrade'], state='interrupted',
+            error='门户重启打断更新任务，请核对当前核心版本后重试')
     ip_tracker = {}
     IP_TIMEOUT_SECONDS = 180
     VALID_USER_ID_RE = re.compile(r'^[a-zA-Z0-9_\-\.]{1,64}$')
