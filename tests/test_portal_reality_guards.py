@@ -35,8 +35,8 @@ class TestRealityClientSyncGuards(unittest.TestCase):
         import inspect
         src = inspect.getsource(portal.serve)
         i = src.find('def _sync_reality_clients')
-        body = src[i:i + 1200]
-        self.assertIn('json.loads(xj.read_text())', body)
+        body = src[i:src.find('def _reality_restart_allowed', i)]
+        self.assertIn("json.loads(xj.read_text(encoding='utf-8'))", body)
         # 解析失败也要 return False 而不是崩
         self.assertIn('except Exception', body)
 

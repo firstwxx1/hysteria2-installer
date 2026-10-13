@@ -513,22 +513,18 @@ const formAddWarpRule = document.getElementById('form-add-warp-rule');
 const inputWarpDomain = document.getElementById('input-warp-domain');
 const btnResetWarpRules = document.getElementById('btn-reset-warp-rules');
 
-function renderWarpRules(rules) {
+function renderWarpRules(rules, active = false) {
   if (!warpTagsCloud) return;
-  if (warpRulesCount) warpRulesCount.textContent = rules.length + ' 个生效中';
-  if (rules.length === 0) {
-    warpTagsCloud.innerHTML = '<span style="font-size:12px;color:var(--muted)">暂无分流域名，上方输入即可快速添加</span>';
+  const domains = (rules || []).map(r => typeof r === 'string'
+    ? {domain:r, outbound:'warp_socks'} : r).filter(r => r && ['warp','warp_socks'].includes(r.outbound)).map(r => r.domain);
+  if (warpRulesCount) warpRulesCount.textContent = domains.length + (active ? ' 个生效中' : ' 个已配置');
+  if (!domains.length) {
+    warpTagsCloud.innerHTML = '<span style="font-size:12px;color:var(--muted)">暂无 WARP 分流域名</span>';
     return;
   }
-  warpTagsCloud.innerHTML = rules.map(d => {
-    // 🔴 不能写成 onclick="delWarpRule('...')"：CSP 的 script-src 只有哈希白名单、
-    // 没有 'unsafe-inline'，内联事件会被浏览器直接丢弃，表现为"× 点了没反应"。
-    // 改为 data-domain + 下方容器上的事件委托（对动态重渲染的标签同样生效）。
-    return `<span class="warp-tag-item">
-      <span class="warp-tag-text">${d}</span>
-      <a href="javascript:void(0)" class="warp-tag-del" data-domain="${d}" title="移除此域名">×</a>
-    </span>`;
-  }).join('');
+  warpTagsCloud.innerHTML = domains.map(d => '<span class="warp-tag-item"><span class="warp-tag-text">'
+    + obEsc(d) + '</span><a href="javascript:void(0)" class="warp-tag-del" data-domain="'
+    + obEsc(d) + '" title="移除此域名">×</a></span>').join('');
 }
 
 // WARP 分流标签的删除按钮：容器级事件委托（标签是动态重渲染的，不能逐个绑定）
@@ -573,9 +569,9 @@ async function delWarpRule(domain) {
       body: 'action=del_rule&domain=' + encodeURIComponent(domain)
     });
     const json = await res.json();
-    if (json.ok && Array.isArray(json.rules)) {
-      renderWarpRules(json.rules);
-    }
+    if (!res.ok || !json.ok) throw new Error(json.error || '分流规则应用失败');
+    if (Array.isArray(json.rules)) renderWarpRules(json.rules);
+    await checkWarpStatus();
   } catch (e) {
     alert('请求异常: ' + e.message);
   }
@@ -609,10 +605,11 @@ async function checkWarpStatus() {
     }
 
     if (json.enabled) {
-      const effective = json.connected && json.applied;
+      const effective = json.connected && json.applied && !json.overridden;
       warpBadge.textContent = effective
         ? ('● 运行中 (' + (json.ip || '已连通') + ')')
-        : (json.applying ? '● 正在应用分流配置...'
+        : (json.overridden ? '● 全局出口优先，WARP 名单分流待命'
+           : json.applying ? '● 正在应用分流配置...'
            : (json.connected ? '● WARP通道可用，分流未应用' : '● 正在连接 / 异常'));
       warpBadge.title = json.apply_error || '';
       warpBadge.style.background = effective ? '#eaf3de' : '#fff1f0';
@@ -632,7 +629,7 @@ async function checkWarpStatus() {
     }
 
     if (Array.isArray(json.rules)) {
-      renderWarpRules(json.rules);
+      renderWarpRules(json.rules, json.enabled && json.applied && !json.overridden);
     }
   } catch (_) {}
 }
@@ -727,7 +724,7 @@ if (btnResetWarpRules) {
 }
 
 checkWarpStatus();
-setInterval(checkWarpStatus, 10000);
+setInterval(() => { if (!document.hidden) checkWarpStatus(); }, 10000);
 
 // ============================================================================
 // 自定义出站（Custom Outbounds）
@@ -817,7 +814,7 @@ function renderOutboundList(outs) {
   }).join('');
 }
 
-function renderOutboundRules(rules, outs) {
+function renderOutboundRules(rules, outs, builtin) {
   if (!obEls.rulesList) return;
   const norm = [];
   (rules || []).forEach(r => {
@@ -827,7 +824,11 @@ function renderOutboundRules(rules, outs) {
   });
   if (obEls.rulesCount) obEls.rulesCount.textContent = norm.length + ' 条';
 
-  const all = [{ name: 'warp_socks', type: 'socks5' }, { name: 'direct', type: 'direct' }].concat(outs || []);
+  const customNames = new Set((outs || []).map(o => o && o.name).filter(Boolean));
+  const builtinTypes = { warp_socks: 'socks5', direct_ipv4: 'direct', warp: 'socks5' };
+  const configured = (builtin || []).filter(name => name && !customNames.has(name))
+    .map(name => ({ name: name, type: builtinTypes[name] || '' }));
+  const all = configured.concat([{ name: 'direct', type: 'direct' }, { name: 'reject', type: '' }], outs || []);
   const seen = {}; const uniq = [];
   all.forEach(o => { if (o && o.name && !seen[o.name]) { seen[o.name] = 1; uniq.push(o); } });
 
@@ -888,6 +889,28 @@ function obMsg(text, kind) {
 
 // 🔴 端点走<prefix>manage-outbounds（网页会话认证），不是 /api/v1/。
 //    出站配置能改流量出口，属管理操作，不能仅凭 api_key 就能动。
+async function waitForEgressApply() {
+  const deadline = Date.now() + 45000;
+  while (Date.now() < deadline) {
+    await new Promise(resolve => setTimeout(resolve, 500));
+    let json;
+    try {
+      const res = await fetch(location.pathname + 'outbounds/list', {credentials:'same-origin'});
+      if (res.status === 401) throw new Error('登录已失效，请重新登录');
+      if (!res.ok) continue;
+      json = await res.json();
+    } catch (err) {
+      if (String(err.message).includes('登录已失效')) throw err;
+      continue;
+    }
+    if (!json.applying) {
+      if (!json.applied) throw new Error(json.apply_error || '配置尚未成功加载');
+      return json;
+    }
+  }
+  throw new Error('配置状态暂未确认，请刷新查看；不要重复提交同一操作');
+}
+
 async function obApi(action, params) {
   const p = Object.assign({ action: action }, params || {});
   const body = new URLSearchParams(p).toString();
@@ -899,10 +922,11 @@ async function obApi(action, params) {
   let json = {};
   try { json = await res.json(); } catch (_) {}
   if (!res.ok || !json.ok) throw new Error(json.error || ('请求失败 HTTP ' + res.status));
+  if (json.applying) json = Object.assign(json, await waitForEgressApply());
   return json;
 }
 
-let OB_STATE = { mode: 'rules', outbounds: [], rules: [] };
+let OB_STATE = { mode: 'rules', outbounds: [], rules: [], builtin: [] };
 
 async function loadOutbounds() {
   if (!obEls.list) return;
@@ -912,10 +936,11 @@ async function loadOutbounds() {
     if (!res.ok) return;
     const json = await res.json();
     if (!json.ok) return;
-    OB_STATE = { mode: json.mode || 'rules', outbounds: json.outbounds || [], rules: json.rules || [] };
+    OB_STATE = { mode: json.mode || 'rules', outbounds: json.outbounds || [], rules: json.rules || [], builtin: json.builtin || [] };
     obSetModeUI(OB_STATE.mode);
     renderOutboundList(OB_STATE.outbounds);
-    renderOutboundRules(OB_STATE.rules, OB_STATE.outbounds);
+    renderOutboundRules(OB_STATE.rules, OB_STATE.outbounds, OB_STATE.builtin);
+    if (json.apply_error && !json.applying && !json.applied) obMsg(json.apply_error, 'err');
   } catch (_) {}
 }
 
@@ -931,7 +956,7 @@ async function probeOutbound(kind, addr) {
     if (!json.ok) throw new Error(json.error || '探测失败');
     if (json.ip) {
       obEls.ip.textContent = json.ip;
-      if (obEls.ipNote) obEls.ipNote.textContent = '客户端流量出去时对方看到的地址';
+      if (obEls.ipNote) obEls.ipNote.textContent = '所选出站的探测地址；实际连接还取决于当前分流规则';
     } else {
       obEls.ip.textContent = '探测失败';
       if (obEls.ipNote) {
@@ -976,7 +1001,8 @@ function obFillForm(o) {
 async function setOutboundMode(mode) {
   try {
     obMsg('切换中，正在重启服务...', '');
-    await obApi('mode', { mode: mode });
+    const result = await obApi('mode', { mode: mode });
+    mode = result.mode || mode;
     obSetModeUI(mode);
     obMsg('已切换到' + (mode === 'global' ? '全局出口' : '按域名分流') + ' ✓', 'ok');
     await loadOutbounds();
@@ -1127,6 +1153,8 @@ async function checkRealityStatus() {
     if (!res.ok) return;
     const json = await res.json();
     if (!json.ok) return;
+    const portTag = document.getElementById('reality-port-tag');
+    if (portTag) portTag.textContent = 'TCP ' + (json.config?.port || '--');
 
     if (!json.installed) {
       realityBadge.textContent = '● 未安装 Xray 核心';
@@ -1272,6 +1300,11 @@ async function checkBbrStatus() {
     const json = await res.json();
     if (!json.ok) return;
 
+    if (Array.isArray(json.available)) document.querySelectorAll('.btn-apply-bbr').forEach(btn => {
+      const algo = {v1:'bbr',v2:'bbr2',v3:'bbr3'}[btn.dataset.version];
+      btn.disabled = !json.available.includes(algo);
+      btn.title = btn.disabled ? '当前内核未提供该算法，需要先使用支持它的内核' : '';
+    });
     if (bbrCurrentText) bbrCurrentText.textContent = json.current || 'cubic';
     if (bbrQdiscText) bbrQdiscText.textContent = json.qdisc || 'fq_codel';
     if (bbrKernelText) bbrKernelText.textContent = json.kernel || '--';
@@ -1511,16 +1544,16 @@ function fmtVer(current, latest, hasUpdate, installed) {
   return hasUpdate ? (current + ' → ' + latest + ' 有新版本') : (current + '（最新）');
 }
 
-async function checkVersions() {
+async function checkVersions(force = false) {
   if (!coreVerDisplay || !portalVerDisplay) return;
   try {
-    const res = await fetch(location.pathname + 'check-version', { credentials: 'same-origin' });
-    if (!res.ok) return;
+    const res = await fetch(location.pathname + 'check-version' + (force ? '?force=1' : ''), { credentials: 'same-origin' });
+    if (!res.ok) return false;
     const json = await res.json();
-    if (!json.ok) return;
+    if (!json.ok) return false;
 
     // 核心展示
-    coreVerDisplay.textContent = json.core_current + (json.core_has_update ? (' → 可升级至 ' + json.core_latest) : ' (最新)');
+    coreVerDisplay.textContent = fmtVer(json.core_current, json.core_latest, json.core_has_update, true);
     if (btnUpdateCore) {
       btnUpdateCore.style.display = json.core_has_update ? 'inline-flex' : 'none';
       btnUpdateCore.onclick = () => doUpgrade('core');
@@ -1541,14 +1574,32 @@ async function checkVersions() {
         btnUpdateAwgEngine.onclick = () => doUpgrade('awg');
       }
     }
-  } catch (_) {}
+    return true;
+  } catch (_) { return false; }
+}
+
+async function waitForCoreUpgrade() {
+  const deadline = Date.now() + 300000;
+  while (Date.now() < deadline) {
+    await new Promise(resolve => setTimeout(resolve, 2000));
+    let state;
+    try {
+      const res = await fetch(location.pathname + 'upgrade-status', {credentials:'same-origin'});
+      if (!res.ok) continue;
+      state = (await res.json()).job || {};
+    } catch (_) { continue; }
+    if (state.state === 'completed') return;
+    if (state.state === 'failed' || state.state === 'interrupted') throw new Error(state.error || '核心更新失败');
+  }
+  throw new Error('更新任务尚未确认完成，请刷新查看版本状态');
 }
 
 async function doUpgrade(target) {
   const names = { core: 'Hysteria 2 官方核心', portal: '控制面板自身', awg: 'AmneziaWG 引擎' };
   const btns = { core: btnUpdateCore, portal: btnUpdatePortal, awg: btnUpdateAwgEngine };
   const btn = btns[target];
-  if (!confirm('确定要升级 ' + (names[target] || target) + ' 吗？')) return;
+  const custom = target === 'core' && coreVerDisplay?.textContent.includes('+');
+  if (!confirm('确定要升级 ' + (names[target] || target) + ' 吗？' + (custom ? '\\n当前含定制补丁，升级官方核心会替换补丁。' : ''))) return;
   if (btn) { btn.disabled = true; btn.textContent = '升级中...'; }
   if (updateStatusMsg) updateStatusMsg.textContent = '正在下载并应用更新，请稍候...';
   try {
@@ -1556,10 +1607,14 @@ async function doUpgrade(target) {
       method: 'POST',
       credentials: 'same-origin',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: 'target=' + encodeURIComponent(target)
+      body: 'target=' + encodeURIComponent(target) + (custom ? '&allow_custom=1' : '')
     });
     const json = await res.json();
     if (json.ok) {
+      if (target === 'core' && json.applying) {
+        if (updateStatusMsg) updateStatusMsg.textContent = '更新任务运行中，正在等待验证实际结果...';
+        await waitForCoreUpgrade();
+      }
       const msg = json.message || '升级已触发';
       if (updateStatusMsg) updateStatusMsg.textContent = msg + '，5 秒后自动刷新页面...';
       setTimeout(() => location.reload(), 5000);
@@ -1576,9 +1631,12 @@ async function doUpgrade(target) {
 
 if (btnRecheckUpdate) {
   btnRecheckUpdate.addEventListener('click', async () => {
-    if (updateStatusMsg) updateStatusMsg.textContent = '正在检测...';
-    await checkVersions();
-    if (updateStatusMsg) updateStatusMsg.textContent = '检测完成（远端结果在服务端缓存 5 分钟）';
+    btnRecheckUpdate.disabled = true;
+    if (updateStatusMsg) updateStatusMsg.textContent = '正在重新检测...';
+    try {
+      const ok = await checkVersions(true);
+      if (updateStatusMsg) updateStatusMsg.textContent = ok ? '检测完成（已主动刷新缓存）' : '检测失败，请检查网络；未把未知结果当成最新';
+    } finally { btnRecheckUpdate.disabled = false; }
   });
 }
 
@@ -1596,7 +1654,10 @@ function fmtSpeed(bytesPerSec) {
   return (bytesPerSec / (1024 * 1024)).toFixed(2) + ' MB/s';
 }
 
+let trafficPollPending = false;
 async function pollTrafficSpeed() {
+  if (document.hidden || trafficPollPending) return;
+  trafficPollPending = true;
   try {
     const res = await fetch(location.pathname + 'traffic-speed', { credentials: 'same-origin' });
     if (!res.ok) return;
@@ -1639,7 +1700,7 @@ async function pollTrafficSpeed() {
         }
       });
     }
-  } catch (_) {}
+  } catch (_) {} finally { trafficPollPending = false; }
 }
 
 setInterval(pollTrafficSpeed, 2000);
@@ -1680,7 +1741,7 @@ function showProxyResult(data) {
   if (!proxyModal) return;
   const host = data.host || curProxyServerHost;
   const ptype = data.type || 'socks5';
-  const url = data.url || (ptype + '://' + data.username + ':' + data.password + '@' + host + ':' + data.port);
+  const url = data.url || (ptype + '://' + encodeURIComponent(data.username) + ':' + encodeURIComponent(data.password) + '@' + host + ':' + data.port);
   const fmt = data.format || (host + ':' + data.port + ':' + data.username + ':' + data.password);
 
   if (resPTypeBadge) {
@@ -1842,20 +1903,20 @@ async function loadProxyServices() {
     if (json.host) curProxyServerHost = json.host;
     const typeLabel = { socks5: 'SOCKS5', http: 'HTTP', https: 'HTTPS' };
     proxyTbody.innerHTML = services.map(s => {
-      const fullUrl = `${s.type}://${s.username}:${s.password}@${curProxyServerHost}:${s.port}`;
+      const fullUrl = `${obEsc(s.type)}://${encodeURIComponent(s.username)}:${encodeURIComponent(s.password)}@${obEsc(curProxyServerHost)}:${obEsc(s.port)}`;
       return `
       <tr>
-        <td><span class="proxy-type ${s.type}">${typeLabel[s.type] || s.type}</span></td>
-        <td><code style="font-size:12px;font-weight:700;color:var(--accent)">:${s.port}</code></td>
-        <td><code style="font-size:12px">${s.username}</code></td>
-        <td><code style="font-size:12px">${s.password}</code></td>
+        <td><span class="proxy-type ${obEsc(s.type)}">${obEsc(typeLabel[s.type] || s.type)}</span></td>
+        <td><code style="font-size:12px;font-weight:700;color:var(--accent)">:${obEsc(s.port)}</code></td>
+        <td><code style="font-size:12px">${obEsc(s.username)}</code></td>
+        <td><code style="font-size:12px">${obEsc(s.password)}</code></td>
         <td>
           <div style="display:flex;align-items:center;gap:6px">
-            <code style="font-size:11px;background:#f5f8f7;padding:2px 6px;border-radius:4px;word-break:break-all">${s.type}://${s.username}:****@${curProxyServerHost}:${s.port}</code>
-            <button class="button" style="padding:2px 8px;font-size:11px;white-space:nowrap" type="button" data-copy-link="${fullUrl}">复制链接</button>
+            <code style="font-size:11px;background:#f5f8f7;padding:2px 6px;border-radius:4px;word-break:break-all">${obEsc(s.type)}://${obEsc(s.username)}:****@${obEsc(curProxyServerHost)}:${obEsc(s.port)}</code>
+            <button class="button" style="padding:2px 8px;font-size:11px;white-space:nowrap" type="button" data-copy-link="${obEsc(fullUrl)}">复制链接</button>
           </div>
         </td>
-        <td><button class="button danger" style="padding:4px 10px;font-size:11px" type="button" data-proxy-del="${s.id}">删除</button></td>
+        <td><button class="button danger" style="padding:4px 10px;font-size:11px" type="button" data-proxy-del="${obEsc(s.id)}">删除</button></td>
       </tr>`;
     }).join('');
 
@@ -1872,15 +1933,19 @@ async function loadProxyServices() {
     proxyTbody.querySelectorAll('[data-proxy-del]').forEach(btn => {
       btn.addEventListener('click', async () => {
         if (!confirm('确定删除该代理服务？')) return;
-        const res = await fetch(location.pathname + 'manage-proxy', {
-          method: 'POST',
-          credentials: 'same-origin',
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          body: 'action=delete&id=' + encodeURIComponent(btn.dataset.proxyDel)
-        });
-        const json = await res.json();
-        if (json.ok) loadProxyServices();
-        else alert(json.error || '删除失败');
+        btn.disabled = true;
+        try {
+          const res = await fetch(location.pathname + 'manage-proxy', {
+            method: 'POST', credentials: 'same-origin',
+            headers: {'Content-Type':'application/x-www-form-urlencoded'},
+            body: 'action=delete&id=' + encodeURIComponent(btn.dataset.proxyDel)
+          });
+          const json = await res.json();
+          if (!res.ok || !json.ok) throw new Error(json.error || '删除代理失败');
+          await loadProxyServices();
+        } catch (err) {
+          alert(err.message || '删除代理请求失败');
+        } finally { btn.disabled = false; }
       });
     });
   } catch (_) {}
@@ -1943,9 +2008,9 @@ document.querySelectorAll('.btn-user-connect').forEach(btn => {
         <div style="background:#eaf5ef;border:1px solid #c3ddd5;border-radius:12px;padding:12px 14px">
           <div style="font-size:12px;font-weight:700;color:var(--accent);margin-bottom:6px">🌐 专属独立连接页面 (可直接发给客户):</div>
           <div class="input-with-action">
-            <input type="text" id="um-share-url" value="${shareUrl}" readonly style="font-size:12px;height:38px">
+            <input type="text" id="um-share-url" value="${obEsc(shareUrl)}" readonly style="font-size:12px;height:38px">
             <button class="button primary" style="padding:0 12px;height:38px;font-size:12px" type="button" data-modal-copy="um-share-url">复制页面链接</button>
-            <a class="button" style="padding:0 12px;height:38px;font-size:12px" href="${shareUrl}" target="_blank">打开页面 ↗</a>
+            <a class="button" style="padding:0 12px;height:38px;font-size:12px" href="${obEsc(shareUrl)}" target="_blank">打开页面 ↗</a>
           </div>
         </div>
 
@@ -1958,7 +2023,7 @@ document.querySelectorAll('.btn-user-connect').forEach(btn => {
           <div style="display:flex;flex-direction:column;gap:12px">
             <div>
               <div style="font-size:12px;font-weight:700;color:var(--ink);margin-bottom:4px">专属节点直链 (URI):</div>
-              <textarea id="um-uri" class="link" style="height:65px;font-size:11px" readonly>${json.uri}</textarea>
+              <textarea id="um-uri" class="link" style="height:65px;font-size:11px" readonly>${obEsc(json.uri)}</textarea>
               <div style="margin-top:6px;display:flex;gap:8px">
                 <button class="button primary" style="padding:6px 14px;font-size:11px" type="button" data-modal-copy="um-uri">复制直链</button>
               </div>
@@ -1972,7 +2037,7 @@ document.querySelectorAll('.btn-user-connect').forEach(btn => {
               </div>
               <details style="margin-top:6px">
                 <summary style="font-size:11px;color:var(--muted)">查看/复制配置文本</summary>
-                <textarea id="um-clash" class="link" style="height:65px;font-size:10px;margin-top:4px" readonly>${json.clash}</textarea>
+                <textarea id="um-clash" class="link" style="height:65px;font-size:10px;margin-top:4px" readonly>${obEsc(json.clash)}</textarea>
                 <div style="margin-top:4px"><button class="button" style="padding:2px 8px;font-size:10px" type="button" data-modal-copy="um-clash">复制文本</button></div>
               </details>
             </div>
@@ -1993,7 +2058,7 @@ document.querySelectorAll('.btn-user-connect').forEach(btn => {
       });
       
     } catch (err) {
-      uModalBody.innerHTML = `<div style="text-align:center;padding:24px;color:var(--danger)">加载失败: ${err.message}</div>`;
+      uModalBody.innerHTML = `<div style="text-align:center;padding:24px;color:var(--danger)">加载失败: ${obEsc(err.message)}</div>`;
     }
   });
 });

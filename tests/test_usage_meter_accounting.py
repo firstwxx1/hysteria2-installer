@@ -157,6 +157,7 @@ class MeterAccountingTest(unittest.TestCase):
                'usage_summary': lambda uid: self.meter.summary(uid)}
         exec(compile(ast.Module(body=functions, type_ignores=[]), 'portal-speed', 'exec'), env)
         class Handler:
+            path = '/fixture/check-version'
             def is_authenticated(self): return True
             def reply_json(self, code, payload): return payload
         with patch.object(time, 'monotonic', return_value=100):
@@ -237,9 +238,12 @@ class MeterAccountingTest(unittest.TestCase):
                '_local_blob_sha': blob, '_version_triple': lambda path, name: ('current', 'latest', True),
                '_usage_runtime': runtime, 'usage_meter': self.meter,
                'usage_summary': self.meter.summary, 'MASTER_USER_ID': 'admin_master',
-               'subprocess': subprocess, 'urllib': urllib, 'json': json}
+               'subprocess': subprocess, 'urllib': urllib, 'json': json,
+               'parse_qs': urllib.parse.parse_qs, 'time': __import__('time'),
+               '_ver_cache': {'t':0}, '_core_ver_cache': {'t':0, 'tag':''}, 'core_version_key': lambda value: ()}
         exec(compile(ast.Module(body=[fn], type_ignores=[]), 'version-bundle', 'exec'), env)
         class Handler:
+            path = '/fixture/check-version'
             def is_authenticated(self): return True
             def reply_json(self, code, payload): return payload
         with patch.object(subprocess, 'run', side_effect=OSError('no binary')), \

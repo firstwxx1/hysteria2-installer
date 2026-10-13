@@ -31,6 +31,9 @@
   3. 启动自检脚本必须在"端口未监听"时返回非零。
 """
 import ast
+import threading
+from types import SimpleNamespace
+from unittest.mock import Mock
 import importlib.util
 import re
 import sys
@@ -145,16 +148,27 @@ class ReloadGostChecksReturncode(unittest.TestCase):
                       'reload_gost 缺少 restart 兜底')
 
     def test_restart_reachable_when_reload_returns_nonzero(self):
-        """反向用例：returncode 非 0 时**不会**提前 return，必须能走到 restart。
+        run = Mock(side_effect=[SimpleNamespace(returncode=3), SimpleNamespace(returncode=0)])
+        env = {'Path': lambda path: SimpleNamespace(exists=lambda: True),
+               'gost_operation_lock': threading.RLock(), 'ensure_gost_unit': Mock(),
+               'write_gost_config': Mock(), 'gost_status': lambda: True,
+               'gost_ports_ready': lambda: True, 'subprocess': SimpleNamespace(run=run),
+               'time': SimpleNamespace(sleep=lambda seconds: None)}
+        exec(compile(ast.fix_missing_locations(ast.Module(body=[self.fn], type_ignores=[])),
+                     'gost-reload-behavior', 'exec'), env)
+        self.assertTrue(env['reload_gost']())
+        self.assertIn(['systemctl', 'restart', 'gost'], [c.args[0] for c in run.call_args_list])
 
-        直接按语义检查：`if r.returncode == 0: return` 这种写法意味着
-        "只有成功才提前返回"，非 0 会继续往下走 —— 这正是我们要的形状。
-        """
-        self.assertRegex(
-            self.code,
-            r'returncode\s*==\s*0\s*:\s*\n\s*return',
-            'returncode 判断形状不对：应当是"成功才 return"，'
-            '否则失败路径会被跳过')
+    def test_reload_success_without_listeners_is_not_a_false_success(self):
+        run = Mock(return_value=SimpleNamespace(returncode=0))
+        env = {'Path': lambda path: SimpleNamespace(exists=lambda: True),
+               'gost_operation_lock': threading.RLock(), 'ensure_gost_unit': Mock(),
+               'write_gost_config': Mock(), 'gost_status': lambda: True,
+               'gost_ports_ready': lambda: False, 'subprocess': SimpleNamespace(run=run),
+               'time': SimpleNamespace(sleep=lambda seconds: None)}
+        exec(compile(ast.fix_missing_locations(ast.Module(body=[self.fn], type_ignores=[])),
+                     'gost-listener-readiness', 'exec'), env)
+        self.assertFalse(env['reload_gost']())
 
     def test_no_manual_sighup_fallback(self):
         """不能再回到"只靠 kill -HUP 兜底"的老写法。

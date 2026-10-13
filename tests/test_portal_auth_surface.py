@@ -61,6 +61,7 @@ class EndpointAuthTest(unittest.TestCase):
         (cls.root / 'meta.json').write_text(json.dumps(META), encoding='utf-8')
         portal.prepare(cls.root / 'meta.json', cls.port)
         cls.data = json.loads((cls.root / 'portal.json').read_text(encoding='utf-8'))
+        cls.access = json.loads((cls.root / 'portal-access.json').read_text(encoding='utf-8'))
         cls.prefix = '/' + cls.data['token'] + '/'
         cls.proc = subprocess.Popen(
             [sys.executable, str(Path(portal.__file__)), 'serve', str(cls.root / 'portal.json')],
@@ -142,6 +143,35 @@ class EndpointAuthTest(unittest.TestCase):
                 self.assertIn(status, (401, 403),
                               f'{ep} 接受了错误的凭据（返回 {status}）')
                 self.assertNoLeak(body, f'POST {ep} (wrong auth)')
+
+    def test_manage_outbounds_rejects_unknown_target(self):
+        raw = f"{self.access['username']}:{self.access['password']}".encode()
+        auth = 'Basic ' + base64.b64encode(raw).decode()
+        status, body = self.request(
+            'POST', self.prefix + 'manage-outbounds',
+            {'action': 'rule-add', 'domain': 'example.com', 'outbound': 'not-configured'}, auth)
+        self.assertEqual(status, 400, body)
+        self.assertIn(b'Unknown outbound target', body)
+
+    def test_query_bearing_management_gets_keep_working(self):
+        auth = 'Basic ' + base64.b64encode((self.access['username'] + ':' + self.access['password']).encode()).decode()
+        for endpoint in ('warp-status?audit=1', 'proxy-services?audit=1', 'outbounds/list?audit=1', 'upgrade-status?audit=1'):
+            status, body = self.request('GET', self.prefix + endpoint, auth=auth)
+            self.assertEqual(status, 200, (endpoint, body[:200]))
+            self.assertTrue(json.loads(body)['ok'])
+
+    def test_invalid_probe_never_falls_back_to_direct_egress(self):
+        auth = 'Basic ' + base64.b64encode((self.access['username'] + ':' + self.access['password']).encode()).decode()
+        for query in ('kind=unrecognized', 'kind=socks5&addr='):
+            status, body = self.request('GET', self.prefix + 'outbounds/probe?' + query, auth=auth)
+            self.assertEqual(status, 400, body)
+
+    def test_invalid_api_payloads_return_json_not_a_broken_connection(self):
+        auth = 'Bearer ' + self.data['api_key']
+        for payload in ([], {'user_id':42}, {'user_id':'qa-invalid', 'duration_days':-1}):
+            status, body = self.request('POST', '/api/v1/users/create', json.dumps(payload), auth)
+            self.assertEqual(status, 400, body)
+            self.assertFalse(json.loads(body)['ok'])
 
     def test_cluster_api_requires_valid_api_key(self):
         """集群 API 用 Bearer api_key，错 key / 无 key 都必须是 401。"""
