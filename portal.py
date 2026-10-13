@@ -8,6 +8,7 @@ import hmac
 import html
 import json
 import importlib.util
+import ipaddress
 import os
 import platform
 import random
@@ -58,7 +59,14 @@ MASTER_USER_ID = 'admin_master'
 #
 # ⚠️ 改动 portal.py 的**能力**时记得同步 +1，否则主面板会按旧能力显示。
 # 格式固定 `PORTAL_VERSION = 'x.y'`（capabilities 端点按行首匹配解析它）。
-PORTAL_VERSION = '2.4'
+PORTAL_VERSION = '2.5'
+
+DEFAULT_WARP_DOMAINS = (
+    'ipify.org', 'cloudflare.com',
+    'openai.com', 'chatgpt.com', 'oaistatic.com', 'oaiusercontent.com', 'ai.com',
+    'anthropic.com', 'claude.ai',
+    'gemini.google.com', 'aistudio.google.com', 'generativelanguage.googleapis.com',
+)
 
 
 def strip_acl_block(text):
@@ -323,35 +331,148 @@ def _existing_outbound_names():
     return re.findall(r'^\s*-\s*name:\s*(\S+)\s*$', cfg, re.M)
 
 
+def build_warp_acl_config(original, enabled, rules):
+    """Render WARP domain ACL over the existing Hysteria config."""
+    text = strip_acl_block(original)
+    custom_rules = [r for r in (rules or ()) if isinstance(r, dict)
+                    and r.get('outbound') not in ('', None, 'warp', 'warp_socks')]
+    if not enabled and not custom_rules:
+        return text.rstrip('\n') + '\n'
+
+    existing = re.findall(r'^\s*-\s*name:\s*(\S+)\s*$', text, re.M)
+    warp_name = 'warp_socks' if 'warp_socks' in existing else 'warp'
+    if warp_name not in existing:
+        block = ("\n  - name: warp_socks\n    type: socks5\n"
+                 "    socks5:\n      addr: 127.0.0.1:19898")
+        if re.search(r'^outbounds:\s*$', text, re.M):
+            text = re.sub(r'^outbounds:\s*$', 'outbounds:' + block, text, count=1, flags=re.M)
+        else:
+            text = text.rstrip('\n') + '\n\noutbounds:' + block + '\n'
+        warp_name = 'warp_socks'
+        existing.append(warp_name)
+
+    if not re.search(r'^sniff:', text, re.M):
+        text = text.rstrip('\n') + '\n\nsniff:\n  enable: true\n  timeout: 2s\n  rewriteDomain: false\n  tcpPorts: 80,443\n  udpPorts: 443\n'
+    tail = 'direct_ipv4' if 'direct_ipv4' in existing else 'direct'
+    lines = ['acl:', '  inline:']
+    for rule in (rules or ()) if enabled else custom_rules:
+        domain = rule.get('domain', '') if isinstance(rule, dict) else rule
+        target = rule.get('outbound') or warp_name if isinstance(rule, dict) else warp_name
+        if target not in set(existing) | {'direct', 'reject'}:
+            target = warp_name
+        domain = str(domain).strip().lower().strip('.')
+        if domain and re.fullmatch(r'[a-z0-9.-]+', domain):
+            lines.append('    - %s(suffix:%s)' % (target, domain))
+    lines.append('    - %s(all)' % tail)
+    return text.rstrip('\n') + '\n\n' + '\n'.join(lines) + '\n'
+
+
+def _hy2_runtime_identity():
+    """Return active state, PID and start timestamp for reload verification."""
+    proc = subprocess.run(
+        ['systemctl', 'show', 'hysteria-server', '--property=ActiveState',
+         '--property=MainPID', '--property=ExecMainStartTimestamp'],
+        capture_output=True, text=True, timeout=8)
+    values = {}
+    for line in proc.stdout.splitlines():
+        if '=' in line:
+            key, value = line.split('=', 1)
+            values[key] = value
+    return values.get('ActiveState', ''), values.get('MainPID', '0'), values.get('ExecMainStartTimestamp', '')
+
+
+def _hy2_config_loaded(config_path, identity=None):
+    try:
+        state, pid, started = identity or _hy2_runtime_identity()
+        fields = started.split()
+        timestamp = time.mktime(time.strptime(' '.join(fields[1:3]), '%Y-%m-%d %H:%M:%S'))
+        return state == 'active' and pid not in ('', '0') and Path(config_path).stat().st_mtime <= timestamp + 1
+    except Exception:
+        return False
+
+
+def apply_warp_acl_config(data, data_lock, config_path='/etc/hysteria/config.yaml'):
+    """Apply WARP rules transactionally; success requires a new active process."""
+    cfg = Path(config_path)
+    try:
+        original = cfg.read_text(encoding='utf-8')
+    except Exception as exc:
+        return False, '读取 Hysteria 配置失败: %s' % exc
+    with data_lock:
+        enabled = bool(data.get('warp_enabled', False))
+        rules = list(data.get('warp_rules', DEFAULT_WARP_DOMAINS))
+    rendered = build_warp_acl_config(original, enabled, rules)
+    try:
+        before = _hy2_runtime_identity()
+        if rendered == original and _hy2_config_loaded(cfg, before):
+            return True, ''
+        fd, tmp = tempfile.mkstemp(prefix='.config.yaml.warp-', dir=str(cfg.parent))
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8') as stream:
+                stream.write(rendered)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.chmod(tmp, cfg.stat().st_mode & 0o777)
+            os.replace(tmp, cfg)
+        finally:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+        _restart_hy2()
+        after = ('', '0', '')
+        for _ in range(12):
+            after = _hy2_runtime_identity()
+            if after[0] == 'active' and after[1] not in ('', '0') and after != before:
+                time.sleep(1)
+                if _hy2_runtime_identity() == after and cfg.read_text(encoding='utf-8') == rendered:
+                    return True, ''
+            if after[0] in ('failed', 'inactive'):
+                break
+            time.sleep(1)
+        detail = 'Hysteria 没有加载新配置（state=%s,pid=%s,start=%s）' % after
+    except Exception as exc:
+        detail = '应用 WARP 分流配置失败: %s' % exc
+
+    rollback_state = _rollback_outbounds(cfg, original)
+    if rollback_state != 'active':
+        return False, '%s；并且恢复原配置后服务状态为 %s' % (detail, rollback_state)
+    return False, '%s；已回滚原配置' % detail
+
+
+def warp_acl_matches(config_text, enabled, rules):
+    """Whether the saved config contains the exact ACL/outbound state requested."""
+    return config_text == build_warp_acl_config(config_text, enabled, rules)
+
+
 def detect_outbound_ip(kind='auto', addr='', timeout=6):
     """探测出站真实出口 IP —— 面板要显示"现在出去是哪个 IP"。
 
     🔴 这是用户判断"到底生效没有"的唯一依据。旧面板只显示 WARP 装没装，
     显示不了实际出口，用户只能靠访问 ipify 自己猜。
     """
-    proxy = None
+    proxy_url = ''
     if kind == 'socks5' and addr:
-        proxy = {'http': 'socks5h://' + addr, 'https': 'socks5h://' + addr}
+        proxy_url = 'socks5h://' + addr
     elif kind == 'http' and addr:
-        proxy = {'http': addr, 'https': addr}
-    elif kind in ('warp', 'auto'):
-        # WARP 本地 socks5；auto 时先试 WARP 再试直连，方便对比
-        if kind == 'warp':
-            proxy = {'http': 'socks5h://127.0.0.1:19898', 'https': 'socks5h://127.0.0.1:19898'}
+        proxy_url = addr
+    elif kind == 'warp':
+        proxy_url = 'socks5h://127.0.0.1:19898'
     try:
-        handler = urllib.request.ProxyHandler(proxy) if proxy else urllib.request.ProxyHandler({})
-        opener = urllib.request.build_opener(handler)
-        req = urllib.request.Request(
-            'https://api4.ipify.org?format=json',
-            headers={'User-Agent': 'curl/8.0 hysteria-portal'})
-        with opener.open(req, timeout=timeout) as resp:
-            if resp.status != 200:
-                return ''
-            payload = resp.read().decode('utf-8', 'ignore')
-            try:
-                return json.loads(payload).get('ip', '')
-            except Exception:
-                return payload.strip()
+        seconds = max(1, float(timeout))
+        # urllib's ProxyHandler speaks HTTP CONNECT, not the SOCKS5 protocol.
+        # Explicitly override no_proxy: '*' would silently bypass this proxy.
+        args = ['curl', '--disable', '--silent', '--show-error', '--fail',
+                '--connect-timeout', str(min(3, seconds)), '--max-time', str(seconds),
+                '--proxy', proxy_url, '--noproxy', '' if proxy_url else '*',
+                'https://api4.ipify.org?format=json']
+        proc = subprocess.run(args, capture_output=True, text=True, timeout=seconds + 2)
+        if proc.returncode != 0:
+            return ''
+        payload = proc.stdout.strip()
+        try:
+            result = json.loads(payload).get('ip', '')
+        except (ValueError, AttributeError):
+            result = payload
+        return str(ipaddress.ip_address(result))
     except Exception:
         return ''
 
@@ -2940,6 +3061,8 @@ def serve(path):
 
     data_lock = threading.RLock()
     portal_upgrade_lock = threading.Lock()
+    warp_apply_lock = threading.Lock()
+    data.pop('warp_applying', None)  # an interrupted worker cannot survive a process restart
     ip_tracker = {}
     IP_TIMEOUT_SECONDS = 180
     VALID_USER_ID_RE = re.compile(r'^[a-zA-Z0-9_\-\.]{1,64}$')
@@ -4860,6 +4983,34 @@ if __name__ == '__main__':
             except Exception as e:
                 return self.reply_json(500, {'ok': False, 'error': f'执行异常: {str(e)}'})
 
+        def _reply_with_warp_apply(self, payload):
+            # This response can be carried by Hysteria's own masquerade listener.
+            # Flush it before reloading that listener; expose pending vs applied.
+            with data_lock:
+                data['warp_applying'] = True
+            save_data()
+
+            def worker():
+                with warp_apply_lock:
+                    try:
+                        applied, error = apply_warp_acl_config(data, data_lock)
+                    except Exception as exc:
+                        applied, error = False, '应用 WARP 分流失败: %s' % exc
+                    with data_lock:
+                        data.pop('warp_applying', None)
+                        if error:
+                            data['warp_apply_error'] = error
+                        else:
+                            data.pop('warp_apply_error', None)
+                    save_data()
+                    if not applied:
+                        print('[portal] WARP apply failed: %s' % error, file=sys.stderr, flush=True)
+
+            try:
+                self.reply_json(200, dict(payload, ok=True, applying=True, applied=False))
+            finally:
+                threading.Thread(target=worker, daemon=True).start()
+
         def _h_post_manage_warp(self, prefix):
             """POST /manage-warp 的处理逻辑（从 do_POST 机械搬移而来）。"""
             if not self.is_authenticated():
@@ -4869,6 +5020,9 @@ if __name__ == '__main__':
                 body = self.rfile.read(length).decode('utf-8') if length > 0 else ''
                 form = parse_qs(body)
                 action = form.get('action', ['toggle'])[0]
+                if action not in ('toggle', 'enable', 'disable', 'apply',
+                                  'add_rule', 'del_rule', 'reset_rules'):
+                    return self.reply_json(400, {'ok': False, 'error': '未知 WARP 操作'})
 
                 DEFAULT_WARP_DOMAINS = [
                     'ipify.org', 'cloudflare.com',
@@ -4884,6 +5038,8 @@ if __name__ == '__main__':
                     if action == 'toggle':
                         curr = data.get('warp_enabled', False)
                         data['warp_enabled'] = not curr
+                    elif action in ('enable', 'disable'):
+                        data['warp_enabled'] = action == 'enable'
                     elif action == 'add_rule':
                         raw_domain = form.get('domain', [''])[0].strip().lower()
                         cleaned = re.sub(r'^[a-zA-Z]+://', '', raw_domain).split('/')[0].split(':')[0].strip('.')
@@ -4901,83 +5057,9 @@ if __name__ == '__main__':
 
                 save_data()
 
-                def apply_hy2_acl():
-                    cfg_path = Path('/etc/hysteria/config.yaml')
-                    if not cfg_path.exists():
-                        return
-                    raw_text = cfg_path.read_text(encoding='utf-8')
-
-                    # 只删掉 acl: 块，保留其余全部内容 —— 详见模块级
-                    # strip_acl_block() 的注释（那里记录了踩过的坑：
-                    # 原来的"删到文件尾"会把末尾的 obfs 段一起删掉，
-                    # 导致"能连上但没网"）。
-                    cfg_text = strip_acl_block(raw_text)
-
-                    def has_outbound(name):
-                        return re.search(r'^\s*-\s*name:\s*' + name + r'\s*$',
-                                         cfg_text, re.M) is not None
-
-                    if new_state:
-                        # 出站名要探测实际存在的那个：config 模板用 warp_socks，
-                        # 而某些版本的 toggle_warp.sh 会把它改写成 warp。
-                        warp_name = 'warp_socks' if has_outbound('warp_socks') else 'warp'
-                        if not has_outbound(warp_name):
-                            warp_outbound = ("\n  - name: warp_socks\n    type: socks5\n"
-                                                 "    socks5:\n      addr: 127.0.0.1:19898")
-                            if 'outbounds:' in cfg_text:
-                                cfg_text = cfg_text.replace('outbounds:', 'outbounds:' + warp_outbound, 1)
-                            else:
-                                cfg_text += '\noutbounds:' + warp_outbound
-                            warp_name = 'warp_socks'
-
-                        # 🔴 ACL 末尾引用的出站必须【真实存在】，否则 hysteria 直接
-                        # 起不来，报错形如：
-                        #   invalid config: acl.inline: error at line N:
-                        #   outbound direct_ipv4 not found
-                        # 历史教训：这里曾无条件写 direct_ipv4(all)。该出站由 config
-                        # 模板定义，而 toggle_warp.sh 重写配置时可能把它连 outbounds
-                        # 段一起删掉 —— 于是 Web 端点一下 WARP 开关就把 Hysteria
-                        # 打成 failed，整台机器的 Hysteria 全挂。
-                        # 现在先探测：存在才用 direct_ipv4（保留强制 IPv4 的意图），
-                        # 否则退回 hysteria 内置的 direct。
-                        tail_name = 'direct_ipv4' if has_outbound('direct_ipv4') else 'direct'
-
-                        acl_block = '\nacl:\n  inline:\n'
-                        for d in current_rules:
-                            acl_block += '    - %s(suffix:%s)\n' % (warp_name, d)
-                        acl_block += '    - %s(all)\n' % tail_name
-                        cfg_text += acl_block
-
-                    new_text = cfg_text.strip() + '\n'
-
-                    # 改配置前留备份，重启后校验；起不来就自动回滚。
-                    # 光靠"写对了"不够 —— 一个引用错出站的 ACL 就足以让服务起不来，
-                    # 所以必须有一层兜底，不能让 Web 上的一个开关把服务打挂。
-                    backup = cfg_path.read_text(encoding='utf-8')
-                    cfg_path.write_text(new_text, encoding='utf-8')
-                    subprocess.run(['systemctl', 'restart', 'hysteria-server'],
-                                   capture_output=True, timeout=15)
-                    time.sleep(2)
-                    state = subprocess.run(['systemctl', 'is-active', 'hysteria-server'],
-                                           capture_output=True, text=True, timeout=5).stdout.strip()
-                    if state != 'active':
-                        cfg_path.write_text(backup, encoding='utf-8')
-                        subprocess.run(['systemctl', 'restart', 'hysteria-server'],
-                                       capture_output=True, timeout=15)
-                        with data_lock:
-                            data['warp_apply_error'] = 'ACL 写入后 Hysteria 启动失败，已自动回滚配置'
-                    else:
-                        with data_lock:
-                            data.pop('warp_apply_error', None)
-                    # data_lock 是可重入锁，save_data 内部会再取一次，安全
-                    save_data()
-
-                threading.Thread(target=apply_hy2_acl, daemon=True).start()
-
-                return self.reply_json(200, {
-                    'ok': True,
+                return self._reply_with_warp_apply({
                     'enabled': new_state,
-                    'rules': current_rules
+                    'rules': current_rules,
                 })
             except Exception as e:
                 return self.reply_json(500, {'ok': False, 'error': str(e)})
@@ -5453,16 +5535,15 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     err_detail = (res.stderr or res.stdout or '安装失败').strip()
                     return self.reply_json(500, {'ok': False, 'error': f'安装失败: {err_detail}'})
 
-                # 自动开启 WARP 并热重载
+                # Install success is not routing success: apply the domain ACL
+                # directly, never call the legacy script with mismatched arguments.
                 with data_lock:
                     data['warp_enabled'] = True
+                    data.setdefault('warp_rules', list(DEFAULT_WARP_DOMAINS))
                 save_data()
-                try:
-                    subprocess.run(['/etc/hysteria/toggle_warp.sh', 'enable'], capture_output=True, timeout=10)
-                except Exception:
-                    pass
-
-                return self.reply_json(200, {'ok': True, 'message': 'Cloudflare WARP 客户端安装成功并已就绪！'})
+                return self._reply_with_warp_apply({
+                    'message': 'WARP 通道安装完成，正在应用分流配置。',
+                })
             except Exception as e:
                 return self.reply_json(500, {'ok': False, 'error': f'执行异常: {str(e)}'})
 
@@ -6381,12 +6462,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             with data_lock:
                 enabled = data.get('warp_enabled', False)
-                rules = list(data.get('warp_rules', [
-                    'ipify.org', 'cloudflare.com',
-                    'openai.com', 'chatgpt.com', 'oaistatic.com', 'oaiusercontent.com', 'ai.com',
-                    'anthropic.com', 'claude.ai',
-                    'gemini.google.com', 'aistudio.google.com', 'generativelanguage.googleapis.com'
-                ]))
+                rules = list(data.get('warp_rules', DEFAULT_WARP_DOMAINS))
             # 统一到 wgcf + wireproxy(127.0.0.1:19898)；同时兼容尚未升级、
             # 仍跑官方 cloudflare-warp(127.0.0.1:40000) 的旧节点，避免误报「未安装」
             is_installed = (shutil.which('wireproxy') is not None
@@ -6396,23 +6472,27 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             outbound_ip = ''
             if is_installed and enabled:
                 for warp_addr in ('127.0.0.1:19898', '127.0.0.1:40000'):
-                    try:
-                        proxy_handler = urllib.request.ProxyHandler({'http': 'socks5h://' + warp_addr,
-                                                                     'https': 'socks5h://' + warp_addr})
-                        opener = urllib.request.build_opener(proxy_handler)
-                        req = urllib.request.Request('https://api4.ipify.org', headers={'User-Agent': 'curl/7.88.1'})
-                        with opener.open(req, timeout=3) as resp:
-                            if resp.status == 200:
-                                outbound_ip = resp.read().decode('utf-8').strip()
-                                connected = True
-                                break
-                    except Exception:
-                        connected = False
+                    outbound_ip = detect_outbound_ip('socks5', warp_addr, timeout=3)
+                    if outbound_ip:
+                        connected = True
+                        break
+            try:
+                cfg_text = Path('/etc/hysteria/config.yaml').read_text(encoding='utf-8')
+                applied = warp_acl_matches(cfg_text, enabled, rules)
+                applied = applied and _hy2_config_loaded('/etc/hysteria/config.yaml')
+            except Exception:
+                applied = False
+            with data_lock:
+                apply_error = data.get('warp_apply_error', '')
+                applying = bool(data.get('warp_applying', False))
             return self.reply_json(200, {
                 'ok': True,
                 'installed': is_installed,
                 'enabled': enabled,
                 'connected': connected,
+                'applied': applied and not applying,
+                'applying': applying,
+                'apply_error': apply_error,
                 'ip': outbound_ip,
                 'rules': rules
             })

@@ -609,9 +609,14 @@ async function checkWarpStatus() {
     }
 
     if (json.enabled) {
-      warpBadge.textContent = json.connected ? ('● 运行中 (' + (json.ip || '已连通') + ')') : '● 正在连接 / 异常';
-      warpBadge.style.background = json.connected ? '#eaf3de' : '#fff1f0';
-      warpBadge.style.color = json.connected ? '#27500a' : '#cf3c3c';
+      const effective = json.connected && json.applied;
+      warpBadge.textContent = effective
+        ? ('● 运行中 (' + (json.ip || '已连通') + ')')
+        : (json.applying ? '● 正在应用分流配置...'
+           : (json.connected ? '● WARP通道可用，分流未应用' : '● 正在连接 / 异常'));
+      warpBadge.title = json.apply_error || '';
+      warpBadge.style.background = effective ? '#eaf3de' : '#fff1f0';
+      warpBadge.style.color = effective ? '#27500a' : '#cf3c3c';
       if (btnToggleWarp) {
         btnToggleWarp.textContent = '已开启 (点击关闭)';
         btnToggleWarp.className = 'toggle-btn on';
@@ -722,6 +727,7 @@ if (btnResetWarpRules) {
 }
 
 checkWarpStatus();
+setInterval(checkWarpStatus, 10000);
 
 // ============================================================================
 // 自定义出站（Custom Outbounds）
