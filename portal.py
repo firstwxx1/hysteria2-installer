@@ -4955,33 +4955,42 @@ if __name__ == '__main__':
             except Exception as e:
                 return self.reply_json(500, {'ok': False, 'error': f'执行异常: {str(e)}'})
 
-        def _reply_with_warp_apply(self, payload):
-            # This response can be carried by Hysteria's own masquerade listener.
-            # Flush it before reloading that listener; expose pending vs applied.
+        def _reply_with_egress_apply(self, payload, kind='outbound'):
             with data_lock:
-                data['warp_applying'] = True
+                data['egress_applying'] = True
+                data['_egress_pending'] = int(data.get('_egress_pending', 0)) + 1
             save_data()
-
             def worker():
                 with warp_apply_lock:
                     try:
-                        applied, error = apply_warp_acl_config(data, data_lock)
+                        applied, error = apply_egress_config(data, data_lock)
                     except Exception as exc:
-                        applied, error = False, '应用 WARP 分流失败: %s' % exc
+                        applied, error = False, '应用出站失败: %s' % type(exc).__name__
                     with data_lock:
-                        data.pop('warp_applying', None)
-                        if error:
-                            data['warp_apply_error'] = error
+                        pending = max(0, int(data.get('_egress_pending', 1)) - 1)
+                        if pending:
+                            data['_egress_pending'] = pending
                         else:
-                            data.pop('warp_apply_error', None)
+                            data.pop('_egress_pending', None)
+                            data.pop('egress_applying', None)
+                            data.pop('warp_applying', None)
+                        key = 'warp_apply_error' if kind == 'warp' else 'outbound_apply_error'
+                        if error:
+                            data[key] = error
+                            data['egress_apply_error'] = error
+                        else:
+                            data.pop(key, None)
+                            data.pop('egress_apply_error', None)
                     save_data()
                     if not applied:
-                        print('[portal] WARP apply failed: %s' % error, file=sys.stderr, flush=True)
-
+                        print('[portal] egress apply failed: %s' % error, file=sys.stderr, flush=True)
             try:
                 self.reply_json(200, dict(payload, ok=True, applying=True, applied=False))
             finally:
                 threading.Thread(target=worker, daemon=True).start()
+
+        def _reply_with_warp_apply(self, payload):
+            return self._reply_with_egress_apply(payload, kind='warp')
 
         def _h_post_manage_warp(self, prefix):
             """POST /manage-warp 的处理逻辑（从 do_POST 机械搬移而来）。"""
@@ -4996,36 +5005,29 @@ if __name__ == '__main__':
                                   'add_rule', 'del_rule', 'reset_rules'):
                     return self.reply_json(400, {'ok': False, 'error': '未知 WARP 操作'})
 
-                DEFAULT_WARP_DOMAINS = [
-                    'ipify.org', 'cloudflare.com',
-                    'openai.com', 'chatgpt.com', 'oaistatic.com', 'oaiusercontent.com', 'ai.com',
-                    'anthropic.com', 'claude.ai',
-                    'gemini.google.com', 'aistudio.google.com', 'generativelanguage.googleapis.com'
-                ]
-
                 with data_lock:
-                    if 'warp_rules' not in data:
-                        data['warp_rules'] = list(DEFAULT_WARP_DOMAINS)
-
+                    rules = normalize_route_rules(data.get('warp_rules', DEFAULT_WARP_DOMAINS))
                     if action == 'toggle':
-                        curr = data.get('warp_enabled', False)
-                        data['warp_enabled'] = not curr
+                        data['warp_enabled'] = not bool(data.get('warp_enabled'))
                     elif action in ('enable', 'disable'):
                         data['warp_enabled'] = action == 'enable'
                     elif action == 'add_rule':
-                        raw_domain = form.get('domain', [''])[0].strip().lower()
-                        cleaned = re.sub(r'^[a-zA-Z]+://', '', raw_domain).split('/')[0].split(':')[0].strip('.')
-                        if cleaned and cleaned not in data['warp_rules'] and re.match(r'^[a-zA-Z0-9.\-]+$', cleaned):
-                            data['warp_rules'].append(cleaned)
+                        raw = form.get('domain', [''])[0].strip().lower()
+                        domain = re.sub(r'^[a-zA-Z]+://', '', raw).split('/')[0].split(':')[0].strip('.')
+                        if not domain or not re.fullmatch(r'[a-z0-9.-]+', domain):
+                            return self.reply_json(400, {'ok': False, 'error': '域名格式不正确'})
+                        rules = [r for r in rules if r['domain'] != domain]
+                        rules.append({'domain': domain, 'outbound': 'warp_socks'})
                     elif action == 'del_rule':
-                        target_domain = form.get('domain', [''])[0].strip().lower()
-                        if target_domain in data['warp_rules']:
-                            data['warp_rules'].remove(target_domain)
+                        domain = form.get('domain', [''])[0].strip().lower()
+                        rules = [r for r in rules if not (r['domain'] == domain and r['outbound'] in ('warp', 'warp_socks'))]
                     elif action == 'reset_rules':
-                        data['warp_rules'] = list(DEFAULT_WARP_DOMAINS)
-
-                    new_state = data.get('warp_enabled', False)
-                    current_rules = list(data.get('warp_rules', []))
+                        rules = [r for r in rules if r['outbound'] not in ('warp', 'warp_socks')]
+                        keep = {r['domain'] for r in rules}
+                        rules.extend({'domain': d, 'outbound': 'warp_socks'} for d in DEFAULT_WARP_DOMAINS if d not in keep)
+                    data['warp_rules'] = rules
+                    new_state = bool(data.get('warp_enabled'))
+                    current_rules = [r['domain'] for r in rules if r['outbound'] in ('warp', 'warp_socks')]
 
                 save_data()
 
@@ -5104,7 +5106,7 @@ WantedBy=multi-user.target
                             '最常见原因是 TCP 443 已被其他服务（如 Caddy / Nginx）占用。'
                             '日志尾部：%s' % (xr_state, xr_log.strip()[-400:])})
 
-                return self.reply_json(200, {'ok': True, 'message': 'Xray-core 安装成功，VLESS-Reality 节点已在 TCP 443 端口就绪！'})
+                return self.reply_json(200, {'ok': True, 'message': 'Xray-core 安装成功，VLESS-Reality 已在 TCP %s 端口就绪！' % data.get('reality_config', {}).get('port', '')})
             except Exception as e:
                 return self.reply_json(500, {'ok': False, 'error': f'安装执行异常: {str(e)}'})
 
@@ -5121,13 +5123,22 @@ WantedBy=multi-user.target
                 if action == 'toggle':
                     out = subprocess.run(['systemctl', 'is-active', 'xray'], capture_output=True, text=True, timeout=3).stdout.strip()
                     if out == 'active':
-                        subprocess.run(['systemctl', 'stop', 'xray'], capture_output=True, timeout=5)
+                        stopped = subprocess.run(['systemctl', 'stop', 'xray'], capture_output=True, timeout=5)
+                        actual = subprocess.run(['systemctl', 'is-active', 'xray'], capture_output=True, text=True, timeout=3).stdout.strip()
+                        if stopped.returncode != 0 or actual == 'active':
+                            return self.reply_json(500, {'ok': False, 'error': 'Reality 停止失败，服务状态未改变'})
                         new_active = False
                     else:
                         if not Path('/etc/hysteria/xray.json').exists():
                             self._generate_and_apply_reality(True)
                         else:
-                            subprocess.run(['systemctl', 'restart', 'xray'], capture_output=True, timeout=5)
+                            subprocess.run(['systemctl', 'reset-failed', 'xray'], capture_output=True, timeout=5)
+                            started = subprocess.run(['systemctl', 'restart', 'xray'], capture_output=True, timeout=15)
+                            if started.returncode != 0:
+                                return self.reply_json(500, {'ok': False, 'error': 'Reality 启动失败，请检查服务日志'})
+                        actual = subprocess.run(['systemctl', 'is-active', 'xray'], capture_output=True, text=True, timeout=3).stdout.strip()
+                        if actual != 'active':
+                            return self.reply_json(500, {'ok': False, 'error': 'Reality 尚未运行，不能报告已开启'})
                         new_active = True
                     return self.reply_json(200, {'ok': True, 'active': new_active})
 
@@ -5142,51 +5153,62 @@ WantedBy=multi-user.target
                 return self.reply_json(500, {'ok': False, 'error': str(e)})
 
         def _h_post_set_bbr(self, prefix):
-            """POST /set-bbr 的处理逻辑（从 do_POST 机械搬移而来）。"""
+            """Apply only an available kernel algorithm, verify it, and restore on failure."""
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             try:
                 length = int(self.headers.get('Content-Length', 0))
-                body = self.rfile.read(length).decode('utf-8') if length > 0 else ''
-                form = parse_qs(body)
+                form = parse_qs(self.rfile.read(length).decode('utf-8'))
                 ver = form.get('version', ['v1'])[0].lower()
-
-                Path('/etc/modules-load.d/bbr.conf').write_text('tcp_bbr\n', encoding='utf-8')
-                subprocess.run(['modprobe', 'tcp_bbr'], capture_output=True)
-
-                target_algo = 'bbr'
-                qdisc = 'fq'
-                if ver == 'v2':
-                    avail = subprocess.run(['sysctl', '-n', 'net.ipv4.tcp_available_congestion_control'],
-                                           capture_output=True, text=True).stdout
-                    target_algo = 'bbr2' if 'bbr2' in avail else 'bbr'
-                elif ver == 'v3':
-                    avail = subprocess.run(['sysctl', '-n', 'net.ipv4.tcp_available_congestion_control'],
-                                           capture_output=True, text=True).stdout
-                    target_algo = 'bbr3' if 'bbr3' in avail else 'bbr'
-
-                bbr_sysctl = f'''# TCP 拥塞控制 BBR {ver.upper()} 深度优化
-net.core.default_qdisc = {qdisc}
-net.ipv4.tcp_congestion_control = {target_algo}
-net.ipv4.tcp_notsent_lowat = 16384
-net.ipv4.tcp_slow_start_after_idle = 0
-'''
-                Path('/etc/sysctl.d/99-bbr.conf').write_text(bbr_sysctl, encoding='utf-8')
-                subprocess.run(['sysctl', '-p', '/etc/sysctl.d/99-bbr.conf'], capture_output=True, text=True)
-
+                if ver not in ('v1', 'v2', 'v3'):
+                    return self.reply_json(400, {'ok': False, 'error': 'Invalid BBR version'})
+                target = {'v1': 'bbr', 'v2': 'bbr2', 'v3': 'bbr3'}[ver]
+                subprocess.run(['modprobe', 'tcp_' + target], capture_output=True, timeout=5)
+                available = subprocess.run(['sysctl', '-n', 'net.ipv4.tcp_available_congestion_control'],
+                                           capture_output=True, text=True, timeout=3)
+                if available.returncode != 0:
+                    return self.reply_json(500, {'ok': False, 'error': '无法读取内核可用拥塞算法'})
+                if target not in available.stdout.split():
+                    return self.reply_json(409, {'ok': False, 'error':
+                        '当前内核未提供 %s，不能通过 sysctl 切换到 BBR %s；原配置保持不变' % (target, ver.upper())})
+                settings = {'net.core.default_qdisc': 'fq',
+                            'net.ipv4.tcp_congestion_control': target,
+                            'net.ipv4.tcp_notsent_lowat': '16384',
+                            'net.ipv4.tcp_slow_start_after_idle': '0'}
+                runtime = {}
+                for key in settings:
+                    result = subprocess.run(['sysctl', '-n', key], capture_output=True, text=True, timeout=3)
+                    if result.returncode != 0 or not result.stdout.strip():
+                        return self.reply_json(500, {'ok': False, 'error': '读取 sysctl 失败，未修改配置'})
+                    runtime[key] = result.stdout.strip()
+                paths = [Path('/etc/modules-load.d/bbr.conf'), Path('/etc/sysctl.d/99-bbr.conf')]
+                originals = {path: path.read_bytes() if path.exists() else None for path in paths}
+                try:
+                    paths[0].write_text('tcp_' + target + '\n', encoding='utf-8')
+                    paths[1].write_text('\n'.join('%s = %s' % item for item in settings.items()) + '\n', encoding='utf-8')
+                    applied = subprocess.run(['sysctl', '-p', str(paths[1])], capture_output=True, text=True, timeout=5)
+                    if applied.returncode != 0:
+                        raise RuntimeError('sysctl 应用失败')
+                    for key in ('net.ipv4.tcp_congestion_control', 'net.core.default_qdisc'):
+                        actual = subprocess.run(['sysctl', '-n', key], capture_output=True, text=True, timeout=3)
+                        if actual.returncode != 0 or actual.stdout.strip() != settings[key]:
+                            raise RuntimeError('sysctl 读回与目标不一致')
+                except Exception:
+                    for path, content in originals.items():
+                        if content is None:
+                            path.unlink(missing_ok=True)
+                        else:
+                            path.write_bytes(content)
+                    for key, value in runtime.items():
+                        subprocess.run(['sysctl', '-w', key + '=' + value], capture_output=True, timeout=3)
+                    return self.reply_json(500, {'ok': False, 'error': 'BBR 应用失败，已恢复原文件并尝试恢复原运行参数'})
                 with data_lock:
                     data['bbr_target_version'] = ver
                 save_data()
-
-                curr = subprocess.run(['sysctl', '-n', 'net.ipv4.tcp_congestion_control'],
-                                      capture_output=True, text=True).stdout.strip()
-
-                if curr == target_algo:
-                    return self.reply_json(200, {'ok': True, 'message': f'恭喜！BBR {ver.upper()} 算法已立即热生效（当前算法: {curr}）！'})
-                else:
-                    return self.reply_json(200, {'ok': True, 'message': f'BBR {ver.upper()} 配置已成功保存！需要重启服务器后完成内核级生效。'})
-            except Exception as e:
-                return self.reply_json(500, {'ok': False, 'error': str(e)})
+                return self.reply_json(200, {'ok': True, 'applied': True, 'current': target,
+                    'message': 'BBR %s 已应用并核对实际算法为 %s，无需重启整机' % (ver.upper(), target)})
+            except Exception as exc:
+                return self.reply_json(500, {'ok': False, 'error': 'BBR 操作失败: ' + type(exc).__name__})
 
         def _h_post_reboot_server(self, prefix):
             """POST /reboot-server 的处理逻辑（从 do_POST 机械搬移而来）。"""
@@ -5209,6 +5231,11 @@ net.ipv4.tcp_slow_start_after_idle = 0
                 action = form.get('action', [''])[0]
                 user_id = form.get('user_id', [''])[0].strip()
                 now_ts = int(time.time())
+                if action not in ('create', 'delete'):
+                    return self.reply(400, b'Invalid action')
+                with data_lock:
+                    previous_user = copy.deepcopy(data.get('users', {}).get(user_id))
+
 
                 if not VALID_USER_ID_RE.match(user_id):
                     return self.reply(400, b'Invalid user_id format')
@@ -5218,6 +5245,8 @@ net.ipv4.tcp_slow_start_after_idle = 0
                     days = int(form.get('duration_days', ['30'])[0] or 30)
                     ip_limit = int(form.get('ip_limit', ['0'])[0] or 0)
                     traffic_gb = float(form.get('traffic_gb', ['0'])[0] or 0)
+                    if days <= 0 or ip_limit < 0 or not math.isfinite(traffic_gb) or traffic_gb < 0:
+                        return self.reply(400, b'Invalid duration, IP limit or traffic quota')
                     limit_bytes = int(traffic_gb * (1024**3)) if traffic_gb > 0 else 0
                     note = form.get('note', [''])[0].strip()[:200]
                     # 🔴 2026-10-09 修：原来是无条件赋值，同名 id 会被**静默覆盖** ——
@@ -5227,14 +5256,13 @@ net.ipv4.tcp_slow_start_after_idle = 0
                     # 现在显式 409，并回显密码尾号帮机主确认自己是不是认错了人。
                     with data_lock:
                         existing = data.get('users', {}).get(user_id)
-                    if existing is not None:
-                        tail = (existing.get('password') or '')[-4:]
-                        used_gb = round(int(existing.get('used_bytes', 0)) / (1024 ** 3), 2)
-                        return self.reply(409, (
-                            f'用户 {user_id} 已存在（当前密码尾号 {tail}，已用 {used_gb} GB）。'
-                            '如需改参数请用「修改」，或先删除该用户再重建。'
-                        ).encode('utf-8'))
-                    with data_lock:
+                        if existing is not None:
+                            tail = (existing.get('password') or '')[-4:]
+                            used_gb = round(int(existing.get('used_bytes', 0)) / (1024 ** 3), 2)
+                            return self.reply(409, (
+                                f'用户 {user_id} 已存在（当前密码尾号 {tail}，已用 {used_gb} GB）。'
+                                '如需改参数请用「修改」，或先删除该用户再重建。'
+                            ).encode('utf-8'))
                         data.setdefault('users', {})[user_id] = {
                             'password': pwd,
                             'expires_at': now_ts + days * 86400,
@@ -5254,10 +5282,21 @@ net.ipv4.tcp_slow_start_after_idle = 0
                     if user_id == MASTER_USER_ID:
                         return self.reply(400, b'Cannot delete the master account')
                     with data_lock:
+                        if user_id not in data.get('users', {}):
+                            return self.reply(404, b'User not found')
                         if user_id in data.get('users', {}):
                             del data['users'][user_id]
                             if user_id in ip_tracker:
                                 del ip_tracker[user_id]
+
+                if data.get('reality_config') and not self._sync_reality_clients():
+                    with data_lock:
+                        if previous_user is None:
+                            data.get('users', {}).pop(user_id, None)
+                        else:
+                            data.setdefault('users', {})[user_id] = previous_user
+                    save_data()
+                    return self.reply(503, 'Reality 同步失败，用户操作已撤销，请检查服务后重试'.encode('utf-8'))
 
                 regenerate_page()
                 self.send_response(302)
@@ -5525,7 +5564,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     return self.reply(429, b'Too many requests')
                 if not self.verify_api_key():
                     return self.reply_json(401, {'ok': False, 'error': 'Unauthorized API key'})
-                sub = self.path[len('/api/v1/'):]
+                sub = self.path[len('/api/v1/'):].split('?', 1)[0]
                 # 剥掉 query 再比较。
                 #
                 # ⚠️ self.path 是**含 query 的**原始路径，`/api/v1/speedtest?x=1`
@@ -5556,7 +5595,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     #   * 收窄到**白名单**（见 _reality_public_params）：只挑
                     #     明确要用的几个键，不做整字典透传 —— 这样以后
                     #     reality_config 里新增任何字段都不会自动泄漏出去。
-                    m = json.loads(meta_path.read_text()) if meta_path.exists() else {}
+                    m = json.loads(meta_path.read_text(encoding='utf-8')) if meta_path.exists() else {}
                     with data_lock:
                         d_snap = {
                             'reality': dict(data.get('reality_config') or {}),
@@ -5675,7 +5714,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                         result = {k: v for k, v in u.items() if k != 'password'}
                     return self.reply_json(200, {'ok': True, 'user_id': user_id, 'user': result})
                 if sub == 'node/meta':
-                    m = json.loads(meta_path.read_text()) if meta_path.exists() else {}
+                    m = json.loads(meta_path.read_text(encoding='utf-8')) if meta_path.exists() else {}
                     with data_lock:
                         users_count = len(data.get('users', {}))
                     # 🔴 白名单，2026-10-09 修（真实泄漏）：
@@ -5722,7 +5761,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                         items = list(data.get('proxy_services', []))
                     # 面板只看这条 API: 补齐 host 与 gost 运行状态,
                     # 否则列表显示不出主机名, 也无法区分"服务真的可用"和"条目存在".
-                    m = json.loads(meta_path.read_text()) if meta_path.exists() else {}
+                    m = json.loads(meta_path.read_text(encoding='utf-8')) if meta_path.exists() else {}
                     host = m.get('public_ip', '127.0.0.1') if m.get('is_insecure') else m.get('server_name', 'localhost')
                     return self.reply_json(200, {
                         'ok': True,
@@ -5741,7 +5780,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             if not self.path.startswith(prefix):
                 return self.reply(404, b'Not found')
 
-            subpath = self.path[len(prefix):]
+            subpath = self.path[len(prefix):].split('?', 1)[0]
             auth_header = self.headers.get('Authorization', '')
             is_client_api = subpath in ('clash.yaml', 'sing-box.json') or auth_header.startswith('Basic ')
 
@@ -5768,7 +5807,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 if not self.is_authenticated() and not (k_val and hmac.compare_digest(k_val, expected_k)):
                     return self.reply(403, b'Access denied: invalid key')
 
-                m = json.loads(meta_path.read_text()) if meta_path.exists() else {}
+                m = json.loads(meta_path.read_text(encoding='utf-8')) if meta_path.exists() else {}
                 pwd = u_copy.get('password', '')
                 uri, clash_yaml, sing_json = artifacts(m, auth_override=pwd, name_override=f"Hy2-{target_uid}")
 
@@ -5812,6 +5851,13 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             if subpath == 'bbr-status':
                 return self._h_get_bbr_status(subpath)
 
+            if subpath == 'upgrade-status':
+                if not self.is_authenticated():
+                    return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
+                with data_lock:
+                    job = dict(data.get('core_upgrade', {}) or {})
+                return self.reply_json(200, {'ok': True, 'job': job})
+
             if subpath == 'warp-status':
                 return self._h_get_warp_status(subpath)
 
@@ -5844,7 +5890,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                         return self.reply_json(404, {'ok': False, 'error': 'User not found'})
                     u_copy = dict(u)
 
-                m = json.loads(meta_path.read_text()) if meta_path.exists() else {}
+                m = json.loads(meta_path.read_text(encoding='utf-8')) if meta_path.exists() else {}
                 pwd = u_copy.get('password', '')
                 uri, clash_yaml, sing_json = artifacts(m, auth_override=pwd, name_override=f"Hy2-{target_uid}")
                 qr_svg = ""
@@ -6011,7 +6057,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             with data_lock:
                 services = list(data.get('proxy_services', []))
-            m = json.loads(meta_path.read_text()) if meta_path.exists() else {}
+            m = json.loads(meta_path.read_text(encoding='utf-8')) if meta_path.exists() else {}
             host = m.get('public_ip', '127.0.0.1') if m.get('is_insecure') else m.get('server_name', 'localhost')
             return self.reply_json(200, {
                 'ok': True,
@@ -6025,33 +6071,33 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             """GET /check-version 的处理逻辑（从 do_GET 机械搬移而来）。"""
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
-            core_curr = '未知'
-            core_latest = '未知'
-            core_has_update = False
-
+            query = parse_qs(self.path.split('?', 1)[1]) if '?' in self.path else {}
+            if query.get('force', ['0'])[0] == '1':
+                _ver_cache['t'] = 0.0
+                _core_ver_cache['t'] = 0.0
+            core_curr, core_latest, core_has_update = '未知', '', False
             try:
-                # 获取本地核心版本 (按行精确匹配 Version: 前缀，避免被字符艺术 LOGO 干扰)
-                out = subprocess.run(['/usr/local/bin/hysteria', 'version'], capture_output=True, text=True, timeout=2).stdout
-                if out:
-                    for line in out.splitlines():
-                        if line.strip().startswith('Version:'):
-                            core_curr = line.split(':', 1)[1].strip().lstrip('v')
-                            break
+                out = subprocess.run(['/usr/local/bin/hysteria', 'version'], capture_output=True, text=True, timeout=3).stdout
+                for line in out.splitlines():
+                    if line.strip().startswith('Version:'):
+                        core_curr = line.split(':', 1)[1].strip().removeprefix('v')
+                        break
             except Exception:
                 pass
-
-            try:
-                # 从 GitHub 获取官方最新版本
-                req = urllib.request.Request('https://api.github.com/repos/apernet/hysteria/releases/latest',
-                                             headers={'User-Agent': 'hysteria2-installer'})
-                with urllib.request.urlopen(req, timeout=3) as resp:
-                    if resp.status == 200:
-                        rel = json.loads(resp.read().decode('utf-8'))
-                        core_latest = rel.get('tag_name', '').lstrip('app/v').lstrip('v')
-                        if core_curr != '未知' and core_latest and core_curr != core_latest:
-                            core_has_update = True
-            except Exception:
-                pass
+            now = time.time()
+            if now - _core_ver_cache['t'] >= (300 if _core_ver_cache['tag'] else 30):
+                try:
+                    req = urllib.request.Request('https://api.github.com/repos/apernet/hysteria/releases/latest',
+                                                 headers={'User-Agent': 'hysteria2-installer'})
+                    with urllib.request.urlopen(req, timeout=3) as response:
+                        release = json.loads(response.read().decode('utf-8'))
+                    _core_ver_cache['tag'] = str(release.get('tag_name') or '').removeprefix('app/').removeprefix('v')
+                except Exception:
+                    _core_ver_cache['tag'] = ''
+                _core_ver_cache['t'] = now
+            core_latest = _core_ver_cache['tag']
+            if core_version_key(core_curr) and core_version_key(core_latest):
+                core_has_update = core_version_key(core_latest) > core_version_key(core_curr)
 
             # 面板自身与 AWG 引擎：用 git blob sha 比对文件内容。
             # 原实现依赖 data['portal_sha']，但那个字段从来没被写入过，
@@ -6064,6 +6110,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             return self.reply_json(200, {
                 'ok': True,
                 'core_current': core_curr,
+                'core_custom': '+' in core_curr,
                 'core_latest': core_latest,
                 'core_has_update': core_has_update,
                 'portal_current': portal_curr,
@@ -6265,7 +6312,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
 
                 return self.reply_json(200, {
                     'ok': True,
-                    'current': cc_out or 'cubic',
+                    'current': cc_out or '未知',
+                'available': subprocess.run(['sysctl', '-n', 'net.ipv4.tcp_available_congestion_control'], capture_output=True, text=True, timeout=2).stdout.split(),
                     'qdisc': qdisc_out or 'fq_codel',
                     'kernel': kernel_ver,
                     'configured': configured_bbr or target_ver or cc_out,
@@ -6282,9 +6330,19 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 outs = list(data.get('custom_outbounds', []))
                 mode = data.get('outbound_mode', 'rules')
                 rules = list(data.get('warp_rules', []))
+                state = routing_state(data)
+                applying = bool(data.get('egress_applying'))
+                error = data.get('egress_apply_error') or data.get('outbound_apply_error', '')
+            try:
+                text = Path('/etc/hysteria/config.yaml').read_text(encoding='utf-8')
+                applied = text == render_egress_config(text, state) and _hy2_config_loaded('/etc/hysteria/config.yaml')
+            except Exception:
+                applied = False
+
             return self.reply_json(200, {
                 'ok': True,
                 'mode': mode,
+                'applying': applying, 'applied': applied and not applying, 'apply_error': error,
                 'outbounds': outs,
                 # 规则里的旧格式是纯字符串（只有域名），前端需要渲染成对象
                 'rules': [({'domain': r, 'outbound': 'warp_socks'} if isinstance(r, str)
@@ -6304,6 +6362,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             query = parse_qs(self.path.split('?', 1)[1]) if '?' in self.path else {}
             kind = (query.get('kind', ['direct'])[0] or 'direct').strip().lower()
             addr = (query.get('addr', [''])[0] or '').strip()
+            if kind not in ('direct', 'auto', 'warp', 'socks5', 'http') or (kind in ('socks5', 'http') and not addr):
+                return self.reply_json(400, {'ok': False, 'error': 'Invalid outbound probe type or missing address'})
             ip = detect_outbound_ip(kind, addr)
             return self.reply_json(200, {'ok': True, 'ip': ip, 'kind': kind})
 
@@ -6372,6 +6432,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     return self.reply_json(400, {
                         'ok': False,
                         'error': '模式只能是 rules（按域名分流）或 global（全局出口）'})
+                if mode == 'global' and not data.get('custom_outbounds'):
+                    return self.reply_json(400, {'ok': False, 'error': '请先新增一个出站，再切换全局出口'})
                 with data_lock:
                     # 🔴 不在这里拦"全局模式但没有出站"：
                     #    apply_outbounds_config 会自动退回rules，
@@ -6392,6 +6454,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                         if not cleaned or not re.match(r'^[a-zA-Z0-9.\-]+$', cleaned):
                             return self.reply_json(400, {'ok': False, 'error': '域名格式不正确'})
                         target = (form.get('outbound', ['warp_socks'])[0] or 'warp_socks').strip()
+                        if not outbound_target_exists(target, data.get('custom_outbounds', [])):
+                            return self.reply_json(400, {'ok': False, 'error': 'Unknown outbound target; refresh and select a configured outbound'})
                         rules = [r for r in rules if r['domain'] != cleaned]
                         rules.append({'domain': cleaned, 'outbound': target})
                         msg = '规则「%s」→ %s 已添加' % (cleaned, target)
@@ -6403,30 +6467,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 return self.reply_json(400, {'ok': False, 'error': '未知 action: ' + action})
 
             save_data()
-
-            # 🔴 应用配置：任何异常都必须捕获并如实返回 JSON，
-            #    绝不能让异常冒到 http.server —— 那样连接会被直接断开，
-            #    前端只看到"请求失败"，用户完全不知道发生了什么。
-            #    （实测踩过：模块级函数访问不到闭包 data_lock 抛 NameError，
-            #     现象就是点"保存"后连接被断开。）
-            try:
-                applied, aerr = apply_outbounds_config(data, data_lock)
-            except Exception as exc:
-                set_outbound_apply_error(data, data_lock, save_data, str(exc))
-                return self.reply_json(500, {
-                    'ok': False,
-                    'error': '应用配置时发生内部错误，已保持原配置：%s' % exc,
-                    'applied': False,
-                })
-            if not applied:
-                set_outbound_apply_error(data, data_lock, save_data, aerr)
-                return self.reply_json(500, {
-                    'ok': False,
-                    'error': ('配置已保存，但应用失败并已自动回滚到原配置：' + aerr),
-                    'applied': False,
-                })
-            set_outbound_apply_error(data, data_lock, save_data, '')
-            return self.reply_json(200, {'ok': True, 'message': msg, 'applied': True})
+            return self._reply_with_egress_apply({'message': msg}, kind='outbound')
 
         def _h_get_warp_status(self, subpath):
             """GET /warp-status 的处理逻辑（从 do_GET 机械搬移而来）。"""
@@ -6434,7 +6475,9 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             with data_lock:
                 enabled = data.get('warp_enabled', False)
-                rules = list(data.get('warp_rules', DEFAULT_WARP_DOMAINS))
+                state = routing_state(data)
+                rules = [r['domain'] for r in normalize_route_rules(state['warp_rules']) if r['outbound'] in ('warp', 'warp_socks')]
+                overridden = state['outbound_mode'] == 'global' and bool(state['custom_outbounds'])
             # 统一到 wgcf + wireproxy(127.0.0.1:19898)；同时兼容尚未升级、
             # 仍跑官方 cloudflare-warp(127.0.0.1:40000) 的旧节点，避免误报「未安装」
             is_installed = (shutil.which('wireproxy') is not None
@@ -6450,13 +6493,13 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                         break
             try:
                 cfg_text = Path('/etc/hysteria/config.yaml').read_text(encoding='utf-8')
-                applied = warp_acl_matches(cfg_text, enabled, rules)
+                applied = cfg_text == render_egress_config(cfg_text, state)
                 applied = applied and _hy2_config_loaded('/etc/hysteria/config.yaml')
             except Exception:
                 applied = False
             with data_lock:
-                apply_error = data.get('warp_apply_error', '')
-                applying = bool(data.get('warp_applying', False))
+                apply_error = data.get('egress_apply_error') or data.get('warp_apply_error', '')
+                applying = bool(data.get('egress_applying') or data.get('warp_applying'))
             return self.reply_json(200, {
                 'ok': True,
                 'installed': is_installed,
@@ -6465,6 +6508,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 'applied': applied and not applying,
                 'applying': applying,
                 'apply_error': apply_error,
+                'overridden': overridden,
                 'ip': outbound_ip,
                 'rules': rules
             })
@@ -6479,7 +6523,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             try:
-                meta = json.loads(meta_path.read_text()) if meta_path.exists() else {}
+                meta = json.loads(meta_path.read_text(encoding='utf-8')) if meta_path.exists() else {}
             except Exception:
                 meta = {}
             root = meta_path.parent
