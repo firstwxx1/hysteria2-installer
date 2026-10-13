@@ -35,7 +35,7 @@ META = dict(
 POST_ENDPOINTS = {
     'do-upgrade', 'install-amneziawg', 'install-gost', 'install-warp',
     'install-xray', 'login', 'manage-amneziawg', 'manage-proxy',
-    'manage-reality', 'manage-user', 'manage-warp', 'reboot-server',
+    'manage-outbounds', 'manage-reality', 'manage-user', 'manage-warp', 'reboot-server',
     'set-bbr',
 }
 
