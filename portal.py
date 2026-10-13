@@ -3205,100 +3205,61 @@ def serve(path):
                     'listener': {'type': 'tcp'},
                 }
                 if ptype == 'https':
-                    entry['listener'] = {
-                        'type': 'tls',
-                        'tls': {
-                            'certFile': str(cert_dir / 'cert.pem'),
-                            'keyFile': str(cert_dir / 'key.pem'),
-                        },
-                    }
+                    cert_file, key_file = gost_tls_paths(portal_path.parent)
+                    entry['listener'] = {'type': 'tls', 'tls': {
+                        'certFile': cert_file, 'keyFile': key_file}}
                 services.append(entry)
 
         cfg = {'services': services}
-        try:
-            tmp = gost_cfg_path.with_suffix('.tmp')
-            tmp.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding='utf-8')
-            tmp.chmod(0o644)
-            tmp.replace(gost_cfg_path)
-        except OSError:
-            pass
+        tmp = gost_cfg_path.with_suffix('.tmp')
+        tmp.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding='utf-8')
+        tmp.chmod(0o600)
+        tmp.replace(gost_cfg_path)
+
+    def gost_ports_ready():
+        with data_lock:
+            ports = [int(item['port']) for item in data.get('proxy_services', [])]
+        for port in ports:
+            try:
+                with socket.create_connection(('127.0.0.1', port), timeout=0.2):
+                    pass
+            except OSError:
+                return False
+        return True
 
     def reload_gost():
-        """让 gost 重新读取 gost.yml. 未安装 gost 时静默跳过.
-
-        ⚠️ 这里踩过三个坑, 改动前务必读完:
-
-        坑 0 —— 「未运行就不管」是错的. 2026-10-01 真实事故: 机器装了 gost 但
-        服务处于 inactive（重启后 enabled 但被手工停过 / 首次创建代理时还没起过）,
-        旧逻辑 `if not gost_status(): return` 直接静默返回 —— 配置没写、服务没起,
-        控制台却提示"创建成功", 端口永远不监听. 正确行为: **已安装但未运行时,
-        写好配置并 systemctl start**（安装了二进制就代表能力存在, 起不来再报错）.
-        只有「二进制不存在」才静默跳过.
-
-        坑 1 —— subprocess.run **不检查退出码**, 只在超时/找不到命令时抛异常.
-        因此早期写成:
-
-            try:
-                subprocess.run(['systemctl', 'reload', 'gost'], timeout=2)
-            except Exception:
-                ... kill -HUP ...
-                except Exception:
-                    ... restart ...
-
-        是**完全错的**: 当 unit 没有 ExecReload 时, systemctl 会打印
-        "Job type reload is not applicable for unit gost.service." 并且
-        **以退出码 3 正常返回** —— 不抛异常, 于是两个 fallback 成了永不执行的
-        死代码. 结果是: 配置写进了 gost.yml, 但 gost 进程从未重载, 新代理的端口
-        一直不监听. 现象极具误导性 —— `systemctl is-active gost` 是 active,
-        页面提示"创建成功", 但代理就是连不上.
-
-        坑 2 —— 判断"reload 是否可用"不能靠猜, 要实际执行后看返回码.
-        `systemctl reload` 在以下两种情况下行为完全不同:
-          - unit 有 ExecReload  -> CanReload=yes, 返回 0, 配置真正重载
-          - unit 没有 ExecReload -> CanReload=no,  返回 3, **什么都没做**
-        两种情况下 subprocess.run 都不抛异常, 所以**必须显式查 returncode**.
-
-        现行策略: 二进制不存在 -> 静默跳过; 已安装但 inactive -> 写配置并 start;
-        运行中 -> 先试 reload, 返回码非 0 就退化为 restart (restart 一定生效).
-        另外 unit 里还配了 gost 官方的 `-R 30s` 周期自动重载作为第二重保险
-        (实测 v3.3.0 的 -R 有效: 改配置后 2 秒内自动重载并换端口).
-
-        保持异步执行 (daemon 线程 + 短 timeout), 避免 gost 卡住时把 portal 的
-        do_POST 一起拖死.
-        """
+        """Return real application success, including expected listener readiness."""
         if not Path('/usr/local/bin/gost').exists():
-            return                                  # 未安装: 静默跳过 (唯一合法的跳过理由)
-        # 先自愈 unit: 老机器的 unit 可能没有 ExecReload (那样 reload 会静默失败).
-        ensure_gost_unit()
-        write_gost_config()
-
-        def _do_reload():
-            active = gost_status()
-            # 第一优先: 服务在运行则平滑 reload (不断开现有连接).
-            # 必须查 returncode —— 见坑 1/2.
-            if active:
-                try:
-                    r = subprocess.run(['systemctl', 'reload', 'gost'],
-                                       capture_output=True, timeout=5)
-                    if r.returncode == 0:
-                        return
-                except Exception:
-                    pass
-            # 退化路径: inactive 未被上面 start 兜住 / reload 不可用 / reload 失败.
-            # restart 对三种状态都有效 (inactive 时等价于 start), 代价是断当前连接.
+            return False
+        with gost_operation_lock:
             try:
-                subprocess.run(['systemctl', 'restart', 'gost'],
-                               capture_output=True, timeout=10)
+                ensure_gost_unit()
+                write_gost_config()
+                if gost_status():
+                    r = subprocess.run(['systemctl', 'reload', 'gost'], capture_output=True, timeout=5)
+                    if r.returncode == 0:
+                        for _ in range(10):
+                            if gost_status() and gost_ports_ready():
+                                return True
+                            time.sleep(0.2)
+                r = subprocess.run(['systemctl', 'restart', 'gost'], capture_output=True, timeout=12)
+                if r.returncode != 0:
+                    return False
+                for _ in range(15):
+                    if gost_status() and gost_ports_ready():
+                        return True
+                    time.sleep(0.2)
             except Exception:
-                pass
+                return False
+        return False
 
-        threading.Thread(target=_do_reload, daemon=True).start()
 
     # 远端根目录文件 sha 的短缓存。
     # 必要性：版本检查会在每次页面加载时触发，而 GitHub 未认证 API 限 60 次/小时/IP。
     # 用「目录列表」接口一次拿回所有文件的 sha（而不是逐文件取），再叠 5 分钟缓存，
     # 把每次检查的 API 调用压到 1 次。
     _ver_cache = {'t': 0.0, 'data': None}
+    _core_ver_cache = {'t': 0.0, 'tag': ''}
 
     def _remote_root_shas():
         now = time.time()
@@ -3373,7 +3334,7 @@ def serve(path):
         """
         unit_path = Path('/etc/systemd/system/gost.service')
         try:
-            current = unit_path.read_text() if unit_path.exists() else ''
+            current = unit_path.read_text(encoding='utf-8') if unit_path.exists() else ''
         except OSError:
             return
         needed = ('ExecReload=/bin/kill -HUP $MAINPID',
@@ -3518,7 +3479,7 @@ if __name__ == '__main__':
     def awg_read_json(path, default):
         try:
             if path.exists():
-                return json.loads(path.read_text())
+                return json.loads(path.read_text(encoding='utf-8'))
         except Exception:
             pass
         return default
@@ -3658,11 +3619,11 @@ if __name__ == '__main__':
         }
 
     def regenerate_page():
-        m = json.loads(meta_path.read_text()) if meta_path.exists() else {}
+        m = json.loads(meta_path.read_text(encoding='utf-8')) if meta_path.exists() else {}
         uri, clash, sing = artifacts(m)
         root = portal_path.parent
         access_file = root / 'portal-access.json'
-        access = json.loads(access_file.read_text()) if access_file.exists() else {}
+        access = json.loads(access_file.read_text(encoding='utf-8')) if access_file.exists() else {}
         host = m.get('public_ip', '127.0.0.1') if m.get('is_insecure') else m.get('server_name', 'localhost')
         subscription = f"https://{access.get('username','')}:{access.get('password','')}@{host}:{resolve_subscription_port(m)[0]}/{data['token']}/clash.yaml"
         
@@ -3749,62 +3710,30 @@ if __name__ == '__main__':
 
     class Handler(BaseHTTPRequestHandler):
         def _sync_reality_clients(self):
-            """把 data['users'] 派生出的 UUID 列表写进 xray.json 并热重载。
-
-            只在 **xray 已安装**（/etc/hysteria/xray.json 存在）时才动手 ——
-            没装 Reality 的节点不该因为一次开户就被创建出 xray 配置。
-            静默跳过是**正确**的：这不是错误，只是该节点没启用 Reality。
-            """
+            """Synchronize only existing Reality configs; keep an intentionally stopped service off."""
             xj = Path('/etc/hysteria/xray.json')
             if not xj.exists():
                 return False
-            try:
-                cfg = json.loads(xj.read_text())
-            except Exception:
-                return False
-            inbounds = cfg.get('inbounds') or []
-            vless = next((i for i in inbounds
-                          if i.get('protocol') == 'vless'
-                          and (i.get('streamSettings') or {}).get('security') == 'reality'),
-                         None)
-            if vless is None:
-                return False
-            with data_lock:
-                clients = reality_clients(data)
-            vless.setdefault('settings', {})['clients'] = clients
-            vless['settings']['decryption'] = vless['settings'].get('decryption', 'none')
-            try:
-                xj.write_text(json.dumps(cfg, indent=2), encoding='utf-8')
-            except Exception:
-                return False
-            # 重载 xray。
-            #
-            # ⚠️ 2026-10-03 实测踩坑（真机 jp 节点）：
-            #   开户/销户每次都会走到这里，而 xray **不支持 systemctl reload**
-            #   （它没有 ExecReload），于是每次都回退到 `systemctl restart`。
-            #   连着几次（我的五轮验证一口气开了十几个探针账号）之后，
-            #   systemd 的 start-limit 被打满 —— 服务进入 `failed`：
-            #     xray.service: Start request repeated too quickly.
-            #     xray.service: Failed with result 'start-limit-hit'.
-            #   之后**即使配置完全正确也无法启动**，只能
-            #   `systemctl reset-failed xray` 手工解封。
-            #   症状极具误导性：portal 一切正常、xray.json 也对，
-            #   但 Reality 通道全断、443 没人监听。
-            #
-            # 对策（三条一起，缺一不可）：
-            #   1. restart 前先 reset-failed —— 绕开 start-limit 计数；
-            #   2. 加 ExecReload 到 unit（由调用方保证），这样能走 reload 就不重启；
-            #   3. 节流 —— 短时间内多次变更只重启一次（见 _reality_restart_gate）。
-            if self._reality_restart_allowed():
-                subprocess.run(['systemctl', 'reset-failed', 'xray'],
-                               capture_output=True, timeout=5)
-                r = subprocess.run(['systemctl', 'reload', 'xray'],
-                                   capture_output=True, timeout=5)
-                if r.returncode != 0:
-                    r = subprocess.run(['systemctl', 'restart', 'xray'],
-                                       capture_output=True, timeout=10)
-                return r.returncode == 0
-            return False
+            with reality_apply_lock:
+                try:
+                    cfg = json.loads(xj.read_text(encoding='utf-8'))
+                    vless = next((i for i in cfg.get('inbounds', [])
+                        if i.get('protocol') == 'vless' and
+                        (i.get('streamSettings') or {}).get('security') == 'reality'), None)
+                    if vless is None:
+                        return False
+                    with data_lock:
+                        vless.setdefault('settings', {})['clients'] = reality_clients(data)
+                    vless['settings']['decryption'] = 'none'
+                    active = subprocess.run(['systemctl', 'is-active', 'xray'], capture_output=True,
+                                            text=True, timeout=3).stdout.strip() == 'active'
+                    if active:
+                        self._reality_restart_allowed()
+                    apply_xray_config_transaction(cfg, config_path=str(xj),
+                                                  binary=str(Path('/usr/local/bin/xray')), restart=active)
+                    return True
+                except Exception:
+                    return False
 
         def _reality_restart_allowed(self, min_interval=3.0):
             """节流：min_interval 秒内只放行一次 xray 重启。
@@ -3823,10 +3752,11 @@ if __name__ == '__main__':
             #   明令禁止函数级 import（会让每个请求都走一次 import 查找，
             #   且 import 位置分散后很难审计）。
             now = time.monotonic()
-            last = getattr(self, '_reality_last_restart', 0.0)
-            if now - last < min_interval:
-                return False
-            self._reality_last_restart = now
+            last = getattr(self.server, '_reality_last_restart', 0.0)
+            delay = max(0.0, min_interval - (now - last))
+            if delay:
+                time.sleep(delay)
+            self.server._reality_last_restart = time.monotonic()
             return True
 
         def _generate_and_apply_reality(self, restart=True, force=False):
@@ -3853,7 +3783,7 @@ if __name__ == '__main__':
             priv_key = '' if force else rcfg_old.get('private_key', '')
             pub_key = '' if force else rcfg_old.get('public_key', '')
             if not (priv_key and pub_key):
-                # 首次才生成。xray 不可用时回落到硬编码常量（沿用旧行为）。
+                # 生成失败就停止，不能让不同节点共用硬编码私钥。
                 try:
                     p = subprocess.run(['/usr/local/bin/xray', 'x25519'],
                                        capture_output=True, text=True, timeout=5)
@@ -3864,9 +3794,8 @@ if __name__ == '__main__':
                             pub_key = line.split(':')[1].strip()
                 except Exception:
                     priv_key = pub_key = ''
-                if not priv_key or not pub_key:
-                    priv_key = 'SKHsyFDGviRODhpQJQLAxAU-qRBBWjKjntbVXp8KW10'
-                    pub_key = '2uyjYiLgv9SAjn6eVC21EywA55xyiebI-wg03rgBH2g'
+                if not priv_key or not pub_key or p.returncode != 0:
+                    raise RuntimeError('X25519 密钥生成失败，原密钥和配置未修改')
 
             short_id = (secrets.token_hex(4) if force
                         else (rcfg_old.get('short_id') or secrets.token_hex(4)))
@@ -3884,7 +3813,7 @@ if __name__ == '__main__':
             #
             # 注意：这里**只读**监听表，不做 bind 探测 ——
             # 本文件 gost 段记着血泪：「不再用 socket bind 做端口探测(在某些环境会卡住)」。
-            m = json.loads(meta_path.read_text()) if meta_path.exists() else {}
+            m = json.loads(meta_path.read_text(encoding='utf-8')) if meta_path.exists() else {}
             _avoid = set()
             try:
                 _avoid.add(int(m.get('listen_port') or 0))
@@ -3918,22 +3847,15 @@ if __name__ == '__main__':
 
             public_ip = m.get('public_ip', '127.0.0.1')
 
+            new_rcfg = {
+                'private_key': priv_key, 'public_key': pub_key, 'short_id': short_id,
+                'dest_sni': dest_sni, 'port': listen_port,
+            }
+            new_rcfg['uuid'] = reality_uuid_for_user(MASTER_USER_ID)
+            new_rcfg['uri'] = reality_uri_for_user(new_rcfg, MASTER_USER_ID, public_ip,
+                                                 label='Teyir-VLESS-Reality')
             with data_lock:
-                data['reality_config'] = {
-                    'private_key': priv_key,
-                    'public_key': pub_key,
-                    'short_id': short_id,
-                    'dest_sni': dest_sni,
-                    'port': listen_port,
-                }
-                # 单用户视角的 uri 仍然给（Web 面板二维码要用），
-                # 取机主自己的 UUID —— 保证刷新后链接不变。
-                data['reality_config']['uuid'] = reality_uuid_for_user(MASTER_USER_ID)
-                data['reality_config']['uri'] = reality_uri_for_user(
-                    data['reality_config'], MASTER_USER_ID, public_ip,
-                    label='Teyir-VLESS-Reality')
                 clients = reality_clients(data)
-            save_data()
 
             xray_json = {
                 "log": {"loglevel": "warning"},
@@ -3966,6 +3888,20 @@ if __name__ == '__main__':
                 ],
                 "outbounds": [{"protocol": "freedom", "tag": "direct"}]
             }
+            xray_path = Path('/etc/hysteria/xray.json')
+            if xray_path.exists():
+                previous = json.loads(xray_path.read_text(encoding='utf-8'))
+                old_inbound = next((i for i in previous.get('inbounds', [])
+                    if i.get('protocol') == 'vless' and
+                    (i.get('streamSettings') or {}).get('security') == 'reality'), None)
+                if old_inbound is not None:
+                    desired = xray_json['inbounds'][0]
+                    old_inbound['port'] = desired['port']
+                    old_inbound.setdefault('settings', {}).update(desired['settings'])
+                    old_inbound.setdefault('streamSettings', {}).setdefault('realitySettings', {}).update(
+                        desired['streamSettings']['realitySettings'])
+                    xray_json = previous
+
             # 重生成 Reality 配置时保留计量能力；仅添加回环 StatsService。
             # 没有计量配置时保持原行为，有配置却不可应用时禁止静默覆盖。
             _meter_config_path = portal_path.parent / 'usage-meter-config.json'
@@ -3981,11 +3917,12 @@ if __name__ == '__main__':
                     _stats_mod = importlib.util.module_from_spec(_stats_spec)
                     _stats_spec.loader.exec_module(_stats_mod)
                     xray_json = _stats_mod.add_stats(xray_json, int(_address.rsplit(':', 1)[1]))
-            Path('/etc/hysteria/xray.json').write_text(
-                json.dumps(xray_json, indent=2), encoding='utf-8')
-            if restart:
-                subprocess.run(['systemctl', 'restart', 'xray'],
-                               capture_output=True, timeout=5)
+            with reality_apply_lock:
+                apply_xray_config_transaction(xray_json, config_path=str(xray_path),
+                                              binary=str(Path('/usr/local/bin/xray')), restart=restart)
+                with data_lock:
+                    data['reality_config'] = new_rcfg
+                save_data()
             return clients
 
         server_version = 'Gateway'
@@ -4099,6 +4036,12 @@ if __name__ == '__main__':
                 self.server.auth_failures.append(now)
 
         def do_POST(self):
+            try:
+                body_length = int(self.headers.get('Content-Length', 0))
+            except (ValueError, TypeError):
+                return self.reply_json(400, {'ok': False, 'error': 'Invalid Content-Length'})
+            if not 0 <= body_length <= 1024 * 1024:
+                return self.reply_json(413, {'ok': False, 'error': 'Request body exceeds 1 MiB'})
             # 1. Hysteria 2 本地 HTTP 动态鉴权、实时流量统计与 IP 限额拦截端点
             #
             # 🔴 这里必须限流（2026-10-09 修）：原注释写「来自 127.0.0.1 豁免限流」，
@@ -4190,7 +4133,29 @@ if __name__ == '__main__':
                 except Exception:
                     return self.reply_json(400, {'ok': False, 'error': 'Invalid JSON body'})
 
-                sub = self.path[len('/api/v1/'):]
+                if not isinstance(params, dict):
+                    return self.reply_json(400, {'ok': False, 'error': 'JSON body must be an object'})
+                sub = self.path[len('/api/v1/'):].split('?', 1)[0]
+                if sub.startswith('users/'):
+                    try:
+                        for key in ('user_id', 'password'):
+                            if params.get(key) is not None and not isinstance(params[key], str):
+                                raise ValueError()
+                        for key in ('duration_days', 'ip_limit', 'expires_at', 'limit_bytes', 'used_bytes'):
+                            if key in params:
+                                if isinstance(params[key], bool):
+                                    raise ValueError()
+                                params[key] = int(params[key])
+                                if params[key] < (1 if key == 'duration_days' else 0):
+                                    raise ValueError()
+                        if 'traffic_gb' in params:
+                            params['traffic_gb'] = float(params['traffic_gb'])
+                            if not math.isfinite(params['traffic_gb']) or params['traffic_gb'] < 0:
+                                raise ValueError()
+                        if 'active' in params and not isinstance(params['active'], bool):
+                            raise ValueError()
+                    except (ValueError, TypeError, OverflowError):
+                        return self.reply_json(400, {'ok': False, 'error': 'Invalid user parameter'})
                 now_ts = int(time.time())
 
                 # 动态开户 (支持 duration_days, ip_limit, traffic_gb)
@@ -4208,9 +4173,10 @@ if __name__ == '__main__':
                     note = str(params.get('note', '')).strip()[:200]
 
                     with data_lock:
-                        if params.get('create_only') and user_id in data.get('users', {}):
+                        existing = data.get('users', {}).get(user_id)
+                        if params.get('create_only') and existing is not None:
                             return self.reply_json(409, {'ok': False, 'error': 'User already exists'})
-                        data.setdefault('users', {})[user_id] = {
+                        record = {
                             'password': pwd,
                             'expires_at': expires,
                             'ip_limit': ip_limit,
@@ -4220,6 +4186,19 @@ if __name__ == '__main__':
                             'created_at': now_ts,
                             'note': note
                         }
+                        if existing is not None:
+                            record['used_bytes'] = int(existing.get('used_bytes', 0))
+                            record['created_at'] = existing.get('created_at', now_ts)
+                            record['status'] = existing.get('status', 'active')
+                            for param, field in (('password', 'password'), ('ip_limit', 'ip_limit'),
+                                                 ('traffic_gb', 'limit_bytes'), ('note', 'note')):
+                                if param not in params or (param == 'password' and not params.get(param)):
+                                    record[field] = existing.get(field, record[field])
+                            if 'duration_days' not in params and 'expires_at' not in params:
+                                record['expires_at'] = existing.get('expires_at', record['expires_at'])
+                        data.setdefault('users', {})[user_id] = record
+                        pwd, expires = record['password'], record['expires_at']
+                        ip_limit, limit_bytes = record['ip_limit'], record['limit_bytes']
                         # 同步 Reality 账号表（2026-10-03）：一个 Hy2 用户
                         # 对应一个 VLESS UUID，开户即生效。
                         reality_registry(data)
@@ -4231,9 +4210,10 @@ if __name__ == '__main__':
                         if not self._sync_reality_clients():
                             return self.reply_json(503, {'ok': False, 'error': 'Reality sync failed; retry required'})
                     else:
-                        self._sync_reality_clients()
+                        if Path('/etc/hysteria/xray.json').exists() and not self._sync_reality_clients():
+                            return self.reply_json(503, {'ok': False, 'error': 'Reality sync failed; retry required'})
 
-                    m = json.loads(meta_path.read_text()) if meta_path.exists() else {}
+                    m = json.loads(meta_path.read_text(encoding='utf-8')) if meta_path.exists() else {}
                     # artifacts 传入 reality + user_id ⇒ 输出「Hy2 + Reality」双节点
                     # 且 Clash / Sing-box 的策略组变成 url-test（自动择优）。
                     uri, clash_yaml, sing_json = artifacts(
@@ -4335,7 +4315,8 @@ if __name__ == '__main__':
                     if deleted:
                         regenerate_page()
                         # 把 clients 变更热重载到 xray（不装 Reality 时静默跳过）
-                        self._sync_reality_clients()
+                        if Path('/etc/hysteria/xray.json').exists() and not self._sync_reality_clients():
+                            return self.reply_json(503, {'ok': False, 'error': 'Reality revocation sync failed; retry required'})
                         return self.reply_json(200, {'ok': True, 'message': 'User deleted'})
                     return self.reply_json(404, {'ok': False, 'error': 'User not found'})
 
@@ -4423,68 +4404,13 @@ if __name__ == '__main__':
                     return self.reply_json(200, {'ok': True, 'count': len(users_out), 'users': users_out})
 
                 elif sub == 'proxy-services/add':
-                    # BUGFIX #9: 商城/agent 程序化添加 gost 入站代理账号
-                    ptype = (params.get('protocol') or params.get('type') or 'socks5').lower()
-                    if ptype not in ('socks5', 'http', 'https'):
-                        return self.reply_json(400, {'ok': False, 'error': 'Invalid protocol (socks5|http|https)'})
-                    try:
-                        port = int(params.get('port', 0))
-                    except Exception:
-                        return self.reply_json(400, {'ok': False, 'error': 'Invalid port'})
-                    username = (params.get('username') or '').strip() or secrets.token_hex(4)
-                    password = (params.get('password') or '').strip() or secrets.token_urlsafe(16)
-                    note = (params.get('note') or '').strip()
-
-                    with data_lock:
-                        existing_ports = set(s.get('port') for s in data.get('proxy_services', []))
-                    if port <= 0 or port > 65535:
-                        # BUGFIX: 不再用 socket bind 做端口探测 (在某些环境会卡住),
-                        # 改为纯随机选 + 跳过已知占用端口. 若用户没传 port 则强制要求传.
-                        allocated = None
-                        attempts = 0
-                        while attempts < 50:
-                            attempts += 1
-                            cand = random.randint(30000, 50000)
-                            if 20000 <= cand <= 40000 or cand in existing_ports or cand in (8443, 19898, 40000, 22, 80, 443):
-                                continue
-                            allocated = cand
-                            break
-                        if not allocated:
-                            return self.reply_json(500, {'ok': False, 'error': '请显式指定可用端口 (port), 自动分配失败'})
-                        port = allocated
-                    else:
-                        if port in existing_ports:
-                            return self.reply_json(400, {'ok': False, 'error': f'端口 {port} 已被其他代理服务占用'})
-
-                    proxy_id = secrets.token_hex(6)
-                    now_ts = int(time.time())
-                    with data_lock:
-                        data.setdefault('proxy_services', []).append({
-                            'id': proxy_id,
-                            'type': ptype,
-                            'port': port,
-                            'username': username,
-                            'password': password,
-                            'created_at': now_ts,
-                            'note': note,
-                        })
-                        save_data()
-                    reload_gost()
-
-                    m = json.loads(meta_path.read_text()) if meta_path.exists() else {}
-                    host = m.get('public_ip', '127.0.0.1') if m.get('is_insecure') else m.get('server_name', 'localhost')
-                    uri_link = f"{ptype}://{username}:{password}@{host}:{port}"
-                    return self.reply_json(200, {
-                        'ok': True, 'id': proxy_id, 'type': ptype, 'host': host, 'port': port,
-                        'username': username, 'password': password, 'note': note,
-                        'url': uri_link, 'format': f"{host}:{port}:{username}:{password}",
-                        'gost_active': gost_status(),
-                    })
+                    status, payload = self._manage_proxy_operation('create', params)
+                    return self.reply_json(status, payload)
 
                 elif sub == 'proxy-services/list':
                     with data_lock:
                         items = list(data.get('proxy_services', []))
-                    m = json.loads(meta_path.read_text()) if meta_path.exists() else {}
+                    m = json.loads(meta_path.read_text(encoding='utf-8')) if meta_path.exists() else {}
                     host = m.get('public_ip', '127.0.0.1') if m.get('is_insecure') else m.get('server_name', 'localhost')
                     # 不脱敏 password, 调用方是受信 API key
                     return self.reply_json(200, {
@@ -4497,18 +4423,8 @@ if __name__ == '__main__':
                     })
 
                 elif sub == 'proxy-services/delete':
-                    proxy_id = (params.get('id') or '').strip()
-                    if not proxy_id:
-                        return self.reply_json(400, {'ok': False, 'error': 'Missing id'})
-                    with data_lock:
-                        services = data.get('proxy_services', [])
-                        new_services = [s for s in services if s.get('id') != proxy_id]
-                        if len(new_services) == len(services):
-                            return self.reply_json(404, {'ok': False, 'error': 'Proxy service not found'})
-                        data['proxy_services'] = new_services
-                    save_data()
-                    reload_gost()
-                    return self.reply_json(200, {'ok': True, 'message': 'Proxy service deleted'})
+                    status, payload = self._manage_proxy_operation('delete', params)
+                    return self.reply_json(status, payload)
 
                 return self.reply_json(404, {'ok': False, 'error': 'API endpoint not found'})
 
@@ -4621,6 +4537,7 @@ if __name__ == '__main__':
                     # 自更新不走 do_upgrade.sh：那个脚本从 raw.githubusercontent.com
                     # 拉文件，会踩 raw 的 CDN 缓存（实测 push 后数分钟仍返回旧内容），
                     # 表现为"更新完还是旧版"。这里用多源回退直接取。
+                    ref = resolve_update_ref(ref)
                     fetched = []
                     # 标记必须按文件各选各的 —— 踩过：给 portal_assets.py 用了
                     # b'hysteria2-installer'，但那个字符串只存在于 portal.py 里，
@@ -4702,138 +4619,136 @@ if __name__ == '__main__':
 
                 # core 仍交给 do_upgrade.sh：下载的是 Hysteria 官方发布，
                 # 与 raw 的 CDN 缓存无关。
-                subprocess.Popen(['bash', '/etc/hysteria/do_upgrade.sh', target],
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                return self.reply_json(200, {'ok': True, 'target': target})
+                allow_custom = form.get('allow_custom', ['0'])[0] == '1'
+                with data_lock:
+                    if (data.get('core_upgrade') or {}).get('state') == 'running':
+                        return self.reply_json(409, {'ok': False, 'error': '核心更新仍在运行，请等待完成'})
+                    data['core_upgrade'] = {'state': 'running', 'started_at': int(time.time())}
+                save_data()
+                def upgrade_worker():
+                    try:
+                        result = upgrade_core_binary(allow_custom=allow_custom)
+                        job = dict(result, state='completed')
+                    except Exception as exc:
+                        job = {'state': 'failed', 'error': str(exc)}
+                    with data_lock:
+                        data['core_upgrade'] = dict(job, finished_at=int(time.time()))
+                        _core_ver_cache['t'] = 0.0
+                    save_data()
+                try:
+                    self.reply_json(200, {'ok': True, 'target': 'core', 'applying': True,
+                        'message': '核心更新任务已接受，下载、应用和回滚结果将单独核验'})
+                finally:
+                    threading.Thread(target=upgrade_worker, daemon=True).start()
+                return
             except Exception as e:
                 return self.reply_json(500, {'ok': False, 'error': str(e)})
 
+        def _manage_proxy_operation(self, action, params):
+            if action not in ('create', 'delete'):
+                return 400, {'ok': False, 'error': 'Invalid action'}
+            with gost_operation_lock:
+                if not Path('/usr/local/bin/gost').exists():
+                    return 409, {'ok': False, 'error': '请先安装 GOST，再创建代理服务'}
+                with data_lock:
+                    previous = copy.deepcopy(data.get('proxy_services', []))
+                if action == 'create':
+                    ptype = str(params.get('protocol') or params.get('type') or 'socks5').lower()
+                    if ptype not in ('socks5', 'http', 'https'):
+                        return 400, {'ok': False, 'error': 'Invalid proxy type'}
+                    raw_port = str(params.get('port') or '').strip()
+                    try:
+                        port = int(raw_port) if raw_port else 0
+                    except (TypeError, ValueError):
+                        return 400, {'ok': False, 'error': 'Invalid port'}
+                    if raw_port and not 1 <= port <= 65535:
+                        return 400, {'ok': False, 'error': 'Port must be in 1..65535'}
+                    if ptype == 'https':
+                        gost_tls_paths(portal_path.parent)
+                    existing = {int(item['port']) for item in previous}
+                    candidates = [port] if port else [random.randint(12000, 58000) for _ in range(100)]
+                    selected = 0
+                    for candidate in candidates:
+                        if candidate in existing or (not port and 20000 <= candidate <= 40000):
+                            continue
+                        try:
+                            with socket.socket() as probe:
+                                probe.bind(('0.0.0.0', candidate))
+                            selected = candidate
+                            break
+                        except OSError:
+                            continue
+                    if not selected:
+                        return 400, {'ok': False, 'error': '指定端口已占用，或无法找到空闲端口'}
+                    port = selected
+                    username = str(params.get('username') or '').strip()[:64] or ('user_' + secrets.token_hex(4))
+                    password = str(params.get('password') or '').strip() or secrets.token_hex(12)
+                    if ptype in ('http', 'https') and ':' in username:
+                        return 400, {'ok': False, 'error': 'HTTP Basic 认证用户名不能包含冒号'}
+                    if ptype == 'socks5' and (len(username.encode('utf-8')) > 255 or len(password.encode('utf-8')) > 255):
+                        return 400, {'ok': False, 'error': 'SOCKS5 账号或密码不能超过 255 字节'}
+                    entry = {'id': 'proxy_' + secrets.token_hex(6), 'type': ptype, 'port': port,
+                             'username': username, 'password': password, 'created_at': int(time.time()),
+                             'note': str(params.get('note') or '').strip()[:200]}
+                    with data_lock:
+                        data.setdefault('proxy_services', []).append(entry)
+                else:
+                    proxy_id = str(params.get('id') or '').strip()
+                    if not proxy_id:
+                        return 400, {'ok': False, 'error': 'Missing id'}
+                    remaining = [item for item in previous if item.get('id') != proxy_id]
+                    if len(remaining) == len(previous):
+                        return 404, {'ok': False, 'error': 'Proxy service not found'}
+                    with data_lock:
+                        data['proxy_services'] = remaining
+                save_data()
+                if not reload_gost():
+                    with data_lock:
+                        data['proxy_services'] = previous
+                    save_data()
+                    reload_gost()
+                    return 500, {'ok': False, 'applied': False,
+                        'error': 'GOST 配置未成功应用或端口未监听，代理记录已恢复；请检查服务日志'}
+                if action == 'delete':
+                    return 200, {'ok': True, 'applied': True, 'message': 'Proxy service deleted'}
+                m = json.loads(meta_path.read_text(encoding='utf-8')) if meta_path.exists() else {}
+                host = m.get('public_ip', '127.0.0.1') if m.get('is_insecure') else m.get('server_name', 'localhost')
+                host_part = '[' + host + ']' if ':' in host and not host.startswith('[') else host
+                uri = '%s://%s:%s@%s:%s' % (ptype, quote(username, safe=''), quote(password, safe=''), host_part, port)
+                qr_svg = ''
+                try:
+                    qr = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'], input=uri.encode(),
+                                        capture_output=True, timeout=3)
+                    if qr.returncode == 0:
+                        qr_svg = qr.stdout.decode('utf-8')
+                except Exception:
+                    pass
+                return 200, dict(entry, ok=True, applied=True, host=host, url=uri, qr=qr_svg,
+                                 format='%s:%s:%s:%s' % (host, port, username, password), gost_active=True)
+
         def _h_post_manage_proxy(self, prefix):
-            """POST /manage-proxy 的处理逻辑（从 do_POST 机械搬移而来）。"""
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             try:
                 length = int(self.headers.get('Content-Length', 0))
-                body = self.rfile.read(length).decode('utf-8')
-                form = parse_qs(body)
-                action = form.get('action', [''])[0]
-                now_ts = int(time.time())
-
-                if action == 'create':
-                    ptype = form.get('type', ['socks5'])[0]
-                    if ptype not in ('socks5', 'http', 'https'):
-                        return self.reply_json(400, {'ok': False, 'error': 'Invalid proxy type'})
-
-                    raw_port = form.get('port', [''])[0].strip()
-                    port = 0
-                    if raw_port:
-                        try:
-                            port = int(raw_port)
-                        except Exception:
-                            return self.reply_json(400, {'ok': False, 'error': 'Invalid port'})
-
-                    with data_lock:
-                        existing_ports = set(s.get('port') for s in data.get('proxy_services', []))
-
-                    # 若未指定端口或端口无效，自动在 12000-58000 寻找空闲可用端口（避开 Hysteria 20000-40000 端口跳跃段及常见端口）
-                    if port <= 0 or port > 65535:
-                        allocated = None
-                        for _ in range(100):
-                            cand = random.randint(12000, 58000)
-                            if 20000 <= cand <= 40000 or cand in existing_ports or cand in (8443, 40000, 56195):
-                                continue
-                            try:
-                                probe = socket.socket()
-                                probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                                probe.bind(('0.0.0.0', cand))
-                                probe.close()
-                                allocated = cand
-                                break
-                            except OSError:
-                                continue
-                        if not allocated:
-                            return self.reply_json(500, {'ok': False, 'error': '系统未能找到空闲可用端口，请尝试手动指定端口'})
-                        port = allocated
-                    else:
-                        # 真实端口占用检测（避免与已有服务冲突）
-                        if port in existing_ports:
-                            return self.reply_json(400, {'ok': False, 'error': f'端口 {port} 已被其他代理服务占用'})
-                        try:
-                            probe = socket.socket()
-                            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                            probe.bind(('0.0.0.0', port))
-                            probe.close()
-                        except OSError:
-                            return self.reply_json(400, {'ok': False, 'error': f'端口 {port} 已被系统其他进程占用'})
-
-                    username = form.get('username', [''])[0].strip()[:64] or ('user_' + secrets.token_hex(4))
-                    password = form.get('password', [''])[0].strip() or secrets.token_hex(12)
-                    note = form.get('note', [''])[0].strip()[:200]
-
-                    with data_lock:
-                        proxy_id = 'proxy_' + secrets.token_hex(6)
-                        data.setdefault('proxy_services', []).append({
-                            'id': proxy_id,
-                            'type': ptype,
-                            'port': port,
-                            'username': username,
-                            'password': password,
-                            'created_at': now_ts,
-                            'note': note,
-                        })
-                    save_data()
-                    reload_gost()
-
-                    # 获取主机域名或 IP 以输出完整连接格式
-                    m = json.loads(meta_path.read_text()) if meta_path.exists() else {}
-                    host = m.get('public_ip', '127.0.0.1') if m.get('is_insecure') else m.get('server_name', 'localhost')
-
-                    uri_link = f"{ptype}://{username}:{password}@{host}:{port}"
-                    qr_svg = ''
-                    try:
-                        qr_res = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'],
-                                                input=uri_link.encode('utf-8'),
-                                                capture_output=True, timeout=3)
-                        if qr_res.returncode == 0:
-                            qr_svg = qr_res.stdout.decode('utf-8')
-                    except Exception:
-                        qr_svg = ''
-
-                    return self.reply_json(200, {
-                        'ok': True,
-                        'id': proxy_id,
-                        'type': ptype,
-                        'host': host,
-                        'port': port,
-                        'username': username,
-                        'password': password,
-                        'note': note,
-                        'url': uri_link,
-                        'format': f"{host}:{port}:{username}:{password}",
-                        'qr': qr_svg
-                    })
-
-                elif action == 'delete':
-                    proxy_id = form.get('id', [''])[0].strip()
-                    with data_lock:
-                        services = data.get('proxy_services', [])
-                        new_services = [s for s in services if s.get('id') != proxy_id]
-                        if len(new_services) == len(services):
-                            return self.reply_json(404, {'ok': False, 'error': 'Proxy service not found'})
-                        data['proxy_services'] = new_services
-                    save_data()
-                    reload_gost()
-                    return self.reply_json(200, {'ok': True, 'message': 'Proxy service deleted'})
-
-                return self.reply_json(400, {'ok': False, 'error': 'Invalid action'})
-            except Exception as e:
-                return self.reply_json(500, {'ok': False, 'error': str(e)})
+                form = parse_qs(self.rfile.read(length).decode('utf-8'))
+                params = {key: values[0] for key, values in form.items()}
+                status, payload = self._manage_proxy_operation(params.pop('action', ''), params)
+                return self.reply_json(status, payload)
+            except Exception as exc:
+                return self.reply_json(500, {'ok': False, 'error': str(exc)})
 
         def _h_post_install_gost(self, prefix):
             """POST /install-gost 的处理逻辑（从 do_POST 机械搬移而来）。"""
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             try:
+                if Path('/usr/local/bin/gost').exists():
+                    version = subprocess.run(['/usr/local/bin/gost', '-V'], capture_output=True, timeout=5)
+                    if version.returncode == 0:
+                        if not reload_gost():
+                            return self.reply_json(500, {'ok': False, 'error': 'GOST 修复失败或端口未就绪，请检查日志'})
+                        return self.reply_json(200, {'ok': True, 'applied': True, 'message': 'GOST 已恢复运行，监听端口已核对'})
                 machine = platform.machine().lower()
                 if 'x86_64' in machine or 'amd64' in machine:
                     arch = 'linux_amd64'
@@ -4877,9 +4792,14 @@ if __name__ == '__main__':
                                 shutil.copyfileobj(resp, out_f)
                             size = archive_path.stat().st_size
                             if size > 1024 * 1024 and tarfile.is_tarfile(str(archive_path)):
-                                with tarfile.open(str(archive_path), 'r:gz') as tar:
-                                    tar.extractall(path=tmpdir)
                                 src_bin = Path(tmpdir) / 'gost'
+                                with tarfile.open(str(archive_path), 'r:gz') as tar:
+                                    member = next((m for m in tar.getmembers()
+                                        if m.name.lstrip('./') == 'gost' and m.isfile()), None)
+                                    if member is None:
+                                        raise ValueError('Package contains no regular gost binary')
+                                    with tar.extractfile(member) as source, open(src_bin, 'wb') as dest:
+                                        shutil.copyfileobj(source, dest)
                                 if src_bin.exists():
                                     shutil.move(str(src_bin), '/usr/local/bin/gost')
                                     os.chmod('/usr/local/bin/gost', 0o755)
@@ -4907,8 +4827,8 @@ if __name__ == '__main__':
                 subprocess.run(['systemctl', 'enable', 'gost'], capture_output=True)
 
                 # 重新生成 gost.yml 并启动服务
-                write_gost_config()
-                subprocess.run(['systemctl', 'restart', 'gost'], capture_output=True, timeout=10)
+                if not reload_gost():
+                    return self.reply_json(500, {'ok': False, 'error': 'GOST 已安装，但服务或监听端口未就绪'})
 
                 # 核实真的起来了 —— 不谎报成功 (见技能 §12).
                 # `is-active` 为 active 但端口未绑定, 是本项目踩过的静默故障.
