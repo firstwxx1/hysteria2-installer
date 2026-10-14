@@ -178,7 +178,7 @@ cli = subprocess.Popen([HY, 'client', '-c', '/tmp/_r5c.yaml'],
 time.sleep(9)
 connected = False
 try:
-    o = subprocess.run(['ss', '-tlnp'], capture_output=True, text=True).stdout
+    o = subprocess.run(['ss', '-tlnp'], capture_output=True, text=True, encoding="utf-8", errors="replace").stdout
     connected = '18777' in o
 except Exception:
     pass

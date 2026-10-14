@@ -225,7 +225,9 @@ if [ -z "$(ip route show default 2>/dev/null)" ]; then
         apk add --no-cache busybox iproute2 >/dev/null 2>&1 || true
     fi
 
-    for _ifc in $(ls /sys/class/net 2>/dev/null | grep -v '^lo$'); do
+    for _ifc in /sys/class/net/*; do
+        _ifc=${_ifc##*/}
+        { [ "$_ifc" = "lo" ] || [ "$_ifc" = "*" ]; } && continue
         info "启用 $_ifc 并尝试 DHCP"
         ip link set "$_ifc" up 2>/dev/null || true
         udhcpc -i "$_ifc" -q -n -t 10 >/dev/null 2>&1 || true
@@ -539,9 +541,7 @@ fi
 #   → 脚本跑到最后一步才失败，前面的体检全部白做。
 #   现在：无条件检查并安装 bash（以及 InstallNET 依赖的基础工具）。
 _missing_tools=""
-for _t in bash; do
-    command -v "$_t" >/dev/null 2>&1 || _missing_tools="$_missing_tools $_t"
-done
+command -v bash >/dev/null 2>&1 || _missing_tools="$_missing_tools bash"
 if [ -n "$_missing_tools" ]; then
     info "安装缺失的基础工具：$_missing_tools"
     apk update >/dev/null 2>&1 || true

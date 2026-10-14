@@ -77,7 +77,7 @@ def read_hysteria_online(url, secret):
 
 
 """只读采集：连接事件 + Hy2核心在线计数校验；不使用鉴权超时作在线判据。"""
-import json,re,ipaddress,subprocess,time,pathlib,urllib.request,urllib.error
+import re,ipaddress,time,pathlib,urllib.error
 
 def parse_events(rows):
     active={}
@@ -97,7 +97,7 @@ def parse_events(rows):
                 match=re.search(r'(?:^|\t)(client connected|client disconnected)\t',clean)
                 if not match:continue
                 event=match.group(1);fields=json.loads(clean[match.end():])
-        except (ValueError,TypeError):raise ValueError('invalid_connection_event')
+        except (ValueError,TypeError):raise ValueError('invalid_connection_event') from None
         if event not in ('client connected','client disconnected'):continue
         uid,addr=fields.get('id'),fields.get('addr')
         if not isinstance(uid,str) or not isinstance(addr,str):raise ValueError('missing_connection_identity')

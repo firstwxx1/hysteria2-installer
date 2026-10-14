@@ -23,13 +23,11 @@
 import json
 import os
 import shutil
-import subprocess
 import sys
 import tempfile
 import threading
 import time
 import unittest
-import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]

@@ -31,7 +31,7 @@ class PortalTest(unittest.TestCase):
           4. 拿到之后必须做 Python 语法校验 —— 门户同时是 Hysteria 的 auth 后端，
              文件写坏 = 所有客户端都连不上
         """
-        script = (Path(portal.__file__).parent/'install.sh').read_text()
+        script = (Path(portal.__file__).parent/'install.sh').read_text(encoding="utf-8")
         self.assertNotIn("<<'PYPORTAL'", script,
                          'install.sh 又内嵌 portal.py 了；请改回运行时获取（portal_ensure_py）')
         self.assertIn('portal_fetch_py() {', script)
@@ -58,7 +58,7 @@ class PortalTest(unittest.TestCase):
         Windows 上 subprocess 调 `bash` 会拿到 WSL 的 bash（system32\\bash.exe），
         它按 Linux 路径解析，看不到 `C:/...` 的临时脚本，测试会莫名其妙地 127 退出。
         """
-        script = (Path(portal.__file__).parent/'install.sh').read_text()
+        script = (Path(portal.__file__).parent/'install.sh').read_text(encoding="utf-8")
         found = re.search(r"HY2_SUB_PORT=\$\(python3 - <<'PYPORT'\n(.*?)\nPYPORT",
                           script, re.S)
         self.assertIsNotNone(found, 'install.sh 里找不到 HY2_SUB_PORT 的端口探测代码')
@@ -120,13 +120,13 @@ class PortalTest(unittest.TestCase):
                         is_insecure=False, hop_port_range='20000-40000', subscription_port=8443)
             (root/'meta.json').write_text(json.dumps(meta))
             portal.prepare(root/'meta.json', port)
-            access = json.loads((root/'portal-access.json').read_text())
-            data = json.loads((root/'portal.json').read_text())
+            access = json.loads((root/'portal-access.json').read_text(encoding="utf-8"))
+            data = json.loads((root/'portal.json').read_text(encoding="utf-8"))
             portal.refresh(root/'meta.json')
-            refreshed = json.loads((root/'portal.json').read_text())
+            refreshed = json.loads((root/'portal.json').read_text(encoding="utf-8"))
             self.assertEqual(refreshed['token'], data['token'])
             self.assertEqual(refreshed['auth_hash'], data['auth_hash'])
-            self.assertEqual(json.loads((root/'portal-access.json').read_text()), access)
+            self.assertEqual(json.loads((root/'portal-access.json').read_text(encoding="utf-8")), access)
             self.assertIn('data-copy="hy2-link"', refreshed['page'])
             self.assertIn("script-src 'sha256-", portal.content_policy())
             self.assertNotIn('unsafe-inline', portal.content_policy())

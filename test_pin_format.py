@@ -16,13 +16,13 @@ with tempfile.TemporaryDirectory() as td:
     root = Path(td)
     (root / "cert").mkdir()
     subprocess.run(
-        f"openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes "
-        f"-keyout {root}/cert/server.key -out {root}/cert/server.crt "
-        f"-subj /CN=example.com -days 365",
-        shell=True, check=True, capture_output=True)
+        ["openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes",
+         "-keyout", str(root / "cert" / "server.key"), "-out", str(root / "cert" / "server.crt"),
+         "-subj", "/CN=example.com", "-days", "365"],
+        check=True, capture_output=True)
     pin = portal.get_cert_pin_sha256(root)
-    fp = subprocess.run(f"openssl x509 -in {root}/cert/server.crt -fingerprint -sha256 -noout",
-                        shell=True, capture_output=True, text=True).stdout
+    fp = subprocess.run(["openssl", "x509", "-in", str(root / "cert" / "server.crt"), "-fingerprint", "-sha256", "-noout"],
+                        capture_output=True, text=True).stdout
     expected = fp.split("=", 1)[1].replace(":", "").strip().lower()
     print("computed pin :", pin)
     print("openssl fp   :", expected)
@@ -59,10 +59,10 @@ with tempfile.TemporaryDirectory() as td2:
     root2 = Path(td2)
     (root2 / "cert").mkdir()
     subprocess.run(
-        f"openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes "
-        f"-keyout {root2}/cert/server.key -out {root2}/cert/server.crt "
-        f"-subj /CN=example.com -days 365",
-        shell=True, check=True, capture_output=True)
+        ["openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes",
+         "-keyout", str(root2 / "cert" / "server.key"), "-out", str(root2 / "cert" / "server.crt"),
+         "-subj", "/CN=example.com", "-days", "365"],
+        check=True, capture_output=True)
     good = portal.get_cert_pin_sha256(root2)
     mp = root2 / "client_meta.json"
 

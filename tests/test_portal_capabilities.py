@@ -9,7 +9,6 @@
 同时钉死一条安全边界：
   capabilities **只报能力与状态，绝不报凭据**（私钥/公钥/UUID/api_key/密码）。
 """
-import inspect
 import sys
 import unittest
 from pathlib import Path

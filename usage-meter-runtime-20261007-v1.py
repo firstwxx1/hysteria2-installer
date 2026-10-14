@@ -3,6 +3,7 @@ import copy
 import importlib.util
 import json
 import pathlib
+import sys
 import threading
 import time
 from datetime import datetime, timezone
@@ -82,7 +83,7 @@ class PortalMeter:
                 with self.lock:
                     meter=copy.deepcopy(self.data.get('usage_meter',{}))
                     # 每个账户首次基线：不将已存在、未归属新窗口的进程计数混入。
-                    registered=meter.setdefault('registered_users', list(self.data.get('users',{})))
+                    meter.setdefault('registered_users', list(self.data.get('users',{})))
                     # 已存在客户在后续才第一次出现在计数器中时，core 从零累加是有效的：
                     # 当前服务为所有用户保持单调累计，且初始窗口无计数表示0。
                     outcome = core.apply_sample(meter,source,before,counters,now)
@@ -107,8 +108,8 @@ class PortalMeter:
                         for uid, pair in outcome.get('deltas', {}).items():
                             try:
                                 self.on_speed(uid, pair[0], pair[1], sampled-previous, source)
-                            except Exception:
-                                pass
+                            except Exception as exc:
+                                print(f'[meter] on_speed failed: {type(exc).__name__}', file=sys.stderr)
             except Exception as exc:
                 with self.lock:
                     old=copy.deepcopy(self.data.get('usage_meter'))

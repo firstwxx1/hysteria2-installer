@@ -1217,26 +1217,25 @@ PYPORT
     fi
 }
 
+# 删掉一条链里所有 Hy2 端口跳跃规则。
+# 只匹配 Hy2 自己的规则形态「UDP 端口区间 → REDIRECT 到单个端口」，
+# 不能按 "REDIRECT.*udp" 一把删：同机 Docker / 其他软件的 UDP 转发也会被误删。
+_clear_hop_chain() {
+    local bin="$1" chain="$2" rule
+    while rule=$("$bin" -t nat -S "$chain" 2>/dev/null             | grep -E -- '-p udp .*--dport [0-9]+:[0-9]+ .*-j REDIRECT --to-ports [0-9]+$' | head -n 1)           && [ -n "$rule" ]; do
+        # shellcheck disable=SC2086  # -S 输出就是参数列表，按空白拆分是有意的
+        "$bin" -t nat ${rule/#-A /-D } 2>/dev/null || break
+    done
+}
+
 clear_all_hopping_rules() {
-    # 彻底扫描并清理所有历史残留的 REDIRECT 到 hysteria 端口的 iptables 规则，防止旧端口重定向死循环
+    # 彻底清理所有历史残留的 Hy2 端口跳跃规则，防止旧端口重定向死循环
     # BUGFIX #12: 同时清理 PREROUTING + OUTPUT 链
-    while iptables -t nat -L PREROUTING -n --line-numbers 2>/dev/null | grep -q "REDIRECT.*udp"; do
-        local line_num=$(iptables -t nat -L PREROUTING -n --line-numbers | grep "REDIRECT.*udp" | head -n 1 | awk '{print $1}')
-        [ -n "$line_num" ] && iptables -t nat -D PREROUTING "$line_num" 2>/dev/null || break
-    done
-    while iptables -t nat -L OUTPUT -n --line-numbers 2>/dev/null | grep -q "REDIRECT.*udp"; do
-        local line_num=$(iptables -t nat -L OUTPUT -n --line-numbers | grep "REDIRECT.*udp" | head -n 1 | awk '{print $1}')
-        [ -n "$line_num" ] && iptables -t nat -D OUTPUT "$line_num" 2>/dev/null || break
-    done
+    _clear_hop_chain iptables PREROUTING
+    _clear_hop_chain iptables OUTPUT
     if command -v ip6tables >/dev/null 2>&1; then
-        while ip6tables -t nat -L PREROUTING -n --line-numbers 2>/dev/null | grep -q "REDIRECT.*udp"; do
-            local line_num=$(ip6tables -t nat -L PREROUTING -n --line-numbers | grep "REDIRECT.*udp" | head -n 1 | awk '{print $1}')
-            [ -n "$line_num" ] && ip6tables -t nat -D PREROUTING "$line_num" 2>/dev/null || break
-        done
-        while ip6tables -t nat -L OUTPUT -n --line-numbers 2>/dev/null | grep -q "REDIRECT.*udp"; do
-            local line_num=$(ip6tables -t nat -L OUTPUT -n --line-numbers | grep "REDIRECT.*udp" | head -n 1 | awk '{print $1}')
-            [ -n "$line_num" ] && ip6tables -t nat -D OUTPUT "$line_num" 2>/dev/null || break
-        done
+        _clear_hop_chain ip6tables PREROUTING
+        _clear_hop_chain ip6tables OUTPUT
     fi
     systemctl disable --now hy2-iptables.service >/dev/null 2>&1 || true
     rm -f /etc/systemd/system/hy2-iptables.service >/dev/null 2>&1 || true

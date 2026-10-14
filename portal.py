@@ -46,12 +46,14 @@ except ImportError as _e:      # pragma: no cover - 只在部署缺文件时触�
         '它们必须放在同一目录下（通常都是 /etc/hysteria/）。\n'
         '原始错误: %s\n'
         '修复：重新执行一次安装 / 更新（bash install.sh install 或门户里的「更新」）。' % _e
-    )
+    ) from _e
 
 # 机主账号。它的 password 就是 Hysteria 的 auth_password —— /auth 是遍历
 # data['users'] 按密码匹配的，这条记录一旦被删，主密码立刻变成 "User not found"，
 # 机主本人都会被踢下线且再也连不上（只能重装）。因此全站禁止注销它。
 MASTER_USER_ID = 'admin_master'
+# 面板自更新与 AWG 资源的来源仓库（模块级：resolve_update_ref 也要用）。
+AWG_REPO = 'yys9253462-gif/hysteria2-installer'
 
 # 节点门户的版本号（2026-10-04 加）。
 #
@@ -626,14 +628,19 @@ def _rollback_outbounds(cfg, original):
             if state in ('active', 'failed', 'inactive'):
                 break
             time.sleep(1)
-    except Exception:
-        pass
+    except Exception as exc:
+        _log_ignored('wait_service', exc)
     return state
 
 
 def core_version_key(value):
     match = re.search(r'(\d+)\.(\d+)\.(\d+)', str(value or ''))
     return tuple(map(int, match.groups())) if match else ()
+
+
+def _log_ignored(where, exc):
+    """尽力而为的步骤失败时不中断主流程，但至少留一行日志，便于事后排查。"""
+    print(f'[portal] {where} ignored {type(exc).__name__}: {exc}', file=sys.stderr)
 
 
 def resolve_update_ref(ref):
@@ -932,7 +939,7 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
         total_used_bytes += used_bytes
 
         is_traffic_ok = limit_bytes == 0 or used_bytes < limit_bytes
-        is_time_ok = u.get("expires_at", 0) >= now_ts
+        is_time_ok = u.get("expires_at") is None or u.get("expires_at") >= now_ts
         is_active = u.get("status") == "active" and is_time_ok and is_traffic_ok
 
         if is_active:
@@ -947,7 +954,7 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
         else:
             status_html = '<span class="status-pill active">正常</span>'
 
-        expires_str = time.strftime("%Y-%m-%d %H:%M", time.localtime(u.get("expires_at", 0))) if u.get("expires_at", 0) < 2000000000 else "永久有效"
+        expires_str = time.strftime("%Y-%m-%d %H:%M", time.localtime(u["expires_at"])) if u.get("expires_at") is not None and u["expires_at"] < 2000000000 else "永久有效"
         ip_limit = u.get("ip_limit", 0)
         ip_limit_str = f"{ip_limit} IP" if ip_limit > 0 else "不限"
         online_ips = len(u.get("online_ips", {}))
@@ -1918,8 +1925,7 @@ def user_page_html(server_name, host, listen_port, obfs_badge, uid, uinfo, uri, 
     limit_bytes = int(uinfo.get("limit_bytes", 0))
     now_ts = int(time.time())
     is_traffic_ok = limit_bytes == 0 or used_bytes < limit_bytes
-    is_time_ok = uinfo.get("expires_at", 0) >= now_ts
-    is_active = uinfo.get("status") == "active" and is_time_ok and is_traffic_ok
+    is_time_ok = uinfo.get("expires_at") is None or uinfo.get("expires_at") >= now_ts
 
     if not is_traffic_ok:
         status_html = '<span class="status-pill expired">流量已超额</span>'
@@ -1930,7 +1936,7 @@ def user_page_html(server_name, host, listen_port, obfs_badge, uid, uinfo, uri, 
     else:
         status_html = '<span class="status-pill active">运行正常</span>'
 
-    expires_str = time.strftime("%Y-%m-%d %H:%M", time.localtime(uinfo.get("expires_at", 0))) if uinfo.get("expires_at", 0) < 2000000000 else "永久有效"
+    expires_str = time.strftime("%Y-%m-%d %H:%M", time.localtime(uinfo["expires_at"])) if uinfo.get("expires_at") is not None and uinfo["expires_at"] < 2000000000 else "永久有效"
     ip_limit = uinfo.get("ip_limit", 0)
     ip_limit_str = f"{ip_limit} 台设备" if ip_limit > 0 else "不限制"
 
@@ -2292,8 +2298,8 @@ def cert_status(root, meta=None, config_path='/etc/hysteria/config.yaml',
                 info['not_before'] = line.split('=', 1)[1].strip()
             elif line.startswith('notAfter='):
                 info['not_after'] = line.split('=', 1)[1].strip()
-    except Exception:
-        pass
+    except Exception as exc:
+        _log_ignored('cert_info.openssl', exc)
 
     # notAfter 形如 'Oct  9 00:00:00 2027 GMT' —— 用 dateutil 之类会引入依赖，
     # 直接交给 openssl 换算成 epoch（-checkend 是相对秒数，但我们要绝对到期时刻，
@@ -2313,8 +2319,8 @@ def cert_status(root, meta=None, config_path='/etc/hysteria/config.yaml',
             info['expires_in_days'] = int((epoch - now) // 86400)
             info['expires_at'] = epoch
             info['expired'] = epoch < now
-        except Exception:
-            pass
+        except Exception as exc:
+            _log_ignored('cert_info.notAfter', exc)
 
     days = info['expires_in_days']
     if info['expired']:
@@ -2336,8 +2342,8 @@ def cert_status(root, meta=None, config_path='/etc/hysteria/config.yaml',
             info['heal_count'] = int(st.get('heal_count') or 0)
             if st.get('last_pin'):
                 info['pin_sha256'] = st['last_pin']
-        except Exception:
-            pass
+        except Exception as exc:
+            _log_ignored('cert_info.heal_state', exc)
 
     info['ok'] = True
     return info
@@ -2535,9 +2541,12 @@ _ACCESS_APPLIED = {}
 
 def user_access_allowed(info, now=None):
     now = time.time() if now is None else now
+    # 缺 expires_at（老版本数据 / 手工添加的用户）视为永久有效：
+    # 按 0 处理会把这些用户全部判成过期，Reality 白名单随之被清空。
+    expires_at = info.get('expires_at')
     try:
         return (info.get('status', 'active') == 'active' and
-                float(info.get('expires_at', 0)) > now and
+                (expires_at is None or float(expires_at) > now) and
                 (int(info.get('limit_bytes', 0)) <= 0 or
                  int(info.get('used_bytes', 0)) < int(info.get('limit_bytes', 0))))
     except (ValueError, TypeError):
@@ -3088,8 +3097,8 @@ def sync_download_artifacts(data, uri, clash, sing):
                             input=uri.encode(), capture_output=True, timeout=20)
         if qr.returncode == 0 and qr.stdout:
             data['qr'] = qr.stdout.decode('utf-8', 'replace')
-    except Exception:
-        pass  # 保留旧图，别把框清空
+    except Exception as exc:
+        _log_ignored('qr_refresh', exc)  # 保留旧图，别把框清空
     return data
 
 
@@ -3217,25 +3226,48 @@ def serve(path):
     speed_tracker = {}
 
     access_apply_lock = threading.RLock()
+    # 上一次成功收回时的「被封禁用户集合」。过期用户不会从 data 里移走，
+    # 不记这个的话 worker 每 5 秒都会重做一遍收回（查 /online、比对 xray）。
+    last_enforced_blocked = None
+
+    def blocked_user_ids():
+        return frozenset(uid for uid, u in data.get('users', {}).items() if not user_access_allowed(u))
+
     def apply_access(force_ids=()):
-        with access_apply_lock, data_lock:
-            pending=set(data.get('_pending_revocations', [])) | set(force_ids)
-            snapshot=copy.deepcopy(data)
+        # access_apply_lock 串行化收回流程；data_lock 只在拍快照和写回结果时短暂持有。
+        # 🔴 不能在持有 data_lock 时做 HTTP / systemctl：/auth 每个请求都要拿 data_lock，
+        # 收回期间（最长 4s 查询 + 12s 重启）会卡住所有 Hy2 新连接的鉴权。
+        # 快照过期也安全：账号变更后调用方会再调 apply_access，被 access_apply_lock
+        # 排在本轮之后，用新快照重新生效。
+        nonlocal last_enforced_blocked
+        with access_apply_lock:
+            with data_lock:
+                pending=set(data.get('_pending_revocations', [])) | set(force_ids)
+                snapshot=copy.deepcopy(data)
+                blocked=blocked_user_ids()
             try:
                 enforce_node_access(portal_path.parent,snapshot,pending)
             except Exception as exc:
-                data['_pending_revocations']=sorted(pending)
-                save_data()
+                with data_lock:
+                    data['_pending_revocations']=sorted(set(data.get('_pending_revocations', [])) | pending)
+                    save_data()
                 print('[expiry] access enforcement failed: '+type(exc).__name__,file=sys.stderr)
                 return False
-            data.pop('_pending_revocations',None)
-            save_data()
+            with data_lock:
+                # 收回期间新排进来的待撤销项要保留，只清掉本轮已确认的。
+                remaining=set(data.get('_pending_revocations', [])) - pending
+                if remaining:
+                    data['_pending_revocations']=sorted(remaining)
+                else:
+                    data.pop('_pending_revocations',None)
+                save_data()
+            last_enforced_blocked=blocked
             return True
     def expiry_access_worker():
         while True:
             try:
                 with data_lock:
-                    needed=bool(data.get('_pending_revocations')) or any(not user_access_allowed(u) for u in data.get('users',{}).values())
+                    needed=bool(data.get('_pending_revocations')) or blocked_user_ids()!=(last_enforced_blocked or frozenset())
                 if needed:apply_access()
             except Exception as exc:
                 print('[expiry] worker retry: '+type(exc).__name__,file=sys.stderr)
@@ -3388,7 +3420,6 @@ def serve(path):
     def write_gost_config():
         """根据 proxy_services 动态生成 gost.yml 配置并触发热重载。"""
         gost_cfg_path = portal_path.parent / 'gost.yml'
-        cert_dir = portal_path.parent / 'gost-cert'
         services = []
         with data_lock:
             for idx, svc in enumerate(data.get('proxy_services', [])):
@@ -3483,8 +3514,8 @@ def serve(path):
                 _ver_cache['t'] = now
                 _ver_cache['data'] = shas
                 return shas
-        except Exception:
-            pass
+        except Exception as exc:
+            _log_ignored('version_check', exc)
         return None
 
     def _version_triple(local_path, remote_name):
@@ -3551,8 +3582,8 @@ def serve(path):
             write_gost_selfcheck()
             unit_path.write_text(GOST_UNIT_CONTENT, encoding='utf-8')
             subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=5)
-        except Exception:
-            pass
+        except Exception as exc:
+            _log_ignored('gost_unit_install', exc)
 
     # ------------------------------------------------------------------
     # AmneziaWG (AWG) 支持
@@ -3563,7 +3594,6 @@ def serve(path):
     # 两端逐字节一致，重复实现的风险太高。
     # ------------------------------------------------------------------
     AWG_CTL = '/usr/local/bin/hy2-awgctl'
-    AWG_REPO = 'yys9253462-gif/hysteria2-installer'
     AWG_DIR_PATH = Path('/etc/amnezia/amneziawg')
     AWG_META_PATH = AWG_DIR_PATH / 'awg_meta.json'
     AWG_PEERS_PATH = AWG_DIR_PATH / 'awg_peers.json'
@@ -3685,8 +3715,8 @@ if __name__ == '__main__':
         try:
             if path.exists():
                 return json.loads(path.read_text(encoding='utf-8'))
-        except Exception:
-            pass
+        except Exception as exc:
+            _log_ignored('read_json', exc)
         return default
 
     def awg_installed():
@@ -3759,8 +3789,8 @@ if __name__ == '__main__':
             sha = info.get('sha', '')
             if len(sha) == 40:
                 return sha
-        except Exception:
-            pass
+        except Exception as exc:
+            _log_ignored('awg_remote_sha', exc)
         content = _fetch_repo_file(filename, marker)
         return _git_blob_sha(content) if content else None
 
@@ -4257,7 +4287,7 @@ if __name__ == '__main__':
                     users = data.get('users', {})
                     matched_uid, matched_user = None, None
                     for uid, uinfo in users.items():
-                        if uinfo.get('password') == client_auth:
+                        if hmac.compare_digest(str(uinfo.get('password', '')).encode(), client_auth.encode()):
                             matched_uid, matched_user = uid, uinfo
                             break
 
@@ -4265,10 +4295,12 @@ if __name__ == '__main__':
                         self.record_auth_failure()
                         return self.reply_json(200, {'ok': False, 'msg': 'User not found'})
 
-                    if matched_user.get('status') != 'active':
+                    # 判据与 user_access_allowed 同源：缺 status 视为 active、
+                    # 缺 expires_at 视为永久，否则会出现「Reality 能连、Hy2 被拒」。
+                    if matched_user.get('status', 'active') != 'active':
                         return self.reply_json(200, {'ok': False, 'msg': 'User account inactive'})
 
-                    if matched_user.get('expires_at', 0) <= now_ts:
+                    if matched_user.get('expires_at') is not None and matched_user['expires_at'] <= now_ts:
                         return self.reply_json(200, {'ok': False, 'msg': 'User account expired'})
 
                     # -------- 流量限额检查与增量累加 -------- #
@@ -4562,9 +4594,7 @@ if __name__ == '__main__':
                                 # 而这里原实现只看 expires_at —— 两者不一致的后果是
                                 # "停用后列表仍报 active，但客户端连不上"，
                                 # 那是最难排查的一类矛盾。两者必须同源。
-                                'active': (info.get('status', 'active') == 'active'
-                                           and info.get('expires_at', 0) > now_ts
-                                           and (int(info.get('limit_bytes', 0)) <= 0 or int(info.get('used_bytes', 0)) < int(info.get('limit_bytes', 0)))),
+                                'active': user_access_allowed(info, now_ts),
                                 'status': info.get('status', 'active'),
                                 'traffic_limit_bytes': info.get('limit_bytes', 0),
                                 'traffic_used_bytes': info.get('used_bytes', 0),
@@ -4778,8 +4808,8 @@ if __name__ == '__main__':
                         for dest, bak in backups:
                             try:
                                 shutil.copy2(str(bak), str(dest))
-                            except Exception:
-                                pass
+                            except Exception as exc:
+                                _log_ignored('portal_update.rollback', exc)
                         return self.reply_json(500, {'ok': False, 'error':
                             '更新过程中出错，已回滚到原版本：%s' % e})
 
@@ -4912,8 +4942,8 @@ if __name__ == '__main__':
                                         capture_output=True, timeout=3)
                     if qr.returncode == 0:
                         qr_svg = qr.stdout.decode('utf-8')
-                except Exception:
-                    pass
+                except Exception as exc:
+                    _log_ignored('qr_svg', exc)
                 return 200, dict(entry, ok=True, applied=True, host=host, url=uri, qr=qr_svg,
                                  format='%s:%s:%s:%s' % (host, port, username, password), gost_active=True)
 
@@ -5258,8 +5288,8 @@ if __name__ == '__main__':
                                     os.chmod('/usr/local/bin/xray', 0o755)
                                     installed = True
                                     break
-                        except Exception:
-                            pass
+                        except Exception as exc:
+                            _log_ignored('xray_install', exc)
 
                 if not installed:
                     return self.reply_json(500, {'ok': False, 'error': '下载或解压 Xray 核心失败'})
@@ -5943,9 +5973,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                                 'user_id': uid,
                                 'expires_at': info.get('expires_at', 0),
                                 # 与 API 通道同一判据（status + 到期），理由见那边注释。
-                                'active': (info.get('status', 'active') == 'active'
-                                           and info.get('expires_at', 0) > now_ts
-                                           and (int(info.get('limit_bytes', 0)) <= 0 or int(info.get('used_bytes', 0)) < int(info.get('limit_bytes', 0)))),
+                                'active': user_access_allowed(info, now_ts),
                                 'status': info.get('status', 'active'),
                                 'traffic_limit_bytes': info.get('limit_bytes', 0),
                                 'traffic_used_bytes': info.get('used_bytes', 0),
@@ -5958,7 +5986,6 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                                 ],
                                 'ip_limit': info.get('ip_limit', 0),
                                 'created_at': info.get('created_at', now_ts),
-                                'status': info.get('status', 'active'),
                             })
                     return self.reply_json(200, {'ok': True, 'count': len(users_out), 'users': users_out})
                 if sub == 'proxy-services/list':
@@ -6101,8 +6128,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 qr_svg = ""
                 try:
                     qr_svg = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'], input=uri.encode(), capture_output=True, check=True).stdout.decode('utf-8')
-                except Exception:
-                    pass
+                except Exception as exc:
+                    _log_ignored('qr_svg', exc)
 
                 return self.reply_json(200, {
                     'ok': True,
@@ -6287,8 +6314,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     if line.strip().startswith('Version:'):
                         core_curr = line.split(':', 1)[1].strip().removeprefix('v')
                         break
-            except Exception:
-                pass
+            except Exception as exc:
+                _log_ignored('core_version', exc)
             now = time.time()
             if now - _core_ver_cache['t'] >= (300 if _core_ver_cache['tag'] else 30):
                 try:

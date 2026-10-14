@@ -37,7 +37,6 @@
 第 4/5 条用一个「仿真老装机 config」的沙箱 harness 真正执行 install.sh 里
 写出的自愈段来验证，而不是重写一遍逻辑（重写就等于没测到真代码）。
 """
-import io
 import os
 import re
 import subprocess

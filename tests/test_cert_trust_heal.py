@@ -62,7 +62,7 @@ def _run_bash(script_text, cwd=None, env=None):
     try:
         Path(path).write_text(script_text, encoding="utf-8", newline="\n")
         return subprocess.run([BASH, path], cwd=cwd, env=env,
-                              capture_output=True, text=True)
+                              capture_output=True, text=True, encoding="utf-8", errors="replace")
     finally:
         try:
             os.unlink(path)
@@ -72,7 +72,7 @@ def _run_bash(script_text, cwd=None, env=None):
 
 def _openssl(*args, cwd=None):
     return subprocess.run(["openssl", *args], cwd=cwd,
-                          capture_output=True, text=True)
+                          capture_output=True, text=True, encoding="utf-8", errors="replace")
 
 
 def _make_self_signed(certdir, cn="www.bing.com"):
@@ -111,14 +111,14 @@ def _make_public(certdir, cn="se.zy3a.com"):
     assert r.returncode == 0, f"openssl sign failed: {r.stderr}"
     # fullchain = leaf + CA
     with open(certdir / "fullchain.pem", "a") as fh:
-        fh.write(Path(ca_crt).read_text())
+        fh.write(Path(ca_crt).read_text(encoding="utf-8"))
     assert (certdir / "fullchain.pem").exists(), "openssl public cert failed"
 
 
 def _pin_of(path):
     p = subprocess.run(f"openssl x509 -in {path} -outform DER | "
                        f"openssl dgst -sha256 | awk '{{print $NF}}'",
-                       shell=True, capture_output=True, text=True)
+                       shell=True, capture_output=True, text=True, encoding="utf-8", errors="replace")
     return p.stdout.strip().lower()
 
 
@@ -150,7 +150,7 @@ class TestPortalSyncCertTrust(unittest.TestCase):
             (td / "client_meta.json").write_text(json.dumps(meta))
             changed = self._call(td, meta)
             self.assertTrue(changed)
-            out = json.loads((td / "client_meta.json").read_text())
+            out = json.loads((td / "client_meta.json").read_text(encoding="utf-8"))
             self.assertEqual(out["cert_type"], "self_signed")
             self.assertIs(out["is_insecure"], True)
             self.assertEqual(out["server_name"], "www.bing.com")
@@ -169,7 +169,7 @@ class TestPortalSyncCertTrust(unittest.TestCase):
             (td / "client_meta.json").write_text(json.dumps(meta))
             changed = self._call(td, meta)
             self.assertTrue(changed)
-            out = json.loads((td / "client_meta.json").read_text())
+            out = json.loads((td / "client_meta.json").read_text(encoding="utf-8"))
             self.assertEqual(out["cert_type"], "custom")
             self.assertIs(out["is_insecure"], False)
             self.assertEqual(out["server_name"], "se.zy3a.com")
@@ -191,7 +191,7 @@ class TestPortalSyncCertTrust(unittest.TestCase):
                     "cert_type": "custom", "is_insecure": False, "pin_sha256": ""}
             (td / "client_meta.json").write_text(json.dumps(meta))
             self.assertTrue(self._call(td, meta))
-            out = json.loads((td / "client_meta.json").read_text())
+            out = json.loads((td / "client_meta.json").read_text(encoding="utf-8"))
             self.assertEqual(out["cert_type"], "acme")
             self.assertIs(out["is_insecure"], False)
             self.assertEqual(out["server_name"], "node.example.com")
@@ -207,7 +207,7 @@ class TestPortalSyncCertTrust(unittest.TestCase):
             (td / "client_meta.json").write_text(json.dumps(meta))
             self.assertTrue(self._call(td, meta))
             # second run: read the healed meta back in, must be a no-op
-            healed = json.loads((td / "client_meta.json").read_text())
+            healed = json.loads((td / "client_meta.json").read_text(encoding="utf-8"))
             self.assertFalse(self._call(td, healed))
 
 
@@ -260,7 +260,7 @@ class TestShellSyncCertMeta(unittest.TestCase):
                 raw = "/" + drive.rstrip(":").lower() + rest.replace("\\", "/")
             Path(p).write_text(script, encoding="utf-8", newline="\n")
             try:
-                return subprocess.run([BASH, p, raw], capture_output=True, text=True)
+                return subprocess.run([BASH, p, raw], capture_output=True, text=True, encoding="utf-8", errors="replace")
             finally:
                 try:
                     os.unlink(p)
@@ -280,7 +280,7 @@ class TestShellSyncCertMeta(unittest.TestCase):
                  "is_insecure": False, "pin_sha256": ""})
             r = runner()
             self.assertEqual(r.returncode, 0, r.stderr)
-            out = json.loads((td / "client_meta.json").read_text())
+            out = json.loads((td / "client_meta.json").read_text(encoding="utf-8"))
             self.assertEqual(out["cert_type"], "self_signed")
             self.assertIs(out["is_insecure"], True)
             self.assertEqual(out["server_name"], "www.bing.com")
@@ -298,7 +298,7 @@ class TestShellSyncCertMeta(unittest.TestCase):
                  "pin_sha256": "8" * 64})
             r = runner()
             self.assertEqual(r.returncode, 0, r.stderr)
-            out = json.loads((td / "client_meta.json").read_text())
+            out = json.loads((td / "client_meta.json").read_text(encoding="utf-8"))
             self.assertEqual(out["cert_type"], "custom")
             self.assertIs(out["is_insecure"], False)
             self.assertEqual(out["server_name"], "se.zy3a.com")
@@ -316,11 +316,11 @@ class TestShellSyncCertMeta(unittest.TestCase):
             r1 = runner()
             self.assertEqual(r1.returncode, 0, r1.stderr)
             self.assertIn("已自愈", r1.stderr)
-            snapshot = (td / "client_meta.json").read_text()
+            snapshot = (td / "client_meta.json").read_text(encoding="utf-8")
             r2 = runner()  # same dir, meta now healed -> must not rewrite
             self.assertEqual(r2.returncode, 0, r2.stderr)
             self.assertNotIn("已自愈", r2.stderr)
-            self.assertEqual(snapshot, (td / "client_meta.json").read_text())
+            self.assertEqual(snapshot, (td / "client_meta.json").read_text(encoding="utf-8"))
 
     def test_shell_idempotent_with_false_is_insecure(self):
         """jq 的 `//` 把布尔 false 当 null —— 这条锁死 is_insecure=false 时的幂等。
@@ -340,15 +340,15 @@ class TestShellSyncCertMeta(unittest.TestCase):
                  "pin_sha256": "8" * 64})
             r1 = runner()
             self.assertEqual(r1.returncode, 0, r1.stderr)
-            out = json.loads((td / "client_meta.json").read_text())
+            out = json.loads((td / "client_meta.json").read_text(encoding="utf-8"))
             self.assertIs(out["is_insecure"], False)   # healed to boolean false
-            snapshot = (td / "client_meta.json").read_text()
+            snapshot = (td / "client_meta.json").read_text(encoding="utf-8")
             # second run MUST be a no-op even though is_insecure is now false
             r2 = runner()
             self.assertEqual(r2.returncode, 0, r2.stderr)
             self.assertNotIn("已自愈", r2.stderr,
                              "is_insecure=false 时自愈不幂等（jq `//` 把 false 当 null）")
-            self.assertEqual(snapshot, (td / "client_meta.json").read_text())
+            self.assertEqual(snapshot, (td / "client_meta.json").read_text(encoding="utf-8"))
 
 
 # ----------------------------------------------------------------------------
@@ -385,12 +385,12 @@ class TestPortalSelfHealEntry(unittest.TestCase):
                 {"username": "u", "password": "p", "api_key": "k" * 24}))
             changed = self._call(td, config_path=td / "config.yaml")
             self.assertTrue(changed)
-            out = json.loads((td / "client_meta.json").read_text())
+            out = json.loads((td / "client_meta.json").read_text(encoding="utf-8"))
             self.assertEqual(out["cert_type"], "custom")
             self.assertIs(out["is_insecure"], False)
             self.assertEqual(out["server_name"], "se.zy3a.com")
             # portal.json page must have been regenerated with the new server_name
-            page = json.loads((td / "portal.json").read_text())["page"]
+            page = json.loads((td / "portal.json").read_text(encoding="utf-8"))["page"]
             self.assertNotEqual(page, "<html>OLD</html>")
             self.assertIn("se.zy3a.com", page)
 
@@ -409,13 +409,13 @@ class TestPortalSelfHealEntry(unittest.TestCase):
                  "page": "<html>KEEP</html>"}))
             (td / "portal-access.json").write_text(json.dumps(
                 {"username": "u", "password": "p", "api_key": "k" * 24}))
-            before = (td / "client_meta.json").read_text()
-            page_before = json.loads((td / "portal.json").read_text())["page"]
+            before = (td / "client_meta.json").read_text(encoding="utf-8")
+            page_before = json.loads((td / "portal.json").read_text(encoding="utf-8"))["page"]
             changed = self._call(td, config_path=td / "config.yaml")
             self.assertFalse(changed)
-            self.assertEqual(before, (td / "client_meta.json").read_text())
+            self.assertEqual(before, (td / "client_meta.json").read_text(encoding="utf-8"))
             # portal.json must NOT be rewritten (that's why selfheal != refresh)
-            self.assertEqual(page_before, json.loads((td / "portal.json").read_text())["page"])
+            self.assertEqual(page_before, json.loads((td / "portal.json").read_text(encoding="utf-8"))["page"])
 
     def test_selfheal_missing_meta_returns_false(self):
         with tempfile.TemporaryDirectory() as td:
@@ -467,7 +467,6 @@ class TestCertStatus(unittest.TestCase):
         猜出来的基准和实际值对不上（实测偏差上千天）。
         """
         import unittest.mock as mock
-        import calendar
         p = self._portal()
         self.assertEqual(p.CERT_EXPIRY_WARN_DAYS, 30)
         self.assertEqual(p.CERT_EXPIRY_CRITICAL_DAYS, 7)

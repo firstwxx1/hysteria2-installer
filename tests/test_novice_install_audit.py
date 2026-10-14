@@ -55,7 +55,7 @@ def _run_shell(script_text, cwd=None):
     os.close(fd)
     try:
         Path(path).write_text(script_text, encoding="utf-8", newline="\n")
-        return subprocess.run([BASH, path], cwd=cwd, capture_output=True, text=True)
+        return subprocess.run([BASH, path], cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace")
     finally:
         try:
             os.unlink(path)

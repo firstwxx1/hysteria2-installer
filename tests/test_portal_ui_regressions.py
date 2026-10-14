@@ -29,6 +29,9 @@ import unittest
 import urllib.parse
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import fake_hy2_stats  # noqa: E402
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import portal
 import portal_assets
@@ -77,6 +80,7 @@ class FrontendRegressionTest(unittest.TestCase):
         cls.prefix = '/' + cls.data['token'] + '/'
         cls.auth = 'Basic ' + base64.b64encode(
             f"{cls.access['username']}:{cls.access['password']}".encode()).decode()
+        cls.stats = fake_hy2_stats.start(cls.root)
         cls.proc = subprocess.Popen(
             [sys.executable, str(Path(portal.__file__)), 'serve', str(cls.root / 'portal.json')],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -97,6 +101,7 @@ class FrontendRegressionTest(unittest.TestCase):
             cls.proc.wait(timeout=5)
         except Exception:
             cls.proc.kill()
+        cls.stats.shutdown()
         cls._tmp.cleanup()
 
     def req(self, method, path, form=None, auth=None, raw=None, timeout=10):

@@ -1,4 +1,4 @@
-import sys,unittest,json,tempfile,pathlib,subprocess,ast,threading,re
+import sys,unittest,json,tempfile,pathlib,ast,threading,re
 from unittest.mock import patch
 sys.path.insert(0,str(pathlib.Path(__file__).resolve().parents[1]));import portal
 class Resp:

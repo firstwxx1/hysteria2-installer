@@ -9,7 +9,6 @@
   - 重复名字（覆盖 vs 冲突）
   - 空值、None、非字符串类型
 """
-import importlib.util
 import json
 import sys
 import threading

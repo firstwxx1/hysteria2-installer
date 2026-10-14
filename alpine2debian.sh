@@ -158,7 +158,9 @@ info "第 2/9 步：检查网络与外网连通性"
 #   所以必须先 `ip link set <网卡> up` 把网卡启起来，再要 IP。
 if ! ip route show default >/dev/null 2>&1 || [ -z "$(ip route show default 2>/dev/null)" ]; then
     warn "尚未获取到默认路由，先启用网卡再尝试 DHCP..."
-    for ifc in $(ls /sys/class/net | grep -v '^lo$'); do
+    for ifc in /sys/class/net/*; do
+        ifc=${ifc##*/}
+        [ "$ifc" = "lo" ] && continue
         # 先启用网卡（DOWN 状态下 DHCP 一定失败）
         if [ "$DRY_RUN" = "1" ]; then
             printf '    %s[dry-run]%s ip link set %s up\n' "$c_ylw" "$c_rst" "$ifc"
@@ -448,6 +450,7 @@ else
         fi
         # sysfs 里没有就直接问内核要（/proc/partitions 第 1、2 列）
         if [ -z "$_maj" ] || [ -z "$_min" ]; then
+            # shellcheck disable=SC2046  # 有意按空白拆成主/次设备号两个参数
             set -- $(awk -v n="${_base}p${_pnum}" -v m="${_base}${_pnum}" \
                 '$4==n || $4==m {print $1, $2; exit}' /proc/partitions 2>/dev/null)
             _maj="${1:-}"; _min="${2:-}"

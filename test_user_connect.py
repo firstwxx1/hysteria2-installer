@@ -1,6 +1,5 @@
 """单元测试：验证多用户专属连接弹窗与独立免密页面"""
 import html
-import json
 import portal
 
 # 构造模拟元数据和用户数据

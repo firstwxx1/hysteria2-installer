@@ -53,7 +53,6 @@ class TestRealityUuidDerivation(unittest.TestCase):
 
     def test_namespace_is_stable(self):
         """命名空间写死 —— 换了会让所有已发出去的链接失效。"""
-        import uuid as _uuid
         import inspect
         src = inspect.getsource(portal.reality_uuid_for_user)
         self.assertIn('uuid.NAMESPACE_URL', src,

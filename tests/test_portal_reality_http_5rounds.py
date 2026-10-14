@@ -14,7 +14,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 import unittest
 import urllib.error
@@ -23,6 +22,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import fake_hy2_stats  # noqa: E402
 
 PORT = None
 BASE = None
@@ -129,6 +130,9 @@ def setUpModule():
         },
     }, ensure_ascii=False), encoding='utf-8')
 
+    global STATS
+    STATS = fake_hy2_stats.start(hdir)
+
     env = dict(os.environ)
     env['HY2_PORTAL_AUTOSTART_PORT'] = str(PORT)
     PROC = subprocess.Popen(
@@ -150,8 +154,13 @@ def setUpModule():
     raise RuntimeError('portal 未能启动: ' + out)
 
 
+STATS = None
+
+
 def tearDownModule():
     global PROC
+    if STATS:
+        STATS.shutdown()
     if PROC:
         PROC.kill()
         try:

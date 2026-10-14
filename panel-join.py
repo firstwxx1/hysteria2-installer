@@ -117,7 +117,6 @@ def main():
         return 2
 
     cfg = parse_simple_yaml(cfg_text)
-    acme = cfg.get("acme", {})
     masq = cfg.get("masquerade", {})
 
     # 域名：优先 acme.domains 的第一项（列表在 YAML 里是 "- xxx" 行，简单解析拿不到，

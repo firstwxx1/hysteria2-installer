@@ -186,7 +186,7 @@ class MeterAccountingTest(unittest.TestCase):
                     and ast.unparse(n.test) == "self.path == '/auth'")
         fn = ast.parse('def handle(self):\n    pass').body[0]
         fn.body = [auth]
-        env = {'json': json, 'time': time, 'data_lock': threading.RLock(), 'data': self.data}
+        env = {'json': json, 'time': time, 'hmac': __import__('hmac'), 'data_lock': threading.RLock(), 'data': self.data}
         exec(compile(ast.fix_missing_locations(ast.Module(body=[fn], type_ignores=[])), 'auth-quota', 'exec'), env)
         body = json.dumps({'auth': 'unchanged', 'addr': '127.0.0.1:1234'}).encode()
         class Handler:
@@ -240,7 +240,7 @@ class MeterAccountingTest(unittest.TestCase):
                'usage_summary': self.meter.summary, 'MASTER_USER_ID': 'admin_master',
                'subprocess': subprocess, 'urllib': urllib, 'json': json,
                'parse_qs': urllib.parse.parse_qs, 'time': __import__('time'),
-               '_ver_cache': {'t':0}, '_core_ver_cache': {'t':0, 'tag':''}, 'core_version_key': lambda value: ()}
+               '_ver_cache': {'t':0}, '_core_ver_cache': {'t':0, 'tag':''}, 'core_version_key': lambda value: (), '_log_ignored': lambda where, exc: None}
         exec(compile(ast.Module(body=[fn], type_ignores=[]), 'version-bundle', 'exec'), env)
         class Handler:
             path = '/fixture/check-version'

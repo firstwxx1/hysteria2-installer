@@ -163,12 +163,12 @@ def curl_mark(socks, timeout=12):
 
 
 def gost_has_upstream_conn():
-    out = subprocess.run(['ss', '-tn'], capture_output=True, text=True).stdout
+    out = subprocess.run(['ss', '-tn'], capture_output=True, text=True, encoding="utf-8", errors="replace").stdout
     return 'ESTAB' in out
 
 
 def conn_to_gost():
-    out = subprocess.run(['ss', '-tn'], capture_output=True, text=True).stdout
+    out = subprocess.run(['ss', '-tn'], capture_output=True, text=True, encoding="utf-8", errors="replace").stdout
     return any(('127.0.0.1:%d' % GP) in l or (':%d' % GP) in l for l in out.splitlines())
 
 
