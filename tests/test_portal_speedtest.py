@@ -18,6 +18,7 @@
 """
 import http.client
 import json
+import os
 import re
 import socket
 import subprocess
@@ -191,9 +192,18 @@ class SpeedtestEndpointTest(unittest.TestCase):
         (cls.root / 'meta.json').write_text(json.dumps(META), encoding='utf-8')
         portal.prepare(cls.root / 'meta.json', cls.port)
         cls.data = json.loads((cls.root / 'portal.json').read_text(encoding='utf-8'))
+        # 假 ping：端点测试只验证结构与鉴权，不该真去 ping 公网靶点
+        # （Linux 上每个靶点 3 次 × 2 秒超时，整组测试要跑近两分钟）。
+        bindir = cls.root / 'bin'
+        bindir.mkdir()
+        fake_ping = bindir / 'ping'
+        fake_ping.write_text('#!/bin/sh\necho "3 packets transmitted, 3 received, 0% packet loss"\n'
+                             'echo "rtt min/avg/max/mdev = 10.0/12.0/14.0/1.0 ms"\n', encoding='utf-8')
+        fake_ping.chmod(0o755)
+        env = dict(os.environ, PATH=str(bindir) + os.pathsep + os.environ.get('PATH', ''))
         cls.proc = subprocess.Popen(
             [sys.executable, str(Path(portal.__file__)), 'serve', str(cls.root / 'portal.json')],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
         for _ in range(80):
             try:
                 with socket.create_connection(('127.0.0.1', cls.port), .1):

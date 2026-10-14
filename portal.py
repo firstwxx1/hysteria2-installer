@@ -543,6 +543,10 @@ def apply_outbounds_config(data, data_lock, config_path='/etc/hysteria/config.ya
     return apply_egress_config(data, data_lock, config_path)
 
 
+# serve() 启动后换成真实判断：该服务是否因整机流量超额停用中。
+_unit_suspended = lambda unit: False  # noqa: E731
+
+
 def _restart_hy2():
     """停 → 清失败计数 → 启动。**所有**改Hysteria 配置后都必须走这里。
 
@@ -551,7 +555,11 @@ def _restart_hy2():
     计数耗尽后进入 `start-limit-hit`，此后 start/restart 一律被直接拒绝，
     服务就永久锁死 —— 而配置完全合法、端口空闲，极难定位（第 4 轮回归真实踩到）。
     `reset-failed` 是官方解封手段，必须在**每次**启动前调用。
+
+    流量超额停用期间不启动：配置已经落盘，控制台恢复节点时会带着新配置启动。
     """
+    if _unit_suspended('hysteria-server'):
+        return
     subprocess.run(['systemctl', 'stop', 'hysteria-server'],
                    capture_output=True, timeout=25)
     # 🔴 关键：每次启动前都要 reset，否则上一次的失败计数会累积
@@ -841,8 +849,12 @@ def set_outbound_apply_error(data, data_lock, save_data, msg):
 
 
 
-def user_view_key(secret, user_id):
-    return hmac.new(str(secret).encode(), f'uv:{user_id}'.encode(), hashlib.sha256).hexdigest()[:16]
+def user_view_key(secret, user_id, nonce=''):
+    # nonce 是开户时随机生成的 view_nonce：同名用户删了重建会换新 nonce，
+    # 旧分享链接随之失效，不会让上一个买家看到新买家的配置。
+    # 老用户没有 nonce，保持原算法，已发出去的链接不受影响。
+    msg = f'uv:{user_id}:{nonce}' if nonce else f'uv:{user_id}'
+    return hmac.new(str(secret).encode(), msg.encode(), hashlib.sha256).hexdigest()[:16]
 
 
 def format_bytes(b):
@@ -1001,7 +1013,7 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
             traffic_display = f"""<div><span data-user-usage="{html.escape(uid)}">{format_bytes(used_bytes)}</span> <span style="font-size:11px;color:var(--muted)">(不限)</span></div>"""
 
         note = u.get("note") or "-"
-        user_key = user_view_key(session_secret, uid) if session_secret else ""
+        user_key = user_view_key(session_secret, uid, u.get('view_nonce', '')) if session_secret else ""
         
         user_rows.append(f"""<tr>
           <td><strong>{html.escape(uid)}</strong><div style="font-size:11px;color:var(--muted)">{html.escape(note)}</div></td>
@@ -2583,6 +2595,15 @@ def user_access_allowed(info, now=None):
     except (ValueError, TypeError):
         return False
 
+def _systemd_state(unit):
+    """systemctl is-active 的结果；拿不到（无 systemd、超时）时返回空串。"""
+    try:
+        return subprocess.run(['systemctl', 'is-active', unit], capture_output=True,
+                              text=True, timeout=5).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ''
+
+
 def password_taken(users, pwd, owner_uid):
     """pwd 是否已被 owner_uid 以外的用户（含机主）占用。调用方须持有 data_lock。
 
@@ -2610,7 +2631,16 @@ def enforce_node_access(root, snapshot, force_ids=()):
             with urllib.request.urlopen(req, timeout=4) as response:
                 raw=response.read()
             return json.loads(raw) if raw.strip() else {}
-        online=request_stats('/online')
+        try:
+            online=request_stats('/online')
+        except OSError:
+            # Hy2 已停（例如整机流量超额停用）时统计接口必然连不上，但此时也
+            # 不可能有在线会话；新连接的鉴权照样会被拒。不跳过的话，停用期间
+            # 控制台删除 / 停用用户会一直拿到 503。
+            if _systemd_state('hysteria-server') in ('inactive', 'failed'):
+                online={}
+            else:
+                raise
         active=[uid for uid in blocked if int(online.get(uid, 0)) > 0]
         if active:
             request_stats('/kick', active)
@@ -3393,7 +3423,22 @@ def serve(path):
         except Exception:
             return False
 
+    traffic_suspend_lock = threading.Lock()
+
+    def unit_suspended(unit):
+        """该服务是否因整机流量超额被停用中 —— 停用期间任何流程都不能把它拉起来。"""
+        with data_lock:
+            state = data.get('traffic_suspend') or {}
+            return bool(state.get('suspended')) and unit in (state.get('units') or [])
+
+    global _unit_suspended
+    _unit_suspended = unit_suspended
+
     def set_traffic_suspension(suspend):
+        with traffic_suspend_lock:
+            return _set_traffic_suspension(suspend)
+
+    def _set_traffic_suspension(suspend):
         with data_lock:
             state = dict(data.get('traffic_suspend') or {})
         results = {}
@@ -3411,7 +3456,14 @@ def serve(path):
                 subprocess.run(['systemctl', 'reset-failed', u], capture_output=True, timeout=5)
                 r = subprocess.run(['systemctl', 'start', u], capture_output=True, timeout=20)
                 results[u] = r.returncode == 0
-            new_state = {'suspended': False}
+            # 没启动成功的服务必须留在停用记录里：原来一律清空，控制台下一轮重试
+            # 时已无服务可启、直接回成功，该服务就一直停着而控制台以为已恢复。
+            remaining = [u for u, ok in results.items() if not ok]
+            if remaining:
+                new_state = {'suspended': True, 'units': remaining,
+                             'since': state.get('since') or int(time.time())}
+            else:
+                new_state = {'suspended': False}
         with data_lock:
             data['traffic_suspend'] = new_state
         save_data()
@@ -3457,6 +3509,23 @@ def serve(path):
     except Exception as _usage_exc:
         print('[portal] 真实计量未初始化: ' + type(_usage_exc).__name__, file=sys.stderr)
 
+    def live_online_ips(uid):
+        """计量模块采到的该用户**当前仍在连**的 IP（核心 /online/ips）；拿不到返回空集。
+
+        /auth 只在建连时记 IP、180 秒后遗忘，而 Hy2 的 QUIC 连接会一直保持；
+        只靠它的话，第一台设备连上 3 分钟后第二台就能绕过同时在线 IP 限制。
+        """
+        if usage_meter is None:
+            return set()
+        snapshot = getattr(usage_meter, 'live_snapshot', None)
+        sampled_at = getattr(usage_meter, 'live_sampled_at', 0)
+        if not snapshot or time.time() - sampled_at >= 45:
+            return set()
+        row = (snapshot.get('users') or {}).get(uid) or {}
+        if not row.get('hysteria_ok'):
+            return set()
+        return {str(item.get('ip')) for item in row.get('ips') or [] if item.get('ip')}
+
     def usage_summary(uid):
         if usage_meter is not None:
             return usage_meter.summary(uid)
@@ -3495,10 +3564,8 @@ def serve(path):
                 services.append(entry)
 
         cfg = {'services': services}
-        tmp = gost_cfg_path.with_suffix('.tmp')
-        tmp.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding='utf-8')
-        tmp.chmod(0o600)
-        tmp.replace(gost_cfg_path)
+        # gost.yml 里有代理账号密码，与 portal.json 同样必须一创建就是 0600。
+        atomic_write_private(gost_cfg_path, json.dumps(cfg, ensure_ascii=False, indent=2).encode('utf-8'))
 
     def gost_ports_ready():
         with data_lock:
@@ -3519,6 +3586,9 @@ def serve(path):
             try:
                 ensure_gost_unit()
                 write_gost_config()
+                if unit_suspended('gost'):
+                    # 停用期间只更新配置；控制台恢复节点时 gost 会带着它启动。
+                    return True
                 if gost_status():
                     r = subprocess.run(['systemctl', 'reload', 'gost'], capture_output=True, timeout=5)
                     if r.returncode == 0:
@@ -4185,8 +4255,10 @@ if __name__ == '__main__':
                     _stats_spec.loader.exec_module(_stats_mod)
                     xray_json = _stats_mod.add_stats(xray_json, int(_address.rsplit(':', 1)[1]))
             with reality_apply_lock:
+                # 流量超额停用期间只落配置、不重启，否则等于替 Reality 解除了停用。
                 apply_xray_config_transaction(xray_json, config_path=str(xray_path),
-                                              binary=str(Path('/usr/local/bin/xray')), restart=restart)
+                                              binary=str(Path('/usr/local/bin/xray')),
+                                              restart=restart and not unit_suspended('xray'))
                 with data_lock:
                     data['reality_config'] = new_rcfg
                 save_data()
@@ -4318,6 +4390,11 @@ if __name__ == '__main__':
             # 构成完美的密码 oracle。现在走 auth_rate_limited()，
             # 并且**失败也计数**（低速爆破同样被挡）。
             if self.path == '/auth':
+                # Hy2 核心直连 /auth 从不带 X-Forwarded-For；带了说明是公网请求经
+                # masquerade 代理进来的（config.yaml 里 xForwarded: true）。直接拒，
+                # 且不计入全局失败桶 —— 否则外人刷 30 次错误密码就能让全节点无法登录。
+                if self.headers.get('X-Forwarded-For'):
+                    return self.reply_json(200, {'ok': False, 'msg': 'Forbidden'})
                 if self.auth_rate_limited():
                     # 用与成功路径相同的 200 + JSON 形态回复：不给爆破者区分信号。
                     # （Hysteria 只会看 ok 字段；非 200 可能让它反复重试并刷日志。）
@@ -4333,6 +4410,10 @@ if __name__ == '__main__':
                     # 真实用量由计量模块从 hysteria trafficStats / xray stats
                     # 的单调计数器累计（见 usage-meter-core）。
                     client_ip = client_addr.rsplit(':', 1)[0].strip('[]') if client_addr else ''
+                    try:  # 与计量模块同一写法，避免 IPv6 表示不同导致同一设备被算两次
+                        client_ip = str(ipaddress.ip_address(client_ip)) if client_ip else ''
+                    except ValueError:
+                        pass
                 except Exception:
                     self.record_auth_failure()
                     return self.reply_json(200, {'ok': False, 'msg': 'Bad auth request'})
@@ -4377,8 +4458,10 @@ if __name__ == '__main__':
                         tracker = ip_tracker.setdefault(matched_uid, {})
                         active_ips = {ip: t for ip, t in tracker.items() if now_ts - t < IP_TIMEOUT_SECONDS}
                         ip_tracker[matched_uid] = active_ips
+                        # 已连着的设备即使超过 180 秒没重新鉴权也要算在内。
+                        occupied = set(active_ips) | live_online_ips(matched_uid)
 
-                        if client_ip not in active_ips and len(active_ips) >= ip_limit:
+                        if client_ip not in occupied and len(occupied) >= ip_limit:
                             return self.reply_json(200, {'ok': False, 'msg': f'Concurrent IP limit exceeded ({ip_limit} max)'})
                         active_ips[client_ip] = now_ts
                     elif client_ip:
@@ -4436,6 +4519,8 @@ if __name__ == '__main__':
                     pwd = params.get('password') or secrets.token_hex(16)
                     days = int(params.get('duration_days', 30))
                     ip_limit = int(params.get('ip_limit', 0))
+                    if ip_limit > 1000:  # 与 users/update 的取值范围一致
+                        return self.reply_json(400, {'ok': False, 'error': 'Invalid user parameter'})
                     traffic_gb = float(params.get('traffic_gb', 0))
                     limit_bytes = int(traffic_gb * (1024**3)) if traffic_gb > 0 else 0
                     expires = int(params.get('expires_at', now_ts + days * 86400))
@@ -4455,9 +4540,15 @@ if __name__ == '__main__':
                             'used_bytes': 0,
                             'status': 'active',
                             'created_at': now_ts,
-                            'note': note
+                            'note': note,
+                            'view_nonce': secrets.token_hex(8),
                         }
                         if existing is not None:
+                            # 更新已有用户不能换 nonce，否则发出去的分享链接会失效。
+                            if 'view_nonce' in existing:
+                                record['view_nonce'] = existing['view_nonce']
+                            else:
+                                record.pop('view_nonce')
                             record['used_bytes'] = int(existing.get('used_bytes', 0))
                             record['created_at'] = existing.get('created_at', now_ts)
                             record['status'] = existing.get('status', 'active')
@@ -4539,7 +4630,7 @@ if __name__ == '__main__':
                         if 'password' in changes and password_taken(data.get('users', {}), changes['password'], user_id):
                             return self.reply_json(409, {'ok': False, 'error': 'Password already in use by another user'})
                         u.update(changes)
-                        result = {k: v for k, v in u.items() if k != 'password'}
+                        result = {k: v for k, v in u.items() if k not in ('password', 'view_nonce')}
                     regenerate_page()
                     # 即使同值也重试权威同步；不得因上次写入已落盘而吞掉重载失败。
                     if not self._sync_reality_clients():
@@ -4577,6 +4668,10 @@ if __name__ == '__main__':
                         data['_pending_revocations']=sorted(set(data.get('_pending_revocations',[])) | {user_id})
                         if user_id in data.get('users', {}):
                             del data['users'][user_id]
+                            # 已删用户的累计用量不再有人读，留着只会让 portal.json 越写越大。
+                            # 计数器游标不能删：服务没重启时同名用户再出现会被重复计数；
+                            # 服务重启换 epoch 时 usage-meter-core 会自然丢弃它们。
+                            (data.get('usage_meter') or {}).get('totals', {}).pop(user_id, None)
                             if user_id in ip_tracker:
                                 del ip_tracker[user_id]
                             # 2026-10-03：同步删掉该用户的 Reality 身份。
@@ -5409,6 +5504,8 @@ WantedBy=multi-user.target
                             return self.reply_json(500, {'ok': False, 'error': 'Reality 停止失败，服务状态未改变'})
                         new_active = False
                     else:
+                        if unit_suspended('xray'):
+                            return self.reply_json(409, {'ok': False, 'error': '节点因流量超额停用中，Reality 将在控制台恢复节点时自动启动'})
                         if not Path('/etc/hysteria/xray.json').exists():
                             self._generate_and_apply_reality(True)
                         else:
@@ -5525,7 +5622,7 @@ WantedBy=multi-user.target
                     days = int(form.get('duration_days', ['30'])[0] or 30)
                     ip_limit = int(form.get('ip_limit', ['0'])[0] or 0)
                     traffic_gb = float(form.get('traffic_gb', ['0'])[0] or 0)
-                    if days <= 0 or ip_limit < 0 or not math.isfinite(traffic_gb) or traffic_gb < 0:
+                    if days <= 0 or not 0 <= ip_limit <= 1000 or not math.isfinite(traffic_gb) or traffic_gb < 0:
                         return self.reply(400, b'Invalid duration, IP limit or traffic quota')
                     limit_bytes = int(traffic_gb * (1024**3)) if traffic_gb > 0 else 0
                     note = form.get('note', [''])[0].strip()[:200]
@@ -5553,7 +5650,8 @@ WantedBy=multi-user.target
                             'used_bytes': 0,
                             'status': 'active',
                             'created_at': now_ts,
-                            'note': note
+                            'note': note,
+                            'view_nonce': secrets.token_hex(8),
                         }
                 elif action == 'delete' and user_id:
                     # 🔴 admin_master 不能被注销：它的 password 就是 Hysteria 的
@@ -5569,6 +5667,10 @@ WantedBy=multi-user.target
                         if user_id in data.get('users', {}):
                             data['_pending_revocations']=sorted(set(data.get('_pending_revocations',[])) | {user_id})
                             del data['users'][user_id]
+                            # 已删用户的累计用量不再有人读，留着只会让 portal.json 越写越大。
+                            # 计数器游标不能删：服务没重启时同名用户再出现会被重复计数；
+                            # 服务重启换 epoch 时 usage-meter-core 会自然丢弃它们。
+                            (data.get('usage_meter') or {}).get('totals', {}).pop(user_id, None)
                             if user_id in ip_tracker:
                                 del ip_tracker[user_id]
 
@@ -5795,7 +5897,9 @@ fi
 cat > /usr/local/bin/hy2-warp-watchdog.sh <<'WDE'
 #!/usr/bin/env bash
 set -u
-if ! curl --proxy socks5h://127.0.0.1:19898 --silent --fail --max-time 6 https://api4.ipify.org >/dev/null 2>&1; then
+# 两个探测点都不通才重启：只看 ipify 的话，ipify 自己故障会让 wireproxy 每 3 分钟被白白重启一次。
+probe() { curl --proxy socks5h://127.0.0.1:19898 --silent --fail --max-time 6 "$1" >/dev/null 2>&1; }
+if ! probe https://api4.ipify.org && ! probe https://www.cloudflare.com/cdn-cgi/trace; then
     logger -t hy2-warp-watchdog "WARP local proxy failed. Restarting wireproxy..."
     systemctl restart wireproxy >/dev/null 2>&1 || true
 fi
@@ -5998,7 +6102,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                         u = data.get('users', {}).get(user_id)
                         if u is None:
                             return self.reply_json(404, {'ok': False, 'error': 'User not found'})
-                        result = {k: v for k, v in u.items() if k != 'password'}
+                        result = {k: v for k, v in u.items() if k not in ('password', 'view_nonce')}
                     return self.reply_json(200, {'ok': True, 'user_id': user_id, 'user': result})
                 if sub == 'node/traffic':
                     try:
@@ -6095,7 +6199,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
 
                 query = parse_qs(self.path.split('?', 1)[1]) if '?' in self.path else {}
                 k_val = query.get('k', [''])[0]
-                expected_k = user_view_key(session_secret, target_uid)
+                expected_k = user_view_key(session_secret, target_uid, u_copy.get('view_nonce', ''))
 
                 if not self.is_authenticated() and not (k_val and hmac.compare_digest(k_val, expected_k)):
                     return self.reply(403, b'Access denied: invalid key')

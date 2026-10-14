@@ -32,6 +32,9 @@
     # 直接上报，连面板都不用开：脚本自己 POST /api/nodes
     python3 panel-join.py --register --panel https://mb.teyir.com --admin-token <JWT>
 
+    # 令牌不想出现在 ps / shell 历史里，就改用环境变量：
+    PANEL_ADMIN_TOKEN=<JWT> python3 panel-join.py --register --panel https://mb.teyir.com
+
 ## 退出码
 
     0  成功拿到 api_url + api_key
@@ -89,7 +92,9 @@ def main():
     ap.add_argument("--config", default=CONFIG)
     ap.add_argument("--portal", dest="portal_file", default=PORTAL)
     ap.add_argument("--panel", help="面板地址，如 https://mb.teyir.com")
-    ap.add_argument("--admin-token", help="面板管理员 JWT（用于 --register 或 --format curl）")
+    # 也可用环境变量 PANEL_ADMIN_TOKEN 传：命令行参数会出现在 ps / shell 历史里。
+    ap.add_argument("--admin-token", default=os.environ.get("PANEL_ADMIN_TOKEN"),
+                    help="面板管理员 JWT（用于 --register 或 --format curl；也可设环境变量 PANEL_ADMIN_TOKEN）")
     ap.add_argument("--name", help="节点名，默认用 域名-端口")
     ap.add_argument("--format", choices=["text", "json", "curl"], default="text")
     ap.add_argument("--register", action="store_true", help="直接 POST 到面板完成登记")

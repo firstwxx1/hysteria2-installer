@@ -631,7 +631,10 @@ echo "${HOSTNAME}" > /etc/hostname
 printf '127.0.0.1\\tlocalhost\\n127.0.1.1\\t%s\\n' "${HOSTNAME}" > /etc/hosts
 
 # root 密码 + 允许 root 登录
-echo "root:${ROOT_PWD}" | chpasswd
+# 密码不能直接展开进这段脚本：含 \$、反引号或引号时会被当命令执行或设错密码。
+# 由外层用 printf 原样写进单独文件，这里只读文件。
+chpasswd < /tmp/_rootpw
+rm -f /tmp/_rootpw
 sed -i 's/^#\\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
 sed -i 's/^#\\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
 [ -f /etc/ssh/sshd_config ] || echo 'PermitRootLogin yes' >> /etc/ssh/sshd_config
@@ -655,8 +658,9 @@ if [ "$DRY_RUN" = "1" ]; then
     printf '%s\n' "$BODY" | sed 's/^/        /'
 else
     printf '%s\n' "$BODY" > "$MOUNT_DIR/tmp/_setup.sh"
+    ( umask 077; printf 'root:%s\n' "$ROOT_PWD" > "$MOUNT_DIR/tmp/_rootpw" )
     chroot "$MOUNT_DIR" /bin/sh /tmp/_setup.sh
-    rm -f "$MOUNT_DIR/tmp/_setup.sh"
+    rm -f "$MOUNT_DIR/tmp/_setup.sh" "$MOUNT_DIR/tmp/_rootpw"
     ok "chroot 配置完成"
 fi
 

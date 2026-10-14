@@ -1123,9 +1123,22 @@ EOF
 # ==============================================================================
 # 入口
 # ==============================================================================
+# 会改 peers / 配置 / 二进制的命令互斥执行。门户是多线程的，命令行也可能同时在用：
+# 两个 peer-add 并发时都读到同一份 peers.json，会分到同一个隧道 IP 或互相覆盖丢客户端。
+acquire_lock() {
+    command -v flock >/dev/null 2>&1 || return 0
+    local lock_file="${AWG_LOCK_FILE:-/run/hy2-awgctl.lock}"
+    exec 9>"$lock_file" 2>/dev/null || return 0
+    flock -w 300 9 || die "另一个 hy2-awgctl 操作仍在进行，请稍后重试"
+}
+
 main() {
     local cmd="${1:-}"
     [[ $# -gt 0 ]] && shift || true
+
+    case "$cmd" in
+        install|update|uninstall|resync|peer-add|peer-del) acquire_lock ;;
+    esac
 
     case "$cmd" in
         install)     cmd_install "$@" ;;

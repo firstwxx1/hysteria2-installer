@@ -476,14 +476,19 @@ fi
 info "第 5/6 步：确认重装参数"
 
 if [ -z "$PASSWORD" ]; then
+    # 默认密码一律随机生成：原来交互模式回车给的是 rd13+月日，总共约 372 种可能，
+    # 而新系统开着 root 密码登录 SSH，装好就会被扫到。
+    _random_pwd="$(head -c 18 /dev/urandom | od -An -tx1 | tr -d ' \n' | cut -c1-16)"
     if [ "$ASSUME_YES" = "1" ]; then
-        # 非交互模式没给密码 → 自动生成一个，并醒目打印出来
-        PASSWORD="$(head -c 18 /dev/urandom | od -An -tx1 | tr -d ' \n' | cut -c1-16)"
-        warn "未指定密码，已自动生成：$PASSWORD"
-        warn "★ 请务必记下这个密码，重装后要用它登录！"
+        PASSWORD="$_random_pwd"
     else
-        PASSWORD="$(ask "新系统 root 密码（不含特殊字符）[回车用默认 rd13$(date +%m%d)]： " "rd13$(date +%m%d)")"
+        PASSWORD="$(ask "新系统 root 密码（不含特殊字符）[回车使用随机密码]： " "$_random_pwd")"
     fi
+    if [ "$PASSWORD" = "$_random_pwd" ]; then
+        warn "已自动生成 root 密码：$PASSWORD"
+        warn "★ 请务必记下这个密码，重装后要用它登录！"
+    fi
+    unset _random_pwd
 fi
 [ -n "$PASSWORD" ] || die "root 密码不能为空"
 
@@ -519,7 +524,9 @@ IN_FILE="$WORKDIR/InstallNET.sh"
 download_installnet() {
     rm -f "$IN_FILE"
     if command -v wget >/dev/null 2>&1; then
-        wget --no-check-certificate -qO "$IN_FILE" "$INSTALLNET_URL" && return 0
+        # 不能 --no-check-certificate：下载的脚本随后以 root 执行并重装整个系统，
+        # 跳过证书校验等于把机器交给任何能做中间人的人。
+        wget -qO "$IN_FILE" "$INSTALLNET_URL" && return 0
     fi
     if command -v curl >/dev/null 2>&1; then
         curl -fsSL --max-time 120 -o "$IN_FILE" "$INSTALLNET_URL" && return 0
@@ -532,6 +539,10 @@ if ! command -v wget >/dev/null 2>&1 && ! command -v curl >/dev/null 2>&1; then
     info "安装下载工具"
     apk update >/dev/null 2>&1 || true
     apk add --no-cache wget curl iproute2 gawk ipcalc >/dev/null 2>&1 || true
+fi
+# 下载要校验 HTTPS 证书，Alpine Live 环境可能缺 CA 根证书包。
+if command -v apk >/dev/null 2>&1 && [ ! -s /etc/ssl/certs/ca-certificates.crt ]; then
+    apk add --no-cache ca-certificates >/dev/null 2>&1 || true
 fi
 
 # ★ 必须确保 bash 存在 —— InstallNET.sh 是 bash 脚本，用 sh 跑会报

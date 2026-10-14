@@ -1354,6 +1354,9 @@ masquerade:
   proxy:
     url: http://127.0.0.1:${PORTAL_LOCAL_PORT}/
     rewriteHost: false
+    # 给经伪装代理进来的公网请求打上 X-Forwarded-For，门户据此拒绝公网直打 /auth
+    # （否则任何人都能刷满 /auth 的全局失败计数，让整个节点无法登录）。v2.8.0+ 支持，旧核心忽略。
+    xForwarded: true
   listenHTTPS: :${HY2_SUB_PORT}
 
 # 真实计量：/traffic 只读端点，供 usage-meter 采集。必须回环监听，
@@ -1466,6 +1469,11 @@ if [[ "$TARGET" == "core" ]]; then
     fi
     cp -f "$HY2_BIN" "${HY2_BIN}.bak" 2>/dev/null || true
     mv -f "$TMP_FILE" "$HY2_BIN"
+    # 老装机补上 masquerade.proxy.xForwarded（见安装模板的注释）。放在核心升级里做，
+    # 是因为这里本来就要重启 Hy2，不会为改配置额外断一次所有用户。
+    if [[ -f "$HY2_DIR/config.yaml" ]] && ! grep -qE '^[[:space:]]+xForwarded:' "$HY2_DIR/config.yaml"; then
+        sed -i -E 's/^([[:space:]]+)rewriteHost:(.*)$/&\n\1xForwarded: true/' "$HY2_DIR/config.yaml" || true
+    fi
     if ! systemctl restart hysteria-server 2>/dev/null; then
         if [[ -f "${HY2_BIN}.bak" ]]; then
             mv -f "${HY2_BIN}.bak" "$HY2_BIN"
@@ -2515,8 +2523,9 @@ EOF
     cat > /usr/local/bin/hy2-warp-watchdog.sh <<EOWD
 #!/usr/bin/env bash
 set -u
-TEST_URL="https://api4.ipify.org"
-if ! curl --proxy socks5h://${WARP_SOCKS_ADDR} --silent --fail --max-time 6 "\$TEST_URL" >/dev/null 2>&1; then
+# 两个探测点都不通才重启：只看 ipify 的话，ipify 自己故障会让 wireproxy 每 3 分钟被白白重启一次。
+probe() { curl --proxy socks5h://${WARP_SOCKS_ADDR} --silent --fail --max-time 6 "\$1" >/dev/null 2>&1; }
+if ! probe https://api4.ipify.org && ! probe https://www.cloudflare.com/cdn-cgi/trace; then
     logger -t hy2-warp-watchdog "WARP local proxy failed. Restarting wireproxy..."
     systemctl restart wireproxy >/dev/null 2>&1 || true
 fi
@@ -3299,6 +3308,10 @@ uninstall_all() {
         systemctl disable hysteria-server 2>/dev/null || true
         systemctl disable --now hysteria-portal 2>/dev/null || true
         systemctl disable --now gost 2>/dev/null || true
+        # Reality 用的 xray 由门户安装（/etc/hysteria/xray.json），也要一起停掉，
+        # 否则配置目录删了它还在跑，Reality 用户要到重启后才断。
+        systemctl disable --now xray 2>/dev/null || true
+        rm -f /etc/systemd/system/xray.service /usr/local/bin/xray
         # BUGFIX: 卸载时同时清理 WARP 相关服务与配置
         systemctl disable --now wireproxy 2>/dev/null || true
         systemctl disable --now hy2-warp-watchdog.timer 2>/dev/null || true
@@ -3327,7 +3340,11 @@ uninstall_all() {
         rm -f /usr/local/bin/wireproxy
         rm -f /usr/local/bin/hy2-warp-watchdog.sh
         rm -rf "$HY2_DIR"
-        rm -rf /etc/wireguard
+        # 只删 wgcf / wireproxy 自己的文件：/etc/wireguard 是系统 WireGuard 的公共目录，
+        # 机主自己的 wg0.conf 之类不能被一并删掉。目录空了才移除。
+        rm -f /etc/wireguard/wgcf-account.toml /etc/wireguard/wgcf.conf \
+              /etc/wireguard/wgcf-profile.conf /etc/wireguard/wp.conf
+        rmdir /etc/wireguard 2>/dev/null || true
 
         # AmneziaWG 清理（按上面的确认结果决定）
         if [[ "$awg_confirm" =~ ^[Yy]$ ]]; then

@@ -55,7 +55,8 @@ class WebWorkflowTests(unittest.TestCase):
                        reload_gost=self.reload, gost_status=Mock(return_value=True),
                        gost_operation_lock=threading.RLock(), reality_apply_lock=threading.Lock(),
                        subprocess=SimpleNamespace(run=self.run, Popen=Mock(), TimeoutExpired=subprocess.TimeoutExpired),
-                       write_gost_config=Mock(), _pick_reality_port=Mock(return_value=(8443, 'existing')))
+                       write_gost_config=Mock(), _pick_reality_port=Mock(return_value=(8443, 'existing')),
+                       unit_suspended=lambda unit: False)
         self.sync = Mock(return_value=True)
         self.handler = SimpleNamespace(is_authenticated=lambda: True, server=SimpleNamespace(),
             _sync_reality_clients=self.sync, _reply_with_warp_apply=lambda payload: self.reply_json(200, payload),
