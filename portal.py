@@ -3218,21 +3218,18 @@ def serve(path):
 
     access_apply_lock = threading.RLock()
     def apply_access(force_ids=()):
-        with access_apply_lock:
-            with data_lock:
-                pending=set(data.get('_pending_revocations', [])) | set(force_ids)
-                snapshot=copy.deepcopy(data)
+        with access_apply_lock, data_lock:
+            pending=set(data.get('_pending_revocations', [])) | set(force_ids)
+            snapshot=copy.deepcopy(data)
             try:
                 enforce_node_access(portal_path.parent,snapshot,pending)
             except Exception as exc:
-                with data_lock:
-                    data['_pending_revocations']=sorted(pending)
-                    save_data()
+                data['_pending_revocations']=sorted(pending)
+                save_data()
                 print('[expiry] access enforcement failed: '+type(exc).__name__,file=sys.stderr)
                 return False
-            with data_lock:
-                data.pop('_pending_revocations',None)
-                save_data()
+            data.pop('_pending_revocations',None)
+            save_data()
             return True
     def expiry_access_worker():
         while True:
