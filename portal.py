@@ -61,7 +61,7 @@ MASTER_USER_ID = 'admin_master'
 #
 # ⚠️ 改动 portal.py 的**能力**时记得同步 +1，否则主面板会按旧能力显示。
 # 格式固定 `PORTAL_VERSION = 'x.y'`（capabilities 端点按行首匹配解析它）。
-PORTAL_VERSION = '2.6'
+PORTAL_VERSION = '2.7'
 
 DEFAULT_WARP_DOMAINS = (
     'ipify.org', 'cloudflare.com',
@@ -3264,6 +3264,94 @@ def serve(path):
                     disk_temp.chmod(0o600)
                     disk_temp.replace(disk_path)
 
+    # ---- 整机流量与超额停用（2026-10-14，供主控制台的节点流量限额使用）----
+    #
+    # 计量口径：只取**默认路由所在的网卡**（/proc/net/route 与 ipv6_route 中
+    # 目的地全零的那张），因为 VPS 商家按物理出口网卡计费。把所有网卡加起来
+    # 会把 WARP / AWG 等隧道接口上的流量再算一遍（它们最终也走物理网卡）。
+    # 计数器是开机以来的累计值；控制台用 boot_id 识别重启造成的归零。
+    _TUNNEL_IFACE_PREFIXES = ('lo', 'wg', 'warp', 'awg', 'tun', 'tap', 'docker', 'veth', 'br-', 'virbr')
+
+    def node_default_ifaces():
+        ifaces = set()
+        try:
+            with open('/proc/net/route', encoding='ascii') as fh:
+                next(fh, None)
+                for line in fh:
+                    parts = line.split()
+                    if len(parts) > 2 and parts[1] == '00000000':
+                        ifaces.add(parts[0])
+        except OSError:
+            pass
+        try:
+            with open('/proc/net/ipv6_route', encoding='ascii') as fh:
+                for line in fh:
+                    parts = line.split()
+                    if len(parts) >= 10 and parts[0] == '0' * 32 and parts[1] == '00':
+                        ifaces.add(parts[9])
+        except OSError:
+            pass
+        physical = {i for i in ifaces if not i.startswith(_TUNNEL_IFACE_PREFIXES)}
+        return sorted(physical or ifaces)
+
+    def node_traffic_counters():
+        wanted = set(node_default_ifaces())
+        rx = tx = 0
+        seen = []
+        with open('/proc/net/dev', encoding='ascii') as fh:
+            for line in fh:
+                if ':' not in line:
+                    continue
+                name, rest = line.split(':', 1)
+                name = name.strip()
+                if name not in wanted:
+                    continue
+                cols = rest.split()
+                rx += int(cols[0])
+                tx += int(cols[8])
+                seen.append(name)
+        try:
+            boot_id = Path('/proc/sys/kernel/random/boot_id').read_text(encoding='ascii').strip()
+        except OSError:
+            boot_id = ''
+        return {'rx_bytes': rx, 'tx_bytes': tx, 'interfaces': seen, 'boot_id': boot_id}
+
+    # 超额停用只停**对外提供代理**的服务，portal 自己不停 —— 否则控制台
+    # 下个周期就没法远程恢复。停之前记下哪些本来是开着的，恢复时只启动它们，
+    # 不会把机主有意关掉的服务顺手拉起来。
+    TRAFFIC_SUSPEND_UNITS = ('hysteria-server', 'xray', 'gost', 'amneziawg-go')
+
+    def _unit_active(unit):
+        try:
+            return subprocess.run(['systemctl', 'is-active', unit], capture_output=True,
+                                  text=True, timeout=5).stdout.strip() == 'active'
+        except Exception:
+            return False
+
+    def set_traffic_suspension(suspend):
+        with data_lock:
+            state = dict(data.get('traffic_suspend') or {})
+        results = {}
+        if suspend:
+            units = state.get('units') if state.get('suspended') else None
+            if units is None:
+                units = [u for u in TRAFFIC_SUSPEND_UNITS if _unit_active(u)]
+            for u in units:
+                r = subprocess.run(['systemctl', 'stop', u], capture_output=True, timeout=20)
+                results[u] = r.returncode == 0
+            new_state = {'suspended': True, 'units': units,
+                         'since': state.get('since') or int(time.time())}
+        else:
+            for u in state.get('units') or []:
+                subprocess.run(['systemctl', 'reset-failed', u], capture_output=True, timeout=5)
+                r = subprocess.run(['systemctl', 'start', u], capture_output=True, timeout=20)
+                results[u] = r.returncode == 0
+            new_state = {'suspended': False}
+        with data_lock:
+            data['traffic_suspend'] = new_state
+        save_data()
+        return new_state, results
+
     # 每个来源使用实际采样间隔计算速率，不能把 5 秒增量除以固定 3 秒。
     SPEED_WINDOW_SECONDS = 15
 
@@ -4518,6 +4606,16 @@ if __name__ == '__main__':
                 elif sub == 'proxy-services/delete':
                     status, payload = self._manage_proxy_operation('delete', params)
                     return self.reply_json(status, payload)
+
+                elif sub == 'node/suspend':
+                    # 主控制台的节点流量限额：超额时停代理服务，新周期恢复。
+                    if not isinstance(params.get('suspended'), bool):
+                        return self.reply_json(400, {'ok': False, 'error': 'suspended must be a boolean'})
+                    state, results = set_traffic_suspension(params['suspended'])
+                    failed = [u for u, ok in results.items() if not ok]
+                    return self.reply_json(200 if not failed else 500, {
+                        'ok': not failed, 'suspended': state.get('suspended', False),
+                        'units': results, 'failed': failed})
 
                 return self.reply_json(404, {'ok': False, 'error': 'API endpoint not found'})
 
@@ -5811,6 +5909,15 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                             return self.reply_json(404, {'ok': False, 'error': 'User not found'})
                         result = {k: v for k, v in u.items() if k != 'password'}
                     return self.reply_json(200, {'ok': True, 'user_id': user_id, 'user': result})
+                if sub == 'node/traffic':
+                    try:
+                        counters = node_traffic_counters()
+                    except Exception as e:
+                        return self.reply_json(500, {'ok': False, 'error': 'read counters failed: ' + str(e)[:120]})
+                    with data_lock:
+                        suspended = bool((data.get('traffic_suspend') or {}).get('suspended'))
+                    counters.update({'ok': True, 'suspended': suspended, 'time': int(time.time())})
+                    return self.reply_json(200, counters)
                 if sub == 'node/meta':
                     m = json.loads(meta_path.read_text(encoding='utf-8')) if meta_path.exists() else {}
                     with data_lock:
@@ -6718,6 +6825,18 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                       file=sys.stderr)
     except Exception as e:
         print('[portal] 启动补同步跳过: %s' % str(e)[:120], file=sys.stderr)
+
+    # 超额停用要扛住重启：开机后 systemd 会把服务重新拉起来，这里再停一次。
+    try:
+        with data_lock:
+            _susp = dict(data.get('traffic_suspend') or {})
+        if _susp.get('suspended'):
+            for _u in _susp.get('units') or []:
+                subprocess.run(['systemctl', 'stop', _u], capture_output=True, timeout=20)
+            print('[portal] 流量超额停用中，已重新停止: %s' % ','.join(_susp.get('units') or []),
+                  file=sys.stderr)
+    except Exception as e:
+        print('[portal] 重新应用超额停用失败: %s' % str(e)[:120], file=sys.stderr)
 
     if usage_meter is not None:
         usage_meter.start()
