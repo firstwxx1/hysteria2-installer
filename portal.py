@@ -2637,7 +2637,9 @@ def enforce_node_access(root, snapshot, force_ids=()):
             # Hy2 已停（例如整机流量超额停用）时统计接口必然连不上，但此时也
             # 不可能有在线会话；新连接的鉴权照样会被拒。不跳过的话，停用期间
             # 控制台删除 / 停用用户会一直拿到 503。
-            if _systemd_state('hysteria-server') in ('inactive', 'failed'):
+            # 只认「流量超额停用」这一种已知停机：服务没装、单元不存在时 is-active
+            # 同样返回 inactive，那种情况不能当作「无在线会话」放行（CI 上踩到）。
+            if _unit_suspended('hysteria-server') and _systemd_state('hysteria-server') in ('inactive', 'failed'):
                 online={}
             else:
                 raise

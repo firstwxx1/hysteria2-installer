@@ -88,12 +88,21 @@ class RevocationWhileSuspendedTest(unittest.TestCase):
             {'hysteria': {'url': 'http://127.0.0.1:%d' % port, 'secret': 'x'}}), encoding='utf-8')
         self.snapshot = {'users': {'gone': {'status': 'disabled'}}}
 
-    def test_stopped_hy2_does_not_block_revocation(self):
-        with mock.patch.object(portal, '_systemd_state', return_value='inactive'):
+    def test_suspended_and_stopped_hy2_does_not_block_revocation(self):
+        with mock.patch.object(portal, '_unit_suspended', lambda unit: unit == 'hysteria-server'), \
+                mock.patch.object(portal, '_systemd_state', return_value='inactive'):
             self.assertTrue(portal.enforce_node_access(self.tmp, self.snapshot, ['gone']))
 
     def test_running_hy2_with_unreachable_stats_still_fails_closed(self):
-        with mock.patch.object(portal, '_systemd_state', return_value='active'):
+        with mock.patch.object(portal, '_unit_suspended', lambda unit: unit == 'hysteria-server'), \
+                mock.patch.object(portal, '_systemd_state', return_value='active'):
+            with self.assertRaises(OSError):
+                portal.enforce_node_access(self.tmp, self.snapshot, ['gone'])
+
+    def test_inactive_but_not_suspended_still_fails_closed(self):
+        """服务没装 / 单元不存在时 is-active 也是 inactive，不能据此放行（CI 上踩到）。"""
+        with mock.patch.object(portal, '_unit_suspended', lambda unit: False), \
+                mock.patch.object(portal, '_systemd_state', return_value='inactive'):
             with self.assertRaises(OSError):
                 portal.enforce_node_access(self.tmp, self.snapshot, ['gone'])
 
