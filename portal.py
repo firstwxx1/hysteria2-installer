@@ -643,6 +643,37 @@ def _log_ignored(where, exc):
     print(f'[portal] {where} ignored {type(exc).__name__}: {exc}', file=sys.stderr)
 
 
+def atomic_write_private(path, payload):
+    """原子、落盘、仅 root 可读地写文件。
+
+    - 临时文件一创建就是 0600：先按 umask 建再 chmod，中间那段时间里
+      密码与 api_key 对本机其他用户可读。
+    - replace 前 fsync 文件、之后 fsync 目录：否则断电后可能留下空文件，
+      portal.json 里是全部用户数据。
+    """
+    path = Path(path)
+    temp = path.with_suffix('.tmp')
+    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        if hasattr(os, 'fchmod'):  # 临时文件若已存在，O_CREAT 不会改它原来的权限
+            os.fchmod(fd, 0o600)
+        with os.fdopen(fd, 'wb') as fh:
+            fd = None
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+    finally:
+        if fd is not None:
+            os.close(fd)
+    os.replace(temp, path)
+    if hasattr(os, 'O_DIRECTORY'):
+        dfd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+
+
 def resolve_update_ref(ref):
     if re.fullmatch(r'[0-9a-f]{40}', ref):
         return ref
@@ -2552,6 +2583,15 @@ def user_access_allowed(info, now=None):
     except (ValueError, TypeError):
         return False
 
+def password_taken(users, pwd, owner_uid):
+    """pwd 是否已被 owner_uid 以外的用户（含机主）占用。调用方须持有 data_lock。
+
+    /auth 按密码找用户、命中第一个就停：两人同密码时，后者的流量、限额、
+    到期都会算到前者头上；撞上机主密码则直接拿到不限量的永久账号。
+    """
+    return any(uid != owner_uid and str(u.get('password', '')) == str(pwd)
+               for uid, u in users.items())
+
 def enforce_node_access(root, snapshot, force_ids=()):
     """确认旧会话和 Reality 核心都已收回；失败不伪造销户成功。"""
     root = Path(root)
@@ -3281,20 +3321,13 @@ def serve(path):
             # 直接 UnicodeEncodeError 把 HTTP handler 打死，客户端看到的是
             # "Remote end closed connection without response"，
             # 排查时完全看不出是编码问题。
+            payload = json.dumps(data, ensure_ascii=False).encode('utf-8')
             try:
-                temp = portal_path.with_suffix('.tmp')
-                temp.write_text(json.dumps(data, ensure_ascii=False),
-                                encoding='utf-8')
-                temp.chmod(0o600)
-                temp.replace(portal_path)
+                atomic_write_private(portal_path, payload)
             except OSError:
                 disk_path = Path('/etc/hysteria/portal.json')
                 if disk_path.exists():
-                    disk_temp = disk_path.with_suffix('.tmp')
-                    disk_temp.write_text(json.dumps(data, ensure_ascii=False),
-                                         encoding='utf-8')
-                    disk_temp.chmod(0o600)
-                    disk_temp.replace(disk_path)
+                    atomic_write_private(disk_path, payload)
 
     # ---- 整机流量与超额停用（2026-10-14，供主控制台的节点流量限额使用）----
     #
@@ -3351,7 +3384,7 @@ def serve(path):
     # 超额停用只停**对外提供代理**的服务，portal 自己不停 —— 否则控制台
     # 下个周期就没法远程恢复。停之前记下哪些本来是开着的，恢复时只启动它们，
     # 不会把机主有意关掉的服务顺手拉起来。
-    TRAFFIC_SUSPEND_UNITS = ('hysteria-server', 'xray', 'gost', 'amneziawg-go')
+    TRAFFIC_SUSPEND_UNITS = ('hysteria-server', 'xray', 'gost', 'amneziawg-server')
 
     def _unit_active(unit):
         try:
@@ -3384,7 +3417,22 @@ def serve(path):
         save_data()
         return new_state, results
 
-    # 每个来源使用实际采样间隔计算速率，不能把 5 秒增量除以固定 3 秒。
+    # 计量每 5 秒对每个来源采样一次。若每次都整份落盘（portal.json 含整页 HTML，
+    # 几百 KB 起步），一天要写好几 GB，且写盘期间一直占着 /auth 也要的 data_lock。
+    # 这里限流到每 METER_SAVE_INTERVAL 秒一次；内存里的计数始终是最新的，
+    # 其他任何 save_data() 也会顺带把它写下去。进程意外退出最多丢这一段间隔的
+    # 基线，下次采样按单调计数器补算差值，不会少计。
+    METER_SAVE_INTERVAL = 60
+    _meter_last_save = [0.0]
+
+    def save_meter_data():
+        now = time.monotonic()
+        if now - _meter_last_save[0] < METER_SAVE_INTERVAL:
+            return
+        _meter_last_save[0] = now
+        save_data()
+
+        # 每个来源使用实际采样间隔计算速率，不能把 5 秒增量除以固定 3 秒。
     SPEED_WINDOW_SECONDS = 15
 
     def _meter_speed_sample(uid, tx, rx, elapsed, source):
@@ -3403,7 +3451,7 @@ def serve(path):
         _usage_spec.loader.exec_module(_usage_runtime)
         if getattr(_usage_runtime, 'ACCOUNTING_REVISION', None) != '2026-10-12-real-usage-v2':
             raise RuntimeError('usage_meter_runtime_revision_mismatch')
-        usage_meter = _usage_runtime.from_file(data, data_lock, save_data,
+        usage_meter = _usage_runtime.from_file(data, data_lock, save_meter_data,
                                               portal_path.parent / 'usage-meter-config.json',
                                               on_speed=_meter_speed_sample)
     except Exception as _usage_exc:
@@ -3883,9 +3931,14 @@ if __name__ == '__main__':
             sync_download_artifacts(data, uri, clash, sing)
         save_data()
 
-    def sign_session(token):
-        sig = hmac.new(session_secret.encode(), f'sess:{token}'.encode(), hashlib.sha256).hexdigest()
-        return f'{token}.{sig}'
+    # 会话在服务端过期：签名里带签发时间。原来的签名只覆盖固定 token，
+    # 每次登录得到同一个值、永不过期（Max-Age 只约束浏览器），泄露即永久可用。
+    SESSION_MAX_AGE = 30 * 86400
+
+    def sign_session(token, issued_at=None):
+        issued_at = int(time.time()) if issued_at is None else int(issued_at)
+        sig = hmac.new(session_secret.encode(), f'sess:{token}:{issued_at}'.encode(), hashlib.sha256).hexdigest()
+        return f'{token}.{issued_at}.{sig}'
 
     def verify_session(cookie_header):
         if not cookie_header:
@@ -3897,11 +3950,13 @@ if __name__ == '__main__':
             return False
         if 'hy2_session' not in cookies:
             return False
-        raw = cookies['hy2_session'].value
-        if '.' not in raw:
+        parts = cookies['hy2_session'].value.split('.')
+        if len(parts) != 3 or not parts[1].isdigit() or not parts[0].isascii() or not parts[2].isascii():
             return False
-        t, sig = raw.split('.', 1)
-        expected = hmac.new(session_secret.encode(), f'sess:{t}'.encode(), hashlib.sha256).hexdigest()
+        t, issued_at, sig = parts
+        if not 0 <= time.time() - int(issued_at) <= SESSION_MAX_AGE:
+            return False
+        expected = hmac.new(session_secret.encode(), f'sess:{t}:{issued_at}'.encode(), hashlib.sha256).hexdigest()
         return hmac.compare_digest(t, data['token']) and hmac.compare_digest(sig, expected)
 
     # SPEEDTEST_TARGETS 是 /api/v1/speedtest 的**唯一**靶点来源。
@@ -4390,6 +4445,8 @@ if __name__ == '__main__':
                         existing = data.get('users', {}).get(user_id)
                         if params.get('create_only') and existing is not None:
                             return self.reply_json(409, {'ok': False, 'error': 'User already exists'})
+                        if params.get('password') and password_taken(data.get('users', {}), pwd, user_id):
+                            return self.reply_json(409, {'ok': False, 'error': 'Password already in use by another user'})
                         record = {
                             'password': pwd,
                             'expires_at': expires,
@@ -4479,6 +4536,8 @@ if __name__ == '__main__':
                         u = data.get('users', {}).get(user_id)
                         if u is None:
                             return self.reply_json(404, {'ok': False, 'error': 'User not found'})
+                        if 'password' in changes and password_taken(data.get('users', {}), changes['password'], user_id):
+                            return self.reply_json(409, {'ok': False, 'error': 'Password already in use by another user'})
                         u.update(changes)
                         result = {k: v for k, v in u.items() if k != 'password'}
                     regenerate_page()
@@ -5484,6 +5543,8 @@ WantedBy=multi-user.target
                                 f'用户 {user_id} 已存在（当前密码尾号 {tail}，已用 {used_gb} GB）。'
                                 '如需改参数请用「修改」，或先删除该用户再重建。'
                             ).encode('utf-8'))
+                        if password_taken(data.get('users', {}), pwd, user_id):
+                            return self.reply(409, '该密码已被其他用户使用，请换一个（留空则自动生成）。'.encode('utf-8'))
                         data.setdefault('users', {})[user_id] = {
                             'password': pwd,
                             'expires_at': now_ts + days * 86400,
@@ -5555,7 +5616,7 @@ WantedBy=multi-user.target
                 return self.reply(200, page.encode('utf-8'), 'text/html; charset=utf-8')
 
             sess_val = sign_session(data['token'])
-            max_age = '; Max-Age=2592000' if remember else ''
+            max_age = f'; Max-Age={SESSION_MAX_AGE}' if remember else ''
             cookie = f'hy2_session={sess_val}; Path=/{data["token"]}/; HttpOnly; SameSite=Strict; Secure{max_age}'
             self.send_response(302)
             self.send_header('Location', prefix)
@@ -6049,13 +6110,13 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     return self.reply(200, sing_json.encode('utf-8'), 'application/json')
                 elif action_file == 'qr.svg':
                     try:
-                        qr_bytes = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'], input=uri.encode(), capture_output=True, check=True).stdout
+                        qr_bytes = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'], input=uri.encode(), capture_output=True, check=True, timeout=10).stdout
                         return self.reply(200, qr_bytes, 'image/svg+xml')
                     except Exception:
                         return self.reply(500, b'QR generation failed')
                 elif action_file == '':
                     try:
-                        qr_svg = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'], input=uri.encode(), capture_output=True, check=True).stdout.decode('utf-8')
+                        qr_svg = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'], input=uri.encode(), capture_output=True, check=True, timeout=10).stdout.decode('utf-8')
                     except Exception:
                         qr_svg = ''
                     server_name = m.get('server_name') or m.get('public_ip', 'localhost')
@@ -6127,7 +6188,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 uri, clash_yaml, sing_json = artifacts(m, auth_override=pwd, name_override=f"Hy2-{target_uid}")
                 qr_svg = ""
                 try:
-                    qr_svg = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'], input=uri.encode(), capture_output=True, check=True).stdout.decode('utf-8')
+                    qr_svg = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'], input=uri.encode(), capture_output=True, check=True, timeout=10).stdout.decode('utf-8')
                 except Exception as exc:
                     _log_ignored('qr_svg', exc)
 

@@ -32,7 +32,8 @@ TOK = D['token']
 # 每台机器都不一样（se=33947、us5x=54741...）。
 # 硬编码会让这些脚本只能在那台机器上跑，换机即 Connection refused。
 B = 'http://127.0.0.1:%d/' % D['port'] + TOK + '/'
-SIG = hmac.new(D['session_secret'].encode(), ('sess:' + TOK).encode(),
+IAT = str(int(time.time()))
+SIG = hmac.new(D['session_secret'].encode(), ('sess:' + TOK + ':' + IAT).encode(),
                hashlib.sha256).hexdigest()
 OP = urllib.request.build_opener()
 
@@ -55,7 +56,7 @@ def case(name, ok, extra=''):
 def post(action, **kw):
     body = urllib.parse.urlencode(dict(action=action, **kw)).encode()
     r = urllib.request.Request(B + 'manage-outbounds', data=body)
-    r.add_header('Cookie', 'hy2_session=' + TOK + '.' + SIG)
+    r.add_header('Cookie', 'hy2_session=' + TOK + '.' + IAT + '.' + SIG)
     try:
         return json.loads(OP.open(r, timeout=60).read().decode('utf-8', 'ignore'))
     except urllib.error.HTTPError as e:
@@ -234,7 +235,7 @@ try:
         # 这本身不是 bug。此时只能验"出站被记下来了"。
         lst = json.loads(OP.open(urllib.request.Request(
             B + 'outbounds/list',
-            headers={'Cookie': 'hy2_session=' + TOK + '.' + SIG}),
+            headers={'Cookie': 'hy2_session=' + TOK + '.' + IAT + '.' + SIG}),
             timeout=20).read().decode())
         names = [o['name'] for o in (lst.get('outbounds') or [])]
         case('死端口出站已正确记录（服务仍可启动属 lazy dial 正常行为）',

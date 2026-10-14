@@ -316,9 +316,8 @@ install_binary() {
     log_info "目标版本: ${LATEST_TAG} (${HY2_ARCH})"
     log_step "下载二进制文件至 ${HY2_BIN}..."
     
-    if curl -fL --progress-bar "$DOWNLOAD_URL" -o "${HY2_BIN}.tmp"; then
+    if curl -fL --progress-bar "$DOWNLOAD_URL" -o "${HY2_BIN}.tmp"         && chmod +x "${HY2_BIN}.tmp" && "${HY2_BIN}.tmp" version >/dev/null 2>&1; then
         mv "${HY2_BIN}.tmp" "$HY2_BIN"
-        chmod +x "$HY2_BIN"
         log_info "Hysteria 2 二进制安装成功！版本信息: $($HY2_BIN version 2>&1 | grep -E '^Version:' | head -n1 || echo '未知')"
     else
         rm -f "${HY2_BIN}.tmp"
@@ -1453,15 +1452,29 @@ if [[ "$TARGET" == "core" ]]; then
         x86_64) HY_ARCH="amd64" ;;
         aarch64|arm64) HY_ARCH="arm64" ;;
         armv7l) HY_ARCH="armv7" ;;
-        *) exit 1 ;;
+        *) echo "不支持的架构: $ARCH" >&2; exit 1 ;;
     esac
-    TMP_FILE="/tmp/hy2_update_${HY_ARCH}"
+    # mktemp 而不是固定的 /tmp/hy2_update_*：root 写可预测路径会被符号链接劫持。
+    TMP_FILE="$(mktemp "${HY2_BIN}.update.XXXXXX")"
+    trap 'rm -f "$TMP_FILE"' EXIT
     curl -fsSL "https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-${HY_ARCH}" -o "$TMP_FILE"
-    if [[ -s "$TMP_FILE" ]]; then
-        chmod +x "$TMP_FILE"
-        mv -f "$TMP_FILE" "$HY2_BIN"
-        systemctl restart hysteria-server 2>/dev/null || true
+    chmod +x "$TMP_FILE"
+    # 先确认新文件真能跑，再替换；坏包直接覆盖会让服务起不来、所有客户端断线。
+    if ! "$TMP_FILE" version >/dev/null 2>&1; then
+        echo "下载的 Hysteria 二进制无法运行，已放弃更新" >&2
+        exit 1
     fi
+    cp -f "$HY2_BIN" "${HY2_BIN}.bak" 2>/dev/null || true
+    mv -f "$TMP_FILE" "$HY2_BIN"
+    if ! systemctl restart hysteria-server 2>/dev/null; then
+        if [[ -f "${HY2_BIN}.bak" ]]; then
+            mv -f "${HY2_BIN}.bak" "$HY2_BIN"
+            systemctl restart hysteria-server 2>/dev/null || true
+        fi
+        echo "新版本启动失败，已回滚到旧版本" >&2
+        exit 1
+    fi
+    rm -f "${HY2_BIN}.bak"
 elif [[ "$TARGET" == "portal" ]]; then
     # 从主仓库拉取最新 portal.py 并重启 portal 服务。
     # ⚠️ 不能只用 raw.githubusercontent.com：它有 CDN 缓存，push 后数分钟仍返回旧内容，

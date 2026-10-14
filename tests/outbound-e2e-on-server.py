@@ -9,6 +9,7 @@
 """
 import hashlib
 import hmac
+import time
 import json
 import sys
 import urllib.error
@@ -18,9 +19,10 @@ import urllib.request
 D = json.load(open('/etc/hysteria/portal.json'))
 TOK = D['token']
 B = 'http://127.0.0.1:33947/' + TOK + '/'
-SIG = hmac.new(D['session_secret'].encode(), ('sess:' + TOK).encode(),
+IAT = str(int(time.time()))
+SIG = hmac.new(D['session_secret'].encode(), ('sess:' + TOK + ':' + IAT).encode(),
                hashlib.sha256).hexdigest()
-CK = 'hy2_session=' + TOK + '.' + SIG
+CK = 'hy2_session=' + TOK + '.' + IAT + '.' + SIG
 OP = urllib.request.build_opener()
 
 PASS = 0

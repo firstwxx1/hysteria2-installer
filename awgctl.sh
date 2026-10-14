@@ -202,6 +202,23 @@ download_binaries() {
         return 1
     fi
 
+    # 用同一 Release 里 CI 生成的 SHA256SUMS 校验，挡住下载损坏/被截断的包。
+    # 老的 Release 可能没有这个文件：取不到时只告警，不阻断安装。
+    local sums_url want got
+    sums_url="https://github.com/${AWG_REPO}/releases/download/${AWG_RELEASE_TAG}/SHA256SUMS"
+    if curl -fsSL --connect-timeout 20 --retry 2 -o "${tmpd}/SHA256SUMS" "$sums_url" 2>/dev/null; then
+        want="$(awk -v f="amneziawg-linux-${arch}-awg${line}.tar.gz"             '{n=$2; sub(/^\.\//,"",n); sub(/^\*/,"",n)} n==f {print $1; exit}' "${tmpd}/SHA256SUMS")"
+        got="$(sha256sum "${tmpd}/awg.tar.gz" | awk '{print $1}')"
+        if [[ -z "$want" || "$want" != "$got" ]]; then
+            rm -rf "$tmpd"
+            log_err "校验失败：安装包的 SHA256 与 Release 中的 SHA256SUMS 不一致，已放弃安装"
+            return 1
+        fi
+        log_info "SHA256 校验通过"
+    else
+        log_warn "未取到 SHA256SUMS，跳过完整性校验"
+    fi
+
     if ! tar -xzf "${tmpd}/awg.tar.gz" -C "$tmpd" 2>/dev/null; then
         rm -rf "$tmpd"; log_err "解压失败（包可能已损坏）"; return 1
     fi
