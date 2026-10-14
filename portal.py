@@ -2531,6 +2531,98 @@ def reality_registry(data):
     return reg
 
 
+_ACCESS_APPLIED = {}
+
+def user_access_allowed(info, now=None):
+    now = time.time() if now is None else now
+    try:
+        return (info.get('status', 'active') == 'active' and
+                float(info.get('expires_at', 0)) > now and
+                (int(info.get('limit_bytes', 0)) <= 0 or
+                 int(info.get('used_bytes', 0)) < int(info.get('limit_bytes', 0))))
+    except (ValueError, TypeError):
+        return False
+
+def enforce_node_access(root, snapshot, force_ids=()):
+    """确认旧会话和 Reality 核心都已收回；失败不伪造销户成功。"""
+    root = Path(root)
+    blocked = sorted(set(force_ids) | {uid for uid, info in snapshot.get('users', {}).items()
+                                      if not user_access_allowed(info)})
+    cfg_path = root / 'usage-meter-config.json'
+    cfg = json.loads(cfg_path.read_text(encoding='utf-8')) if cfg_path.exists() else {}
+    if blocked:
+        hc = cfg.get('hysteria', {})
+        url = str(hc.get('url', '')).rstrip('/')
+        if not re.fullmatch(r'http://(?:127\.0\.0\.1|\[::1\]):[0-9]+', url):
+            raise RuntimeError('cannot confirm Hy2 revocation: loopback stats unavailable')
+        def request_stats(path, payload=None):
+            req = urllib.request.Request(url + path, data=json.dumps(payload).encode() if payload is not None else None,
+                                         headers={'Authorization': hc['secret'], 'Content-Type':'application/json'})
+            with urllib.request.urlopen(req, timeout=4) as response:
+                raw=response.read()
+            return json.loads(raw) if raw.strip() else {}
+        online=request_stats('/online')
+        active=[uid for uid in blocked if int(online.get(uid, 0)) > 0]
+        if active:
+            request_stats('/kick', active)
+            time.sleep(0.2)
+            online=request_stats('/online')
+            if any(int(online.get(uid, 0)) > 0 for uid in active):
+                # 标准核心只在下一次传输消费 kick；闲置/多实例需确保全部会话关闭。
+                subprocess.run(['systemctl','restart','hysteria-server'],capture_output=True,timeout=12,check=True)
+                subprocess.run(['systemctl','is-active','--quiet','hysteria-server'],capture_output=True,timeout=4,check=True)
+                online=request_stats('/online')
+                if any(int(online.get(uid, 0)) > 0 for uid in active):
+                    raise RuntimeError('Hy2 sessions still present after revocation')
+    xj=root/'xray.json'
+    if not xj.exists():
+        return True
+    original=xj.read_bytes()
+    xcfg=json.loads(original)
+    inbound=next((i for i in xcfg.get('inbounds',[]) if i.get('protocol')=='vless' and
+                  i.get('streamSettings',{}).get('security')=='reality'),None)
+    if inbound is None:
+        return True
+    wanted=reality_clients(snapshot)
+    signature=hashlib.sha256(json.dumps(wanted,sort_keys=True).encode()).hexdigest()
+    epoch=subprocess.run(['systemctl','show','xray','--property=InvocationID','--value'],capture_output=True,text=True,timeout=4,check=True).stdout.strip()
+    if inbound.get('settings',{}).get('clients')==wanted and _ACCESS_APPLIED.get(str(root))==(signature,epoch):
+        return True
+    # 首次升级/删除请求也核验实际重载，不能仅比较磁盘配置。
+    if not blocked and not force_ids and inbound.get('settings',{}).get('clients')==wanted:
+        return True
+    inbound.setdefault('settings',{})['clients']=wanted
+    candidate=xj.with_name('xray.expiry-candidate.json')
+    candidate.write_text(json.dumps(xcfg,indent=2),encoding='utf-8')
+    candidate.chmod(xj.stat().st_mode & 0o777)
+    binary=cfg.get('reality',{}).get('binary','/usr/local/bin/xray')
+    replaced=False
+    try:
+        subprocess.run([binary,'run','-test','-c',str(candidate)],capture_output=True,timeout=10,check=True)
+        if xj.read_bytes()!=original:
+            raise RuntimeError('Reality configuration changed concurrently; retry')
+        shutil.copy2(xj,xj.with_name('xray.expiry-last-good.json'))
+        candidate.replace(xj); replaced=True
+        state=subprocess.run(['systemctl','is-active','xray'],capture_output=True,text=True,timeout=4).stdout.strip()
+        if state in ('inactive','failed'):
+            _ACCESS_APPLIED[str(root)]=(signature,epoch)
+            return True
+        subprocess.run(['systemctl','reset-failed','xray'],capture_output=True,timeout=4,check=True)
+        subprocess.run(['systemctl','restart','xray'],capture_output=True,timeout=12,check=True)
+        subprocess.run(['systemctl','is-active','--quiet','xray'],capture_output=True,timeout=4,check=True)
+        epoch=subprocess.run(['systemctl','show','xray','--property=InvocationID','--value'],capture_output=True,text=True,timeout=4,check=True).stdout.strip()
+        if not epoch:raise RuntimeError('missing Reality runtime epoch')
+        _ACCESS_APPLIED[str(root)]=(signature,epoch)
+        return True
+    except Exception:
+        if replaced:
+            candidate.write_bytes(original);candidate.replace(xj)
+            subprocess.run(['systemctl','restart','xray'],capture_output=True,timeout=12)
+        raise
+    finally:
+        candidate.unlink(missing_ok=True)
+
+
 def reality_clients(data):
     """生成 xray inbound.settings.clients —— 每个**在用**的 Hy2 用户一个 VLESS 身份。
 
@@ -2567,7 +2659,7 @@ def reality_clients(data):
         # 缺 status 视为 active —— 与 handle_auth 的判据保持同源
         # （那边也是 `info.get('status', 'active') == 'active'`），
         # 两处判据必须一致，否则又会出现「一处放行、一处拒绝」的矛盾状态。
-        if info.get('status', 'active') != 'active':
+        if not user_access_allowed(info):
             continue
         clients.append({'id': uid_uuid, 'flow': 'xtls-rprx-vision', 'email': uid})
     if not clients:
@@ -3123,6 +3215,34 @@ def serve(path):
 
     # 实时速率计算滑动窗口数据结构: {uid: [(timestamp, total_bytes_tx, total_bytes_rx)]}
     speed_tracker = {}
+
+    access_apply_lock = threading.RLock()
+    def apply_access(force_ids=()):
+        with access_apply_lock:
+            with data_lock:
+                pending=set(data.get('_pending_revocations', [])) | set(force_ids)
+                snapshot=copy.deepcopy(data)
+            try:
+                enforce_node_access(portal_path.parent,snapshot,pending)
+            except Exception as exc:
+                with data_lock:
+                    data['_pending_revocations']=sorted(pending)
+                    save_data()
+                print('[expiry] access enforcement failed: '+type(exc).__name__,file=sys.stderr)
+                return False
+            with data_lock:
+                data.pop('_pending_revocations',None)
+                save_data()
+            return True
+    def expiry_access_worker():
+        while True:
+            try:
+                with data_lock:
+                    needed=bool(data.get('_pending_revocations')) or any(not user_access_allowed(u) for u in data.get('users',{}).values())
+                if needed:apply_access()
+            except Exception as exc:
+                print('[expiry] worker retry: '+type(exc).__name__,file=sys.stderr)
+            time.sleep(5)
 
     def save_data():
         with data_lock:
@@ -3710,30 +3830,7 @@ if __name__ == '__main__':
 
     class Handler(BaseHTTPRequestHandler):
         def _sync_reality_clients(self):
-            """Synchronize only existing Reality configs; keep an intentionally stopped service off."""
-            xj = Path('/etc/hysteria/xray.json')
-            if not xj.exists():
-                return False
-            with reality_apply_lock:
-                try:
-                    cfg = json.loads(xj.read_text(encoding='utf-8'))
-                    vless = next((i for i in cfg.get('inbounds', [])
-                        if i.get('protocol') == 'vless' and
-                        (i.get('streamSettings') or {}).get('security') == 'reality'), None)
-                    if vless is None:
-                        return False
-                    with data_lock:
-                        vless.setdefault('settings', {})['clients'] = reality_clients(data)
-                    vless['settings']['decryption'] = 'none'
-                    active = subprocess.run(['systemctl', 'is-active', 'xray'], capture_output=True,
-                                            text=True, timeout=3).stdout.strip() == 'active'
-                    if active:
-                        self._reality_restart_allowed()
-                    apply_xray_config_transaction(cfg, config_path=str(xj),
-                                                  binary=str(Path('/usr/local/bin/xray')), restart=active)
-                    return True
-                except Exception:
-                    return False
+            return apply_access()
 
         def _reality_restart_allowed(self, min_interval=3.0):
             """节流：min_interval 秒内只放行一次 xray 重启。
@@ -4086,7 +4183,7 @@ if __name__ == '__main__':
                     if matched_user.get('status') != 'active':
                         return self.reply_json(200, {'ok': False, 'msg': 'User account inactive'})
 
-                    if matched_user.get('expires_at', 0) < now_ts:
+                    if matched_user.get('expires_at', 0) <= now_ts:
                         return self.reply_json(200, {'ok': False, 'msg': 'User account expired'})
 
                     # -------- 流量限额检查与增量累加 -------- #
@@ -4210,7 +4307,7 @@ if __name__ == '__main__':
                         if not self._sync_reality_clients():
                             return self.reply_json(503, {'ok': False, 'error': 'Reality sync failed; retry required'})
                     else:
-                        if Path('/etc/hysteria/xray.json').exists() and not self._sync_reality_clients():
+                        if not self._sync_reality_clients():
                             return self.reply_json(503, {'ok': False, 'error': 'Reality sync failed; retry required'})
 
                     m = json.loads(meta_path.read_text(encoding='utf-8')) if meta_path.exists() else {}
@@ -4269,7 +4366,7 @@ if __name__ == '__main__':
                         result = {k: v for k, v in u.items() if k != 'password'}
                     regenerate_page()
                     # 即使同值也重试权威同步；不得因上次写入已落盘而吞掉重载失败。
-                    if Path('/etc/hysteria/xray.json').exists() and not self._sync_reality_clients():
+                    if not self._sync_reality_clients():
                         return self.reply_json(503, {'ok': False, 'error': 'Reality sync failed; retry required'})
                     return self.reply_json(200, {'ok': True, 'user_id': user_id, 'user': result})
 
@@ -4301,6 +4398,7 @@ if __name__ == '__main__':
                     if user_id == MASTER_USER_ID:
                         return self.reply_json(400, {'ok': False, 'error': 'Cannot delete the master account'})
                     with data_lock:
+                        data['_pending_revocations']=sorted(set(data.get('_pending_revocations',[])) | {user_id})
                         if user_id in data.get('users', {}):
                             del data['users'][user_id]
                             if user_id in ip_tracker:
@@ -4312,13 +4410,10 @@ if __name__ == '__main__':
                             deleted = True
                         else:
                             deleted = False
-                    if deleted:
-                        regenerate_page()
-                        # 把 clients 变更热重载到 xray（不装 Reality 时静默跳过）
-                        if Path('/etc/hysteria/xray.json').exists() and not self._sync_reality_clients():
-                            return self.reply_json(503, {'ok': False, 'error': 'Reality revocation sync failed; retry required'})
-                        return self.reply_json(200, {'ok': True, 'message': 'User deleted'})
-                    return self.reply_json(404, {'ok': False, 'error': 'User not found'})
+                    regenerate_page()
+                    if not apply_access([user_id]):
+                        return self.reply_json(503, {'ok': False, 'error': 'Access revocation pending; retry required'})
+                    return self.reply_json(200, {'ok': True, 'message': 'User deleted' if deleted else 'User already absent; revocation confirmed'})
 
                 elif sub == 'users/set_status':
                     # 可恢复的停用/启用：只改 status，不动密码/到期/已用流量。
@@ -4356,7 +4451,7 @@ if __name__ == '__main__':
                     # 只在**状态真的变了**时才同步：重复调用同一状态
                     # （changed=False）不该触发 xray 重载 —— 面板可能轮询式调用，
                     # 每次都重启会撞 systemd 的 start-limit（10-03 踩过）。
-                    if Path('/etc/hysteria/xray.json').exists() and not self._sync_reality_clients():
+                    if not self._sync_reality_clients():
                         return self.reply_json(503, {'ok': False, 'error': 'Reality sync failed; retry required'})
                     return self.reply_json(200, {
                         'ok': True,
@@ -5285,12 +5380,17 @@ WantedBy=multi-user.target
                         if user_id not in data.get('users', {}):
                             return self.reply(404, b'User not found')
                         if user_id in data.get('users', {}):
+                            data['_pending_revocations']=sorted(set(data.get('_pending_revocations',[])) | {user_id})
                             del data['users'][user_id]
                             if user_id in ip_tracker:
                                 del ip_tracker[user_id]
 
-                if data.get('reality_config') and not self._sync_reality_clients():
+                regenerate_page()
+                if not self._sync_reality_clients():
                     with data_lock:
+                        if action == 'delete':
+                            save_data()
+                            return self.reply(503, b'Access revocation pending; retry required')
                         if previous_user is None:
                             data.get('users', {}).pop(user_id, None)
                         else:
@@ -6623,6 +6723,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
 
     if usage_meter is not None:
         usage_meter.start()
+    threading.Thread(target=expiry_access_worker,name="portal-expiry-enforcer",daemon=True).start()
     server.serve_forever()
 
 

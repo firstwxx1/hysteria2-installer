@@ -210,12 +210,13 @@ class WebWorkflowTests(unittest.TestCase):
         self.assertEqual(status, 503)
         self.assertNotIn('qa-user', self.data['users'])
 
-    def test_web_delete_restores_record_when_reality_sync_fails(self):
+    def test_web_delete_persists_revocation_when_reality_sync_fails(self):
         old = {'password': 'original-test-only', 'used_bytes': 99}
         self.data['users']['qa-user'] = dict(old)
         self.sync.return_value = False
         self.assertEqual(self.invoke('_h_post_manage_user', {'action': 'delete', 'user_id': 'qa-user'})[0], 503)
-        self.assertEqual(self.data['users']['qa-user'], old)
+        self.assertNotIn('qa-user', self.data['users'])
+        self.assertIn('qa-user', self.data['_pending_revocations'])
 
     def test_http_proxy_username_with_colon_is_rejected(self):
         status, _ = self.invoke('_h_post_manage_proxy', {'action': 'create', 'type': 'http',
@@ -253,12 +254,15 @@ class WebWorkflowTests(unittest.TestCase):
         config = {'inbounds': [{'protocol': 'vless', 'streamSettings': {'security': 'reality'},
                                'settings': {'clients': []}}]}
         (self.hdir / 'xray.json').write_text(json.dumps(config))
-        self.run.return_value = SimpleNamespace(returncode=3, stdout='inactive', stderr='')
-        apply = Mock()
-        self.ns['apply_xray_config_transaction'] = apply
-        result = extract_method('_sync_reality_clients', self.ns)(self.handler)
+        calls=[]
+        def run(args,**kwargs):
+            calls.append(args)
+            return SimpleNamespace(returncode=0,stdout='inactive' if args[:2]==['systemctl','is-active'] else 'fixture-epoch',stderr='')
+        self.ns['apply_access']=lambda:portal.enforce_node_access(self.hdir,{'users':{}})
+        with patch.object(portal.subprocess,'run',side_effect=run):
+            result=extract_method('_sync_reality_clients',self.ns)(self.handler)
         self.assertTrue(result)
-        self.assertFalse(apply.call_args.kwargs['restart'])
+        self.assertFalse(any(args[:2]==['systemctl','restart'] for args in calls))
 
     def test_reality_generation_failure_preserves_old_keys_and_extra_routes(self):
         config = {'inbounds': [{'protocol': 'vless', 'streamSettings': {'security': 'reality'},

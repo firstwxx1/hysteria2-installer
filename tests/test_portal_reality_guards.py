@@ -19,26 +19,17 @@ class TestRealityClientSyncGuards(unittest.TestCase):
     """
 
     def test_source_has_existence_guard(self):
-        """源码级钉死：必须先判断 xray.json 存在再动手。"""
-        import inspect
-        src = inspect.getsource(portal.serve)
-        i = src.find('def _sync_reality_clients')
-        self.assertGreater(i, 0, '找不到 _sync_reality_clients')
-        body = src[i:i + 1200]
-        self.assertIn("Path('/etc/hysteria/xray.json')", body)
-        self.assertIn('if not xj.exists()', body,
-                      '必须在写盘前判断 xray.json 存在，否则会给未装 Reality 的节点'
-                      '凭空创建配置')
-        self.assertIn('return False', body, '不该装时必须静默跳过而不是抛错')
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d)
+            self.assertTrue(portal.enforce_node_access(root,{'users':{}}))
+            self.assertFalse((root/'xray.json').exists())
 
     def test_source_handles_unreadable_json(self):
-        import inspect
-        src = inspect.getsource(portal.serve)
-        i = src.find('def _sync_reality_clients')
-        body = src[i:src.find('def _reality_restart_allowed', i)]
-        self.assertIn("json.loads(xj.read_text(encoding='utf-8'))", body)
-        # 解析失败也要 return False 而不是崩
-        self.assertIn('except Exception', body)
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d);(root/'xray.json').write_text('invalid',encoding='utf-8')
+            with self.assertRaises(json.JSONDecodeError):
+                portal.enforce_node_access(root,{'users':{}})
+            self.assertEqual((root/'xray.json').read_text(encoding='utf-8'),'invalid')
 
 
 class TestEncodingHardening(unittest.TestCase):
