@@ -4413,7 +4413,7 @@ if __name__ == '__main__':
                     regenerate_page()
                     if not apply_access([user_id]):
                         return self.reply_json(503, {'ok': False, 'error': 'Access revocation pending; retry required'})
-                    return self.reply_json(200, {'ok': True, 'message': 'User deleted' if deleted else 'User already absent; revocation confirmed'})
+                    return self.reply_json(200, {'ok': True, 'access_revoked': True, 'message': 'User deleted' if deleted else 'User already absent; revocation confirmed'})
 
                 elif sub == 'users/set_status':
                     # 可恢复的停用/启用：只改 status，不动密码/到期/已用流量。
@@ -4459,6 +4459,7 @@ if __name__ == '__main__':
                         'status': want,
                         # changed=false 表示本来就是该状态（幂等）。
                         # 调用方据此区分"真的改了"与"重复调用"。
+                        'access_revoked': want != 'active',
                         'changed': before != want,
                     })
 
