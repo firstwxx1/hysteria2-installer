@@ -682,6 +682,26 @@ def atomic_write_private(path, payload):
             os.close(dfd)
 
 
+def portal_update_restart_script(port, backups, created, wait_seconds=20):
+    """面板自更新后的重启脚本：起不来就自动回滚到旧版本。
+
+    门户同时是 Hy2 的鉴权后端和 Teyir 管理节点的唯一入口。新版本一旦启动即崩，
+    全节点用户连不上，控制台也没法远程修 —— 所以重启后轮询 /api/health，
+    限时内没有响应就把 .bak 换回去、删掉本次新增的文件，再重启一次。
+    """
+    probe = ("import urllib.request; "
+             "urllib.request.urlopen('http://127.0.0.1:%d/api/health', timeout=2).read()"
+             % int(port))
+    restore = ' '.join('cp -f %s %s;' % (shlex.quote(str(bak)), shlex.quote(str(dest)))
+                       for dest, bak in backups)
+    remove = ' '.join('rm -f %s;' % shlex.quote(str(dest)) for dest in created)
+    return ('sleep 1; systemctl restart hysteria-portal; '
+            'for i in $(seq 1 %d); do sleep 1; python3 -c %s && exit 0; done; '
+            'logger -t hysteria-portal "面板更新后未能启动，已自动回滚到旧版本"; '
+            '%s %s systemctl restart hysteria-portal'
+            % (int(wait_seconds), shlex.quote(probe), restore, remove))
+
+
 def resolve_update_ref(ref):
     if re.fullmatch(r'[0-9a-f]{40}', ref):
         return ref
@@ -2604,6 +2624,35 @@ def _systemd_state(unit):
         return ''
 
 
+def firewall_port(port, proto='tcp', open_=True):
+    """在本机防火墙（ufw / firewalld，仅当它们正在运行）上放行或收回一个端口。
+
+    尽力而为：防火墙操作失败不影响调用方的结果，只记日志。
+    Hy2 与 AWG 的端口由安装脚本放行；门户自己装的 Reality 和 GOST 代理端口要在这里处理，
+    否则开着防火墙的系统上本机探测一切正常，外网却连不上。
+    """
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        return
+    if not 1 <= port <= 65535 or proto not in ('tcp', 'udp'):
+        return
+    spec = '%d/%s' % (port, proto)
+    try:
+        if shutil.which('ufw'):
+            status = subprocess.run(['ufw', 'status'], capture_output=True, text=True, timeout=10).stdout
+            if status.startswith('Status: active'):
+                cmd = ['ufw', 'allow', spec] if open_ else ['ufw', 'delete', 'allow', spec]
+                subprocess.run(cmd, capture_output=True, timeout=15)
+        if shutil.which('firewall-cmd') and _systemd_state('firewalld') == 'active':
+            flag = '--add-port=' if open_ else '--remove-port='
+            subprocess.run(['firewall-cmd', '--zone=public', flag + spec, '--permanent'],
+                           capture_output=True, timeout=15)
+            subprocess.run(['firewall-cmd', '--reload'], capture_output=True, timeout=15)
+    except Exception as exc:
+        _log_ignored('firewall_port', exc)
+
+
 def password_taken(users, pwd, owner_uid):
     """pwd 是否已被 owner_uid 以外的用户（含机主）占用。调用方须持有 data_lock。
 
@@ -2997,7 +3046,9 @@ def artifacts(m, auth_override=None, name_override=None, reality=None, user_id=N
                 password=password, tls=dict(enabled=True, server_name=server_name, insecure=is_insecure))
     if hop_port_range:
         proxy['ports'] = str(listen_port) + ',' + hop_port_range
-        sing['server_ports'] = [str(listen_port), hop_port_range.replace('-', ':')]
+        # sing-box 的 server_ports 每一项都必须是「起:止」区间（sing-quic ParsePorts），
+        # 单写 "443" 会报 bad port range、整份配置加载失败。
+        sing['server_ports'] = [f'{listen_port}:{listen_port}', hop_port_range.replace('-', ':')]
         del sing['server_port']
     if obfs_password:
         proxy.update({'obfs': 'salamander', 'obfs-password': obfs_password})
@@ -4264,6 +4315,8 @@ if __name__ == '__main__':
                 with data_lock:
                     data['reality_config'] = new_rcfg
                 save_data()
+            # Reality 走 TCP；开着 ufw / firewalld 时不放行，外网就连不上。
+            firewall_port(new_rcfg.get('port'), 'tcp', open_=True)
             return clients
 
         server_version = 'Gateway'
@@ -4892,6 +4945,9 @@ if __name__ == '__main__':
                     return self.reply_json(400, {'ok': False, 'error': 'Invalid target'})
 
                 if target == 'reality-online':
+                    # 开启在线统计要重启 xray；流量超额停用期间重启等于替 Reality 解除停用。
+                    if unit_suspended('xray'):
+                        return self.reply_json(409, {'ok': False, 'error': '节点因流量超额停用中，请在控制台恢复节点后再开启'})
                     cfg_path = portal_path.parent / 'usage-meter-config.json'
                     cfg = json.loads(cfg_path.read_text(encoding='utf-8')).get('reality', {})
                     spec = importlib.util.spec_from_file_location('reality_online_config', Path(__file__).parent / 'usage-meter-xray-config-20261007-v1.py')
@@ -4940,6 +4996,7 @@ if __name__ == '__main__':
 
                     base_dir = PORTAL_SELF.parent
                     backups = []
+                    created = []
                     changed = False
                     try:
                         for fname, content in fetched:
@@ -4953,6 +5010,8 @@ if __name__ == '__main__':
                                 bak = Path(str(dest) + '.bak')
                                 shutil.copy2(str(dest), str(bak))
                                 backups.append((dest, bak))
+                            else:
+                                created.append(dest)
                             tmp = str(dest) + '.new'
                             with open(tmp, 'wb') as fh:
                                 fh.write(content)
@@ -4966,6 +5025,8 @@ if __name__ == '__main__':
                                 shutil.copy2(str(bak), str(dest))
                             except Exception as exc:
                                 _log_ignored('portal_update.rollback', exc)
+                        for dest in created:
+                            Path(dest).unlink(missing_ok=True)
                         return self.reply_json(500, {'ok': False, 'error':
                             '更新过程中出错，已回滚到原版本：%s' % e})
 
@@ -4975,7 +5036,7 @@ if __name__ == '__main__':
                     # 延迟重启，且必须脱离当前会话：本进程马上会被 systemctl 杀掉，
                     # 不脱离的话重启命令会跟着一起死（start_new_session=True）。
                     subprocess.Popen(
-                        ['bash', '-c', 'sleep 1; systemctl restart hysteria-portal'],
+                        ['bash', '-c', portal_update_restart_script(data['port'], backups, created)],
                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                         start_new_session=True)
                     return self.reply_json(200, {'ok': True, 'target': target,
@@ -5087,7 +5148,12 @@ if __name__ == '__main__':
                     return 500, {'ok': False, 'applied': False,
                         'error': 'GOST 配置未成功应用或端口未监听，代理记录已恢复；请检查服务日志'}
                 if action == 'delete':
+                    for item in previous:
+                        if item.get('id') == proxy_id:
+                            firewall_port(item.get('port'), 'tcp', open_=False)
                     return 200, {'ok': True, 'applied': True, 'message': 'Proxy service deleted'}
+                # 开着 ufw / firewalld 的系统上不放行的话，本机探测一切正常、外网却连不上。
+                firewall_port(port, 'tcp', open_=True)
                 m = json.loads(meta_path.read_text(encoding='utf-8')) if meta_path.exists() else {}
                 host = m.get('public_ip', '127.0.0.1') if m.get('is_insecure') else m.get('server_name', 'localhost')
                 host_part = '[' + host + ']' if ':' in host and not host.startswith('[') else host
@@ -5952,6 +6018,10 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 return self.reply_json(500, {'ok': False, 'error': f'执行异常: {str(e)}'})
 
         def do_GET(self):
+            # 存活探针：面板自更新后据此判断新版本是否真的起来了（失败则回滚）。
+            # 无需鉴权、不含任何数据，只回答「进程活着且能处理请求」。
+            if self.path.split('?', 1)[0] == '/api/health':
+                return self.reply_json(200, {'ok': True})
             if self.path.startswith('/api/v1/'):
                 if not self.check_rate_limit(bucket='api'):
                     return self.reply(429, b'Too many requests')
