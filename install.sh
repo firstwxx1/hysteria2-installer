@@ -570,6 +570,59 @@ _cert_matches_domain() {
     grep -qiE "(^|[^a-zA-Z0-9.-])${domain//./\\.}([^a-zA-Z0-9.-]|$)" <<<"$txt"
 }
 
+# ------------------------------------------------------------------------------
+# 对外占位页（防主动探测）
+#
+# 🔴 以前借 Caddy 签证书时追加的站点块是 `respond "hy2 cert holder" 200` ——
+#    任何人打开这个域名都能看到「这是 hy2 节点」，主动探测一眼就能认出来。
+#    现在只返回一个普通的「建设中」占位页：标题是域名本身，不含任何代理、
+#    协议、软件名字样，看上去和无数停放中的域名一样。
+# ------------------------------------------------------------------------------
+caddy_decoy_directives() {
+    local domain="$1"
+    # Caddyfile 的反引号字符串可以多行、不做转义；正文里不能出现反引号。
+    cat <<DEOF
+	header Content-Type "text/html; charset=utf-8"
+	header -Server
+	respond \`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${domain}</title><style>body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;font:16px/1.6 -apple-system,Segoe UI,Helvetica,Arial,sans-serif;color:#444;background:#fafafa}main{text-align:center;padding:24px}h1{font-weight:500;font-size:22px;margin:0 0 8px}p{margin:0;color:#888}</style></head><body><main><h1>${domain}</h1><p>This site is under construction.</p></main></body></html>\` 200
+DEOF
+}
+
+# 把老装机遗留的 `respond "hy2 cert holder" 200` 换成占位页。
+# 备份 → 替换 → caddy validate → reload；任何一步失败都回滚，绝不留下坏配置。
+scrub_caddy_identity() {
+    local cf="/etc/caddy/Caddyfile" bak tmp domain
+    [[ -f "$cf" ]] || return 0
+    grep -q 'respond "hy2 cert holder"' "$cf" 2>/dev/null || return 0
+    command -v caddy >/dev/null 2>&1 || return 0
+    bak="${cf}.bak-scrub-$(date +%Y%m%d-%H%M%S)"
+    cp -a "$cf" "$bak" || return 1
+    tmp="$(mktemp)"
+    # 逐行处理：遇到自报身份的 respond 行，用它所在站点块的域名生成占位页。
+    domain=""
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" =~ ^([A-Za-z0-9.-]+)[[:space:]]*\{[[:space:]]*$ ]]; then
+            domain="${BASH_REMATCH[1]}"
+        fi
+        if [[ "$line" == *'respond "hy2 cert holder"'* ]]; then
+            caddy_decoy_directives "${domain:-localhost}" >>"$tmp"
+            continue
+        fi
+        if [[ "$line" == "# Hysteria 2 节点证书专用站点（由 install.sh 自动追加）" ]]; then
+            line="# 证书签发站点（由 install.sh 自动追加）"
+        fi
+        printf '%s\n' "$line" >>"$tmp"
+    done <"$cf"
+    cat "$tmp" >"$cf"; rm -f "$tmp"
+    if ! caddy validate --config "$cf" --adapter caddyfile >/dev/null 2>&1; then
+        cp -a "$bak" "$cf"
+        log_warn "Caddy 占位页替换后校验不通过，已回滚（备份 ${bak}）"
+        return 1
+    fi
+    systemctl reload caddy 2>/dev/null || systemctl restart caddy 2>/dev/null || true
+    log_info "已把 Caddy 上自报身份的证书站点换成普通占位页（备份 ${bak}）"
+}
+
 # 🔴 让已占端口的 Caddy 为某域名签一张证书（复用它的自动签发能力）。
 # 不改动用户已有的 Caddyfile 逻辑，只**追加**一个极小的站点块，
 # 签完证书由 Caddy 保管、Hysteria 只读，续期也由 Caddy 负责。
@@ -596,12 +649,11 @@ setup_cert_via_existing_caddy() {
     if ! grep -qE "^[[:space:]]*${domain//./\\.}([[:space:]]|\{)" "$cf"; then
         cat >> "$cf" <<CEOF
 
-# Hysteria 2 节点证书专用站点（由 install.sh 自动追加）
+# 证书签发站点（由 install.sh 自动追加）
 # 用途：本机 80/443 已被 Caddy 占用，内置 ACME 无法自行签发，
-# 故借 Caddy 之手签发并保管，Hysteria 只读证书文件。
-# Hysteria 主监听是 UDP 端口，与本反代不冲突。
+# 故借 Caddy 之手签发并保管证书。对外只返回一个普通的占位页。
 ${domain} {
-	respond "hy2 cert holder" 200
+$(caddy_decoy_directives "$domain")
 }
 CEOF
     fi
@@ -3736,6 +3788,7 @@ if [[ $# -gt 0 ]]; then
             ;;
         update)
             require_installed || exit 1
+            scrub_caddy_identity || true
             install_binary
             traffic_suspended || restart_service
             ;;
@@ -3743,6 +3796,7 @@ if [[ $# -gt 0 ]]; then
             show_client_configs
             ;;
         refresh-page)
+            scrub_caddy_identity || true
             refresh_portal
             ;;
         status)
