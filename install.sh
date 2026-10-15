@@ -330,6 +330,24 @@ install_binary() {
 # 3. 证书处理模块（自签名 / 自有证书 / ACME 域名证书）
 setup_certificates() {
     mkdir -p "$HY2_CERT_DIR"
+    # 迁移准备阶段复用已验证的证书，不提前切换DNS来申请新证书。
+    if [[ -n "${HY2_CUSTOM_CERT_FILE:-}" || -n "${HY2_CUSTOM_KEY_FILE:-}" ]]; then
+        [[ -r "${HY2_CUSTOM_CERT_FILE:-}" && -r "${HY2_CUSTOM_KEY_FILE:-}" ]] || { log_err "迁移证书文件不可读"; return 1; }
+        openssl x509 -in "$HY2_CUSTOM_CERT_FILE" -noout -checkend 3600 >/dev/null || { log_err "迁移证书无效或即将过期"; return 1; }
+        openssl pkey -in "$HY2_CUSTOM_KEY_FILE" -noout >/dev/null 2>&1 || { log_err "迁移私钥无效"; return 1; }
+        local cert_pub key_pub
+        cert_pub=$(openssl x509 -in "$HY2_CUSTOM_CERT_FILE" -pubkey -noout | openssl pkey -pubin -outform DER | sha256sum | cut -d' ' -f1)
+        key_pub=$(openssl pkey -in "$HY2_CUSTOM_KEY_FILE" -pubout -outform DER | sha256sum | cut -d' ' -f1)
+        [[ "$cert_pub" == "$key_pub" ]] || { log_err "迁移证书与私钥不匹配"; return 1; }
+        CERT_TYPE="custom"
+        CERT_FILE="$HY2_CUSTOM_CERT_FILE"
+        KEY_FILE="$HY2_CUSTOM_KEY_FILE"
+        SERVER_NAME="${HY2_DOMAIN:-$PUBLIC_IP}"
+        IS_INSECURE="${HY2_CUSTOM_INSECURE:-false}"
+        log_info "已复用迁移证书，未改动DNS。"
+        return
+    fi
+
     
     echo -e "\n${CYAN}------------------------------------------------------------${PLAIN}"
     echo -e "${GREEN}TLS 证书配置方式：${PLAIN}"
