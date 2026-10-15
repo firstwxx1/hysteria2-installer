@@ -3272,10 +3272,40 @@ def refresh(meta_path, config_path='/etc/hysteria/config.yaml'):
     # 要消灭的失败模式，只是从下一层又冒了出来。
     sync_download_artifacts(data, uri, clash, sing)
     
-    temporary = path.with_suffix('.tmp')
-    temporary.write_text(json.dumps(data, ensure_ascii=False), encoding='utf-8')
-    temporary.chmod(0o600)
-    temporary.replace(path)
+    # 域名 / 订阅端口改过之后，交给控制台的门户地址也要跟上（token 与凭据不变）。
+    access_url = f"https://{host}:{resolve_subscription_port(m)[0]}/{data['token']}/"
+    if access.get('url') != access_url:
+        access['url'] = access_url
+        atomic_write_private(root / 'portal-access.json', json.dumps(access, ensure_ascii=False).encode('utf-8'))
+    atomic_write_private(path, json.dumps(data, ensure_ascii=False).encode('utf-8'))
+
+
+def adopt(meta_path, port, node_api_key=None):
+    """「重新修改配置 / 重新安装」时沿用现有门户，而不是 prepare() 推倒重建。
+
+    prepare() 会重新生成 token、门户账号密码、session_secret、API Key，并把用户表
+    清成只剩机主 —— 对 Teyir 管理的节点，这等于控制台保存的凭据全部失效、
+    控制台开的子账号与代理服务全部丢失。这里只更新本次确实变了的东西：
+    门户本地端口、机主密码（= Hy2 认证密码）、以及调用方显式给出的新 API Key，
+    其余数据原样保留，再交给 refresh() 按新的节点参数重建页面与订阅。
+    """
+    root = Path(meta_path).parent
+    m = json.loads(Path(meta_path).read_text(encoding='utf-8'))
+    path = root / 'portal.json'
+    data = json.loads(path.read_text(encoding='utf-8'))
+    access_path = root / 'portal-access.json'
+    access = json.loads(access_path.read_text(encoding='utf-8'))
+    data['port'] = int(port)
+    master = data.setdefault('users', {}).setdefault(MASTER_USER_ID, {
+        'expires_at': 2085974400, 'ip_limit': 0, 'limit_bytes': 0, 'used_bytes': 0,
+        'status': 'active', 'created_at': int(time.time()), 'note': 'Master Admin'})
+    master['password'] = m['auth_password']
+    if node_api_key:
+        data['api_key'] = node_api_key
+        access['api_key'] = node_api_key
+        atomic_write_private(access_path, json.dumps(access, ensure_ascii=False).encode('utf-8'))
+    atomic_write_private(path, json.dumps(data, ensure_ascii=False).encode('utf-8'))
+    refresh(meta_path)
 
 
 def selfheal(meta_path, config_path='/etc/hysteria/config.yaml'):
@@ -7115,6 +7145,8 @@ if __name__ == '__main__':
         prepare(sys.argv[2], sys.argv[3], api_key)
     elif _cmd == 'refresh':
         refresh(sys.argv[2])
+    elif _cmd == 'adopt':
+        adopt(sys.argv[2], sys.argv[3], sys.argv[4] if len(sys.argv) > 4 else None)
     elif _cmd == 'selfheal':
         # 供 systemd timer / path unit 调用；退出码恒 0（自愈失败不应让 timer 报错刷屏，
         # 真实失败原因已打到 stderr 由 journal 记录）。

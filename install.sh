@@ -107,11 +107,12 @@ if [[ "${HY2_CERT_TYPE:-}" == "3" && -z "${HY2_DOMAIN:-}" ]]; then
 fi
 
 # 中断保护：Ctrl+C 时明确告知状态，别让用户对着半成品不知所措
-trap '
+on_interrupt() {
     echo
     log_warn "已中断（Ctrl+C）。已完成的步骤不会回滚，重新运行脚本即可从当前状态继续。"
     exit 130
-' INT
+}
+trap on_interrupt INT
 
 # 1. 基础环境检查
 check_root() {
@@ -969,6 +970,14 @@ setup_ports_and_obfs() {
     fi
 
     # 运行模式选择 (单机私密 vs 商城集群 Agent 模式)
+    # 已装机时默认沿用当前模式与 API Key：原来一律默认「1 单机」并重新随机 API Key，
+    # Teyir 管理的节点改个端口、一路回车下来就变成单机模式，控制台开的用户全部连不上。
+    _cur_mode=1
+    _cur_api_key=""
+    if [[ -f "$HY2_CONFIG" ]] && awk '/^auth:/{f=1;next} /^[^ ]/{f=0} f&&/type: *http/{found=1} END{exit !found}' "$HY2_CONFIG"; then
+        _cur_mode=2
+        _cur_api_key="$(jq -r '.api_key // empty' "$HY2_DIR/portal.json" 2>/dev/null || true)"
+    fi
     if [[ -n "${HY2_NODE_MODE:-}" ]]; then
         node_mode_choice="$HY2_NODE_MODE"
         log_info "已使用环境变量 HY2_NODE_MODE=${node_mode_choice} 指定运行模式。"
@@ -977,16 +986,24 @@ setup_ports_and_obfs() {
         echo -e "  ${GREEN}1.${PLAIN} 单机私密模式 (默认：单用户/自用，提供 Web 信息中心)"
         echo -e "  ${GREEN}2.${PLAIN} 商城集群 Agent 模式 (开启 REST API 接口，支持动态开户/续费，对接商城)"
         echo -e "  ${YELLOW}拿不准就选 1${PLAIN}：自用或几个朋友共用选 1；要接发卡商城自动开户才选 2。"
-        read -rp "请输入选项 [1-2, 默认 1]: " node_mode_choice || true
-        node_mode_choice=${node_mode_choice:-1}
+        [[ "$_cur_mode" == "2" ]] && echo -e "  ${YELLOW}本机当前是 Agent 模式（已接入商城 / Teyir 控制台），回车保持不变。${PLAIN}"
+        read -rp "请输入选项 [1-2, 默认 ${_cur_mode}]: " node_mode_choice || true
+        node_mode_choice="$(echo "${node_mode_choice:-}" | tr -d '[:space:]')"
+        node_mode_choice=${node_mode_choice:-$_cur_mode}
     fi
 
     if [[ "$node_mode_choice" == "2" ]]; then
         NODE_MODE="agent"
-        RANDOM_API_KEY="hy2_sec_$(openssl rand -hex 16)"
-        read -rsp "请设置节点通信 API Key [回车自动生成]: " NODE_API_KEY; echo
-        NODE_API_KEY=${NODE_API_KEY:-$RANDOM_API_KEY}
-        log_info "当前已选：商城集群 Agent 模式 (Node API Key 已生成)"
+        if [[ -n "$_cur_api_key" ]]; then
+            read -rsp "请设置节点通信 API Key [回车沿用现有 Key，控制台无需改动]: " NODE_API_KEY || true; echo
+            NODE_API_KEY=${NODE_API_KEY:-$_cur_api_key}
+            log_info "当前已选：商城集群 Agent 模式"
+        else
+            RANDOM_API_KEY="hy2_sec_$(openssl rand -hex 16)"
+            read -rsp "请设置节点通信 API Key [回车自动生成]: " NODE_API_KEY || true; echo
+            NODE_API_KEY=${NODE_API_KEY:-$RANDOM_API_KEY}
+            log_info "当前已选：商城集群 Agent 模式 (Node API Key 已生成)"
+        fi
     else
         NODE_MODE="standalone"
         NODE_API_KEY=""
@@ -1176,6 +1193,21 @@ select_subscription_port() {
     # 选中它，就会出现"订阅端口用了黑名单端口"的自相矛盾，也与
     # 门户侧 `resolve_subscription_port` 的取值意图不符。
     # 直接从高位随机端口里挑，并用 bind 验证真实可用性。
+    #
+    # 沿用现有门户时两个端口都不能换：订阅端口是 Teyir 保存的门户地址和
+    # 每个客户订阅链接的一部分；门户本地端口写在 config.yaml 的 auth.url 里。
+    # （旧端口此刻正被运行中的服务占着，bind 检测必然失败，所以直接沿用。）
+    if [[ "${PRESERVE_PORTAL:-0}" == "1" ]]; then
+        local _old_sub _old_local
+        _old_sub="$(jq -r '.subscription_port // empty' "$HY2_META_FILE" 2>/dev/null || true)"
+        _old_local="$(jq -r '.port // empty' "$HY2_DIR/portal.json" 2>/dev/null || true)"
+        if is_valid_port "$_old_sub" && is_valid_port "$_old_local"; then
+            HY2_SUB_PORT="$_old_sub"
+            PORTAL_LOCAL_PORT="$_old_local"
+            log_info "沿用现有订阅端口 ${HY2_SUB_PORT} 与门户本地端口 ${PORTAL_LOCAL_PORT}。"
+            return 0
+        fi
+    fi
     HY2_SUB_PORT=$(python3 - <<'PYPORT'
 import socket, secrets
 RESERVED = {8443, 19898, 22, 80, 443, 40000, 56195}
@@ -2220,7 +2252,14 @@ refresh_portal() {
 
 setup_portal() {
     portal_ensure_py
-    python3 "$HY2_DIR/portal.py" prepare "$HY2_META_FILE" "$PORTAL_LOCAL_PORT" "$NODE_API_KEY"
+    if [[ "${PRESERVE_PORTAL:-0}" == "1" && -f "$HY2_DIR/portal.json" && -f "$HY2_DIR/portal-access.json" ]]; then
+        # 沿用现有门户：token、门户账号密码、API Key、全部用户与代理服务都保留，
+        # Teyir 控制台保存的凭据继续有效（见 portal.py adopt）。
+        python3 "$HY2_DIR/portal.py" adopt "$HY2_META_FILE" "$PORTAL_LOCAL_PORT" "$NODE_API_KEY"
+        log_info "已沿用现有门户的登录凭据、API Key 与全部用户。"
+    else
+        python3 "$HY2_DIR/portal.py" prepare "$HY2_META_FILE" "$PORTAL_LOCAL_PORT" "$NODE_API_KEY"
+    fi
     cat > /etc/systemd/system/hysteria-portal.service <<EOF
 [Unit]
 Description=Private HY2 information page (loopback only)
@@ -3259,26 +3298,78 @@ status_service() {
     systemctl status hysteria-server --no-pager || true
 }
 
+require_installed() {
+    if [[ ! -f "$HY2_BIN" || ! -f "$HY2_CONFIG" ]]; then
+        log_err "Hysteria 2 尚未安装，请先选择「1. 全新安装 Hysteria 2」。"
+        return 1
+    fi
+}
+
+# Teyir 控制台的整机流量超额停用是否生效中（门户在 portal.json 里记录）。
+traffic_suspended() {
+    [[ "$(jq -r '.traffic_suspend.suspended // false' "$HY2_DIR/portal.json" 2>/dev/null)" == "true" ]]
+}
+
+refuse_if_suspended() {
+    if traffic_suspended; then
+        log_warn "本节点正因流量超额被 Teyir 控制台停用，手动拉起服务会绕过流量限额。"
+        log_warn "请在控制台调整限额或等新计费周期，节点会自动恢复。"
+        return 1
+    fi
+}
+
 start_service() {
+    require_installed || return 1
+    refuse_if_suspended || return 1
     log_step "启动 Hysteria 2 服务..."
     systemctl start hysteria-server
-    log_info "已执行启动命令。"
+    log_info "已启动。"
 }
 
 stop_service() {
+    require_installed || return 1
     log_step "停止 Hysteria 2 服务..."
     systemctl stop hysteria-server
-    log_info "已执行停止命令。"
+    log_info "已停止。"
 }
 
 restart_service() {
+    require_installed || return 1
+    refuse_if_suspended || return 1
     log_step "重启 Hysteria 2 服务..."
     systemctl restart hysteria-server
-    log_info "已执行重启命令。"
+    log_info "已重启。"
+}
+
+restart_portal() {
+    require_installed || return 1
+    log_step "重启门户（私密信息页 / Hy2 鉴权后端 / 控制台 API）..."
+    systemctl restart hysteria-portal
+    log_info "已重启。"
+}
+
+# 接入 Teyir 控制台要填的四项，和网页上「接入 TEYIR 控制台」卡片里的一致。
+show_teyir_access() {
+    require_installed || return 1
+    local access="$HY2_DIR/portal-access.json"
+    [[ -f "$access" ]] || { log_err "未找到门户凭据文件 ${access}。"; return 1; }
+    echo -e "\n${CYAN}------------ 接入 Teyir 控制台 ------------${PLAIN}"
+    echo -e "门户地址 url     : ${GREEN}$(jq -r '.url // ""' "$access")${PLAIN}"
+    echo -e "门户用户名       : ${GREEN}$(jq -r '.username // ""' "$access")${PLAIN}"
+    echo -e "门户密码         : ${GREEN}$(jq -r '.password // ""' "$access")${PLAIN}"
+    local key; key="$(jq -r '.api_key // ""' "$access")"
+    if [[ -n "$key" ]]; then
+        echo -e "API Key (Bearer) : ${GREEN}${key}${PLAIN}"
+    else
+        echo -e "API Key (Bearer) : ${YELLOW}（单机模式未启用 API；要接入控制台请用第 4 项改为 Agent 模式）${PLAIN}"
+    fi
+    echo -e "${CYAN}--------------------------------------------${PLAIN}"
+    echo -e "${YELLOW}以上是节点的管理凭据，请勿外传。${PLAIN}"
 }
 
 view_logs() {
-    echo -e "${CYAN}正在查看 Hysteria 2 实时日志 (Ctrl+C 退出)...${PLAIN}"
+    require_installed || return 1
+    echo -e "${CYAN}正在查看 Hysteria 2 实时日志 (Ctrl+C 退出日志并返回菜单)...${PLAIN}"
     journalctl -u hysteria-server -f -n 50
 }
 
@@ -3372,22 +3463,155 @@ uninstall_all() {
 }
 
 # 主控制台菜单
-menu() {
-  while true; do
-    clear 2>/dev/null || true
-    echo -e "${CYAN}================================================================${PLAIN}"
-    echo -e "${GREEN}       Hysteria 2 全功能生产级管理脚本 (${HY2_ARCH:-$(uname -m)})         ${PLAIN}"
-    echo -e "${BLUE}       GitHub: https://github.com/yys9253462-gif/hysteria2-installer    ${PLAIN}"
-    echo -e "${CYAN}================================================================${PLAIN}"
-    
-    if [[ -f "$HY2_BIN" ]] && systemctl is-active hysteria-server >/dev/null 2>&1; then
-        echo -e "核心状态: ${GREEN}运行中 (Active)${PLAIN} | 版本: $($HY2_BIN version 2>/dev/null | grep -E '^Version:' | head -n1 || echo '未知')"
-    elif [[ -f "$HY2_BIN" ]]; then
-        echo -e "核心状态: ${RED}已停止 (Inactive)${PLAIN} | 版本: $($HY2_BIN version 2>/dev/null | grep -E '^Version:' | head -n1 || echo '未知')"
-    else
-        echo -e "核心状态: ${YELLOW}未安装 (Not Installed)${PLAIN}"
+# 菜单里每个动作都放进子 shell 里跑（子 shell 内重新打开 set -e，出错照样立刻停）。
+# 原来动作直接跑在菜单所在的 shell 里，set -e 让任何一步失败都把整个脚本带走
+# （没装时选 3、服务启动失败、WARP/GOST 下载失败、拿不到公网 IP……），
+# 用户直接被甩回 shell。现在失败只结束这一次操作，提示后回到菜单。
+run_action() {
+    local rc=0
+    set +e
+    ( set -e; "$@" )
+    rc=$?
+    set -e
+    if (( rc == 130 )); then
+        log_warn "操作已中断，已返回主菜单。已完成的步骤不会回滚。"
+    elif (( rc != 0 )); then
+        log_err "操作未完成（退出码 ${rc}），请查看上面的报错。已返回主菜单。"
     fi
-    # AmneziaWG 状态：仅在本机装了 AWG 时显示，避免干扰原有主流程
+    return 0
+}
+
+# 已装机时重装 / 改配置：默认沿用现有门户（登录凭据、API Key、订阅地址、全部用户），
+# 否则 Teyir 控制台保存的凭据全部失效、控制台开的用户与代理服务全部丢失。
+ask_preserve_portal() {
+    PRESERVE_PORTAL=0
+    [[ -f "$HY2_DIR/portal.json" && -f "$HY2_DIR/portal-access.json" ]] || return 0
+    echo
+    echo -e "${YELLOW}是否沿用现有门户？${PLAIN}（登录凭据、API Key、订阅地址、全部用户与代理服务保持不变）"
+    echo -e "  已接入 Teyir 控制台或已给客户发过订阅的节点，请务必选 Y。"
+    local keep=""
+    read -rp "沿用现有门户？[Y/n]: " keep || true
+    if [[ "$keep" =~ ^[Nn]$ ]]; then
+        log_warn "将重建门户：门户凭据、API Key、订阅地址都会换新，除机主外的用户会被清空。"
+    else
+        PRESERVE_PORTAL=1
+    fi
+}
+
+flow_install() {
+    check_root
+    check_arch
+    # 已装机再按「1」会重生成配置、可能换掉端口/密码/证书，
+    # 已发放的客户端配置随之失效 —— 必须让用户确认一次。
+    if [[ -f "$HY2_CONFIG" ]]; then
+        echo
+        log_warn "检测到本机已安装 Hysteria 2。"
+        log_warn "继续将重新生成服务端配置；若中途更换了端口/密码/证书，"
+        log_warn "已发放的客户端配置会失效，需要重新导出。"
+        local _reinstall_hint=""
+        read -rp "确定要重新安装吗？[y/N]: " _reinstall_hint || true
+        if [[ ! "$_reinstall_hint" =~ ^[Yy]$ ]]; then
+            log_info "已取消。如需修改端口/密码/证书，请用菜单第 4 项「重新修改配置」。"
+            return 0
+        fi
+        ask_preserve_portal
+        backup_state_before_reconfigure
+    fi
+    install_dependencies
+    get_public_ip
+    install_binary
+    setup_certificates
+    setup_ports_and_obfs
+    generate_server_config
+    setup_system_firewall "$LISTEN_PORT" "$HOP_START" "$HOP_END"
+    setup_systemd
+    show_client_configs
+}
+
+flow_update_core() {
+    check_root
+    check_arch
+    require_installed
+    install_binary
+    if traffic_suspended; then
+        log_warn "核心已更新；节点正因流量超额被 Teyir 停用，暂不重启，恢复时会自动用上新核心。"
+        return 0
+    fi
+    restart_service
+}
+
+flow_reconfigure() {
+    check_root
+    require_installed
+    # 🔴 改配置前必须警告 + 备份（2026-10-09 修）：
+    # 这条路径会整体重写 client_meta.json 并重建门户，原先一个字都没提示。
+    echo
+    log_warn "「重新修改配置」会重新生成服务端配置，请注意："
+    log_warn "  · 已发放的客户端配置若端口/证书/域名变化，将需要重新导出"
+    log_warn "  · 认证密码与混淆密钥默认保留，不会被随机换掉"
+    log_warn "  · 运行模式与 API Key 默认保持当前设置"
+    local _reconf_hint=""
+    read -rp "确定继续吗？[y/N]: " _reconf_hint || true
+    if [[ ! "$_reconf_hint" =~ ^[Yy]$ ]]; then
+        log_info "已取消。"
+        return 0
+    fi
+    ask_preserve_portal
+    backup_state_before_reconfigure
+    install_dependencies
+    get_public_ip
+    setup_certificates
+    setup_ports_and_obfs
+    generate_server_config
+    setup_system_firewall "$LISTEN_PORT" "$HOP_START" "$HOP_END"
+    setup_systemd
+    show_client_configs
+}
+
+flow_warp() { check_root; install_warp_local_proxy; }
+flow_gost() { check_root; install_gost; }
+flow_uninstall() { check_root; uninstall_all; }
+
+flow_refresh_portal() {
+    check_root
+    require_installed
+    refresh_portal
+}
+
+unit_state_text() {
+    if systemctl is-active --quiet "$1" 2>/dev/null; then
+        echo -e "${GREEN}运行中${PLAIN}"
+    elif systemctl list-unit-files "$1.service" 2>/dev/null | grep -q "^$1.service"; then
+        echo -e "${RED}已停止${PLAIN}"
+    else
+        echo -e "${YELLOW}未安装${PLAIN}"
+    fi
+}
+
+show_menu_status() {
+    local ver
+    if [[ -f "$HY2_BIN" ]]; then
+        ver="$($HY2_BIN version 2>/dev/null | awk '/^Version:/{print $2; exit}')"
+        echo -e "核心状态: $(unit_state_text hysteria-server) | 版本: ${ver:-未知}"
+    else
+        echo -e "核心状态: ${YELLOW}未安装${PLAIN}"
+        return 0
+    fi
+    # 门户同时是 Hy2 的鉴权后端：它停了，所有用户都连不上，必须一眼看到。
+    local mode="单机模式"
+    if awk '/^auth:/{f=1;next} /^[^ ]/{f=0} f&&/type: *http/{found=1} END{exit !found}' "$HY2_CONFIG" 2>/dev/null; then
+        mode="Agent 模式（商城 / Teyir）"
+    fi
+    echo -e "门户状态: $(unit_state_text hysteria-portal) | 运行模式: ${mode}"
+    if traffic_suspended; then
+        echo -e "流量限额: ${RED}已因流量超额被 Teyir 停用${PLAIN}（控制台恢复前不要手动启动服务）"
+    fi
+    local extra=""
+    [[ -f /etc/systemd/system/xray.service ]] && extra+="Reality: $(unit_state_text xray)  "
+    [[ -f /usr/local/bin/gost ]] && extra+="GOST: $(unit_state_text gost)  "
+    [[ -f /etc/systemd/system/wireproxy.service ]] && extra+="WARP: $(unit_state_text wireproxy)"
+    [[ -n "$extra" ]] && echo -e "扩展服务: ${extra}"
+    # AmneziaWG 状态：仅在本机装了 AWG 时显示
     if [[ -f "$AWG_CONFIG" ]]; then
         local _awg_port
         _awg_port="$(jq -r '.port // "?"' "$AWG_META_FILE" 2>/dev/null || echo '?')"
@@ -3397,11 +3621,25 @@ menu() {
             echo -e "AWG 状态 : ${YELLOW}已安装但未运行${PLAIN} | 协议线: AWG $(awg_current_line).x"
         fi
     fi
+}
+
+menu() {
+  while true; do
+    clear 2>/dev/null || true
+    echo -e "${CYAN}================================================================${PLAIN}"
+    echo -e "${GREEN}       Hysteria 2 全功能生产级管理脚本 (${HY2_ARCH:-$(uname -m)})         ${PLAIN}"
+    echo -e "${BLUE}       GitHub: https://github.com/yys9253462-gif/hysteria2-installer    ${PLAIN}"
+    echo -e "${CYAN}================================================================${PLAIN}"
+    show_menu_status
     echo -e "${CYAN}----------------------------------------------------------------${PLAIN}"
-    echo -e "  ${GREEN}1.${PLAIN} 全新安装 Hysteria 2"
+    if [[ -f "$HY2_CONFIG" ]]; then
+        echo -e "  ${GREEN}1.${PLAIN} 重新安装 Hysteria 2 ${YELLOW}(会覆盖现有配置)${PLAIN}"
+    else
+        echo -e "  ${GREEN}1.${PLAIN} 全新安装 Hysteria 2"
+    fi
     echo -e "  ${GREEN}2.${PLAIN} 更新 Hysteria 2 核心至最新版"
     echo -e "  ${GREEN}3.${PLAIN} 查看私密信息页地址和登录凭据"
-    echo -e "  ${GREEN}4.${PLAIN} 重新修改配置 (端口/密码/证书/域名/混淆)"
+    echo -e "  ${GREEN}4.${PLAIN} 重新修改配置 (端口/密码/证书/域名/混淆/运行模式)"
     echo -e "  ${GREEN}5.${PLAIN} 一键安装并配置 Cloudflare WARP 出口 (AI解锁)"
     echo -e "  ${GREEN}6.${PLAIN} 一键安装 gost 入站代理引擎 (SOCKS5/HTTP/HTTPS)"
     echo -e "${CYAN}----------------------------------------------------------------${PLAIN}"
@@ -3413,127 +3651,53 @@ menu() {
     echo -e "  ${GREEN}11.${PLAIN} 重启服务"
     echo -e "  ${GREEN}12.${PLAIN} 查看实时运行日志"
     echo -e "  ${GREEN}13.${PLAIN} 彻底卸载 Hysteria 2"
+    echo -e "${CYAN}----------------------------------------------------------------${PLAIN}"
+    echo -e "  ${GREEN}14.${PLAIN} 刷新信息页与订阅 (不改任何配置)"
+    echo -e "  ${GREEN}15.${PLAIN} 重启门户 (信息页 / 鉴权后端 / 控制台 API)"
+    echo -e "  ${GREEN}16.${PLAIN} 显示接入 Teyir 控制台的信息"
     echo -e "  ${GREEN}0.${PLAIN} 退出脚本"
     echo -e "${CYAN}================================================================${PLAIN}"
     # read 失败 = stdin 到 EOF（管道输入用尽，或用户按了 Ctrl+D）。
     # 不显式处理的话会由 set -e 直接以退出码 1 静默结束，用户看不懂发生了什么。
-    if ! read -rp "请输入选项 [0-13]: " choice; then
+    if ! read -rp "请输入选项 [0-16]: " choice; then
         echo
         log_info "输入已结束（EOF），退出脚本。"
         exit 0
     fi
+    choice="$(echo "$choice" | tr -d '[:space:]')"
 
     case "$choice" in
-        1)
-            check_root
-            check_arch
-            # 已装机再按「1」会重生成配置、可能换掉端口/密码/证书，
-            # 已发放的客户端配置随之失效 —— 必须让用户确认一次。
-            if [[ -f "$HY2_CONFIG" ]]; then
-                echo
-                log_warn "检测到本机已安装 Hysteria 2。"
-                log_warn "继续将重新生成服务端配置；若中途更换了端口/密码/证书，"
-                log_warn "已发放的客户端配置会失效，需要重新导出。"
-                read -rp "确定要重新安装吗？[y/N]: " _reinstall_hint || true
-                if [[ ! "$_reinstall_hint" =~ ^[Yy]$ ]]; then
-                    log_info "已取消。如需修改端口/密码/证书，请用菜单第 4 项「重新修改配置」。"
-                    continue
-                fi
-                backup_state_before_reconfigure
-            fi
-            install_dependencies
-            get_public_ip || exit 1
-            install_binary
-            setup_certificates
-            setup_ports_and_obfs
-            generate_server_config
-            setup_system_firewall "$LISTEN_PORT" "$HOP_START" "$HOP_END"
-            setup_systemd
-            show_client_configs
-            ;;
-        2)
-            check_root
-            check_arch
-            install_binary
-            restart_service
-            ;;
-        3)
-            show_client_configs
-            ;;
-        4)
-            check_root
-            # 🔴 改配置前必须警告 + 备份（2026-10-09 修）：
-            # 这条路径会整体重写 client_meta.json 并调 prepare() 重建 portal.json，
-            # 商城开的子账号会消失、订阅端口可能变化。原先**一个字都没提示**，
-            # 用户只是想改个端口，结果已发放的客户端全部失效。
-            # 现在：先讲清后果 → 留快照 → 要求显式确认。
-            if [[ -f "$HY2_CONFIG" ]]; then
-                echo
-                log_warn "「重新修改配置」会重新生成配置文件并重建门户数据，请注意："
-                log_warn "  · 已发放的客户端配置若端口/证书/域名变化，将需要重新导出"
-                log_warn "  · 门户里已开通的子账号会被重建（机主账号保留）"
-                log_warn "  · 认证密码与混淆密钥默认保留，不会被随机换掉"
-                read -rp "确定继续吗？[y/N]: " _reconf_hint || true
-                if [[ ! "$_reconf_hint" =~ ^[Yy]$ ]]; then
-                    log_info "已取消。"
-                    continue
-                fi
-                backup_state_before_reconfigure
-            fi
-            install_dependencies
-            get_public_ip || exit 1
-            setup_certificates
-            setup_ports_and_obfs
-            generate_server_config
-            setup_system_firewall "$LISTEN_PORT" "$HOP_START" "$HOP_END"
-            setup_systemd
-            show_client_configs
-            ;;
-        5)
-            check_root
-            install_warp_local_proxy
-            ;;
-        6)
-            check_root
-            install_gost
-            ;;
-        7)
-            # AmneziaWG 安装入口。用 || true 兜住失败，避免 set -e 把整个菜单打断，
-            # 让用户能看到报错后返回菜单重试。
-            install_amneziawg || true
-            ;;
-        8)
-            menu_amneziawg || true
-            ;;
-        9)
-            start_service
-            ;;
-        10)
-            stop_service
-            ;;
-        11)
-            restart_service
-            ;;
+        1)  run_action flow_install ;;
+        2)  run_action flow_update_core ;;
+        3)  run_action show_client_configs ;;
+        4)  run_action flow_reconfigure ;;
+        5)  run_action flow_warp ;;
+        6)  run_action flow_gost ;;
+        7)  run_action install_amneziawg ;;
+        8)  run_action menu_amneziawg ;;
+        9)  run_action start_service ;;
+        10) run_action stop_service ;;
+        11) run_action restart_service ;;
         12)
-            view_logs
+            # 菜单这一层先忽略 Ctrl+C（子进程恢复默认，所以 journalctl 照样能被 Ctrl+C 结束），
+            # 否则全局中断处理会把整个脚本一起退出，回不到菜单。
+            trap ':' INT
+            run_action view_logs
+            trap on_interrupt INT
             ;;
-        13)
-            check_root
-            uninstall_all
-            ;;
-        0)
-            exit 0
-            ;;
+        13) run_action flow_uninstall ;;
+        14) run_action flow_refresh_portal ;;
+        15) run_action restart_portal ;;
+        16) run_action show_teyir_access ;;
+        0)  exit 0 ;;
         *)
-            log_err "无效选项，请重新选择！"
+            log_err "无效选项，请输入 0-16 之间的数字。"
             sleep 1
             continue
             ;;
     esac
 
     # 操作完成后回到主菜单，而不是把用户直接丢回 shell。
-    # 放这里而不是每个分支各写一遍 —— 原来只有第 7 项会停留，其余都会直接退出，
-    # 新手装完想接着做点别的就得重新跑一遍脚本。
     echo
     # 同上：EOF 时给个明确交代，而不是静默退出码 1
     if ! read -rp "按回车返回主菜单（输入 q 退出脚本）: " _back; then
@@ -3555,6 +3719,11 @@ check_arch
 if [[ $# -gt 0 ]]; then
     case "$1" in
         install)
+            # 免交互重装时默认沿用现有门户（凭据、API Key、订阅地址、用户），
+            # 要彻底重建请显式传 HY2_PRESERVE_PORTAL=0。
+            if [[ -f "$HY2_DIR/portal.json" && -f "$HY2_DIR/portal-access.json" ]]; then
+                PRESERVE_PORTAL="${HY2_PRESERVE_PORTAL:-1}"
+            fi
             install_dependencies
             get_public_ip || exit 1
             install_binary
@@ -3566,8 +3735,9 @@ if [[ $# -gt 0 ]]; then
             show_client_configs
             ;;
         update)
+            require_installed || exit 1
             install_binary
-            restart_service
+            traffic_suspended || restart_service
             ;;
         info)
             show_client_configs

@@ -289,14 +289,17 @@ class TestBackupBeforeReconfigure(unittest.TestCase):
         # 取菜单里 `4)` 这个 case 分支的正文：从该分支起点到同缩进的 `;;`。
         # 不能按「菜单 5 的提示行」切（提示行在 case 之前，会切出空窗口），
         # 也不能按第一个 `;;` 切（那是 case 1 的结尾，会切进错误的分支）。
-        anchor = text.index("确定继续吗？")
-        branch_start = text.rindex("\n        4)\n", 0, anchor)
-        branch_end = text.index("\n            ;;", anchor)
-        menu4 = text[branch_start:branch_end]
+        # 菜单 4 的流程在 flow_reconfigure() 里（菜单分支只负责调用它）。
+        self.assertRegex(text, r"\n\s+4\)\s+run_action flow_reconfigure ;;",
+                         "菜单 4 必须走 flow_reconfigure")
+        start = text.index("flow_reconfigure() {")
+        menu4 = text[start:text.index("\n}\n", start)]
         self.assertIn("backup_state_before_reconfigure", menu4,
                       "菜单 4 改配置前必须留快照")
         self.assertIn("确定继续吗？", menu4,
-                      "菜单 4 必须显式告知「子账号会被重建」并要求确认")
+                      "菜单 4 必须显式告知后果并要求确认")
+        self.assertLess(menu4.index("确定继续吗？"), menu4.index("backup_state_before_reconfigure"),
+                        "必须先确认、再备份和改配置")
 
 
 @unittest.skipUnless(BASH, "needs bash")
