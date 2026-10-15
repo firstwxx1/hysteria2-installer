@@ -25,6 +25,8 @@ import tarfile
 import tempfile
 import threading
 import time
+import http.client
+import urllib.error
 import urllib.request
 import uuid
 import zipfile
@@ -63,7 +65,141 @@ AWG_REPO = 'yys9253462-gif/hysteria2-installer'
 #
 # ⚠️ 改动 portal.py 的**能力**时记得同步 +1，否则主面板会按旧能力显示。
 # 格式固定 `PORTAL_VERSION = 'x.y'`（capabilities 端点按行首匹配解析它）。
-PORTAL_VERSION = '2.7'
+PORTAL_VERSION = '2.8'
+
+# ---------------------------------------------------------------------------
+# 流媒体 / AI 解锁检测（2.8，GET /api/v1/unlock-check）
+#
+# 判据参考社区通用的 RegionRestrictionCheck 思路，只用标准库 urllib，
+# 不依赖 curl。每项返回 status：
+#   yes      可用
+#   partial  部分可用（如 Netflix 仅自制剧）
+#   no       不可用 / 被识别为代理
+#   unknown  检测失败（超时、网络错误）—— 与 no 区分，别把"没测成"说成"不解锁"
+# ---------------------------------------------------------------------------
+_UNLOCK_UA = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+              '(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36')
+
+
+def _unlock_read(resp, limit):
+    # 分块传输被对端提前断开时 read() 会抛 IncompleteRead —— 判据只看页面里
+    # 的几个标记，拿到的部分内容已经够用，不能因此把整项判成「检测失败」。
+    try:
+        raw = resp.read(limit)
+    except http.client.IncompleteRead as e:
+        raw = e.partial
+    return raw.decode('utf-8', 'replace')
+
+
+def _unlock_fetch(url, timeout=8, limit=400000):
+    """返回 (status_code, final_url, body_text)。HTTP 错误码也正常返回，网络错误抛异常。"""
+    req = urllib.request.Request(url, headers={'User-Agent': _UNLOCK_UA, 'Accept-Language': 'en-US,en;q=0.9'})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, resp.geturl(), _unlock_read(resp, limit)
+    except urllib.error.HTTPError as e:
+        try:
+            body = _unlock_read(e, 200000)
+        except Exception:
+            body = ''
+        return e.code, e.geturl() or url, body
+
+
+def _unlock_netflix():
+    code_full, _, _ = _unlock_fetch('https://www.netflix.com/title/81280792')
+    code_orig, final, _ = _unlock_fetch('https://www.netflix.com/title/80018499')
+    m = re.search(r'netflix\.com/([a-z]{2})(?:-[a-z]{2})?/title', final or '')
+    region = m.group(1).upper() if m else ''
+    if code_full == 200:
+        return 'yes', region or 'US', '完整解锁'
+    if code_orig == 200:
+        return 'partial', region or 'US', '仅自制剧'
+    return 'no', '', 'HTTP %s' % code_orig
+
+
+def _unlock_disney():
+    code, final, _ = _unlock_fetch('https://www.disneyplus.com/')
+    if 'unavailable' in (final or '') or code == 403:
+        return 'no', '', '地区不可用'
+    m = re.search(r'disneyplus\.com/(?:[a-z]{2}-)?([a-z]{2})(?:/|$)', final or '')
+    if code >= 400:
+        return 'no', '', 'HTTP %s' % code
+    return 'yes', (m.group(1).upper() if m else ''), ''
+
+
+def _unlock_youtube():
+    _, _, body = _unlock_fetch('https://www.youtube.com/premium')
+    if 'Premium is not available in your country' in body:
+        return 'no', '', 'Premium 地区不可用'
+    m = re.search(r'"(?:countryCode|GL)":"([A-Z]{2})"', body)
+    region = m.group(1) if m else ''
+    if region == 'CN':
+        return 'no', 'CN', '送中'
+    return 'yes', region, ''
+
+
+def _unlock_chatgpt():
+    _, _, comp = _unlock_fetch('https://api.openai.com/compliance/cookie_requirements')
+    _, _, ios = _unlock_fetch('https://ios.chat.openai.com/')
+    _, _, trace = _unlock_fetch('https://chatgpt.com/cdn-cgi/trace')
+    m = re.search(r'^loc=([A-Z]{2})', trace, re.M)
+    region = m.group(1) if m else ''
+    blocked_region = 'unsupported_country' in comp
+    vpn = 'VPN' in ios
+    if blocked_region:
+        return 'no', region, '地区不支持'
+    if vpn:
+        return 'partial', region, '网页可用，App 识别为 VPN'
+    return 'yes', region, ''
+
+
+def _unlock_claude():
+    code, final, _ = _unlock_fetch('https://claude.ai/')
+    if 'app-unavailable-in-region' in (final or ''):
+        return 'no', '', '地区不可用'
+    # 403 是 Cloudflare 人机校验，说明请求到了 claude.ai 而不是被地区拦截。
+    if code < 400 or code == 403:
+        return 'yes', '', ''
+    return 'no', '', 'HTTP %s' % code
+
+
+def _unlock_gemini():
+    # 页面约 800KB，开关标记在中段，读取上限要放宽。
+    # 标记有新旧两种写法：`45631641,null,true` 与 `45631641\":true`。
+    _, _, body = _unlock_fetch('https://gemini.google.com/', limit=2000000)
+    if re.search(r'45631641(?:,null,|\\?":)true', body):
+        return 'yes', '', ''
+    return 'no', '', '地区不可用'
+
+
+UNLOCK_CHECKS = (
+    ('netflix', 'Netflix', _unlock_netflix),
+    ('disney', 'Disney+', _unlock_disney),
+    ('youtube', 'YouTube Premium', _unlock_youtube),
+    ('chatgpt', 'ChatGPT', _unlock_chatgpt),
+    ('claude', 'Claude', _unlock_claude),
+    ('gemini', 'Gemini', _unlock_gemini),
+)
+
+
+def run_unlock_checks():
+    results = [None] * len(UNLOCK_CHECKS)
+
+    def work(i, key, name, fn):
+        try:
+            status, region, note = fn()
+        except Exception as e:
+            status, region, note = 'unknown', '', '检测失败：%s' % (type(e).__name__)
+        results[i] = {'key': key, 'name': name, 'status': status, 'region': region, 'note': note}
+
+    threads = [threading.Thread(target=work, args=(i, k, n, f), daemon=True)
+               for i, (k, n, f) in enumerate(UNLOCK_CHECKS)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(30)
+    return [r or {'key': k, 'name': n, 'status': 'unknown', 'region': '', 'note': '检测超时'}
+            for r, (k, n, _) in zip(results, UNLOCK_CHECKS)]
 
 DEFAULT_WARP_DOMAINS = (
     'ipify.org', 'cloudflare.com',
@@ -6069,6 +6205,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 # （靶点硬编码，见 SPEEDTEST_TARGETS 的安全说明）。
                 if sub.split('?', 1)[0] == 'speedtest':
                     return self._h_api_speedtest()
+                if sub.split('?', 1)[0] == 'unlock-check':
+                    return self._h_api_unlock_check()
                 if sub == 'capabilities':
                     # 节点能力总览（2026-10-04 加）。
                     #
@@ -6672,6 +6810,17 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     'qr_svg': qr_svg
                 }
             })
+
+        def _h_api_unlock_check(self):
+            """GET /api/v1/unlock-check —— 在节点本机检测流媒体 / AI 服务解锁情况（2.8 加）。
+
+            与 /api/v1/speedtest 同一安全边界：检测目标**完全硬编码**在
+            UNLOCK_CHECKS 里，调用方传不进任何 URL —— 否则这就是一个
+            以节点 IP 出口的任意 HTTP 代理。
+            各项并发执行、单项 8 秒超时，整体约 10 秒内返回。
+            """
+            results = run_unlock_checks()
+            return self.reply_json(200, {'ok': True, 'results': results, 'time': int(time.time())})
 
         def _h_api_speedtest(self):
             """GET /api/v1/speedtest —— 在**节点本机**测到大陆三网的 ICMP 延迟。
