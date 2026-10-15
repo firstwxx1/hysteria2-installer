@@ -1,7 +1,7 @@
 # Hysteria 2 全功能生产级一键部署与管理脚本
 
 [![GitHub License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Platform](https://img.shields.io/badge/platform-Debian%20%7C%20Ubuntu%20%7C%20CentOS%20%7C%20Alpine-success.svg)](#)
+[![Platform](https://img.shields.io/badge/platform-Debian%20%7C%20Ubuntu%20%7C%20CentOS-success.svg)](#)
 [![Hysteria Version](https://img.shields.io/badge/Hysteria-v2.x-orange.svg)](https://v2.hysteria.network/)
 
 极速、轻量、高可用的 **Hysteria 2 (Hy2)** 官方服务端一键自动化部署脚本。针对恶劣网络环境、高丢包率场景与运营商 UDP QoS 做了深度优化。
@@ -16,17 +16,19 @@
 - 🎭 **Salamander 混淆 默认启用**：全自动生成高熵随机密码，将 QUIC 数据报文伪装为完全随机的杂波，彻底免疫 GFW 主动探测与深度包检测。
 - 🛡️ **AmneziaWG 抗 DPI 协议 (可选安装)**：一键部署 WireGuard 的抗审查分支，密码学内核完全不变，只把数据包的头部、长度与时序特征随机化。采用**用户态 `amneziawg-go`** 部署 —— 不编译内核模块、不引入 Docker、不在服务器上装 Go 工具链：二进制由本仓库的 GitHub Actions 交叉编译成**全静态**产物（amd64 / arm64 / armv7）后发布到 Release 下载。支持 **AWG 2.x / 3.x 双协议线可切换**、多客户端管理、`.conf` 下载与二维码导入，并在 Web 控制台提供独立的客户端管理与状态面板。
 - 🌐 **Cloudflare WARP 智能分流 (AI 加速)**：内置 `wgcf` + `wireproxy` 自建本地出口（socks5 `127.0.0.1:19898`，免 apt、无需官方 MASQUE 客户端，绕开 Debian 12 上 `cloudflare-warp` 因 apt keyring bug 装不上的问题），配合 3 分钟探活自愈 Watchdog，并在 Web 控制台独立扩展页面提供一键按需启闭开关，实现 OpenAI、Claude、Gemini 干净住宅出口与 VPS 原生极速直连。
-- 🔄 **Web 端双重版本检测与一键升级**：在 Web 仪表盘在线比对 Hysteria 2 官方内核与控制面板自身版本，发现新版一键平滑无损热升级。
+- 🧭 **VLESS-Reality 备用通道 (可选)**：在 Web 控制台一键启用 Xray Reality（TCP）。订阅里同时下发 Hy2 与 Reality 两个节点，Clash 用 url-test 自动择优 —— UDP 被 QoS 或阻断时自动切到 TCP 通道；每个 Hy2 用户对应一个 Reality 身份，停用 / 删除用户时两边同步生效。
+- 🔄 **Web 端双重版本检测与一键升级**：在 Web 仪表盘在线比对 Hysteria 2 官方内核与控制面板自身版本，发现新版一键升级。面板自更新会先把 `main` 锁定到具体 commit 再下载，每个文件都做内容特征与 Python 语法校验，任一不过就整体放弃；换上新版后若 20 秒内健康检查（`/api/health`）不通过，自动换回旧版本。
 - 🕳️ **独立「入站代理 & WARP」扩展专区 (SOCKS5 / HTTP / HTTPS)**：集成 GOST 引擎，支持 Web 端一键安装/修复核心；解耦独立页面一键添加/删除三种入站代理服务（独立账号密码认证），客户端无需安装 Hysteria 也能直接把服务器当普通代理用，配置动态生成并平滑热重载。
 - 📱 **多客户端格式全覆盖**：
   - 标准 **`hysteria2://`** 节点直链（支持 v2rayN、Nekobox、Shadowrocket、Sing-box 等一键导入）
   - **Clash.Meta / Mihomo** (Clash Verge Rev) 节点配置片段
   - **Sing-box** (SFA / SFI) Outbound 节点配置片段
   - 安装完成显示私密 HTTPS 信息页地址和随机登录凭据；二维码、订阅和配置统一在登录后的网页查看。
-- 🏢 **多租户集群 Agent 节点模式（电商/多用户对接）**：
-  - 支持作为分布式集群节点接入发卡商城或统一控制台（如 `pay.isoziyuan.com`）。
-  - 内置高性能 REST API（`/api/v1/users/create`, `renew`, `delete`, `node/meta`）与 Hysteria 2 本地 HTTP 动态鉴权。
-  - 用户开通、续费与注销实时生效，**零中断、无需重启 Hysteria 2 服务**。
+- 🏢 **多租户集群 Agent 节点模式（Teyir 控制台 / 发卡商城对接）**：
+  - 可作为集群节点接入 [Teyir 控制台](#-接入-teyir-控制台)或发卡商城（如 `pay.isoziyuan.com`）。
+  - 内置 REST API（`Authorization: Bearer <API Key>`）与 Hysteria 2 本地 HTTP 动态鉴权，接口清单见[下文](#-接入-teyir-控制台)。
+  - 用户开通、续费、停用与注销实时生效，**零中断、无需重启 Hysteria 2 服务**；注销 / 停用时会主动断开该用户已有的连接，并同步收回 Reality 身份。
+- 📊 **按真实流量计量**：用量取自 Hysteria `trafficStats` 与 Xray stats 的单调计数器（不是客户端声明的带宽），服务重启、计数器回退都会单独处理，不会重复计数或漏记；用户到期 / 超额后自动停用。同时在线 IP 限制会把「仍然连着的设备」算在内，不会因为连接持续超过 3 分钟就被绕过（需要核心提供在线 IP 数据，取不到时按鉴权时间判断）。
 - 🛠️ **全生命周期管理**：Systemd 服务自动守护、开机自启、内核 UDP 缓冲与参数调优、一键升级、实时日志监控与彻底卸载。
 
 ---
@@ -65,6 +67,7 @@ HY2_CERT_TYPE=3 HY2_DOMAIN=hy2.example.com HY2_EMAIL=me@example.com bash install
 | `HY2_CERT_TYPE` | `1` 自签名 / `2` 指定已有证书文件 / `3` 域名自动申请 Let's Encrypt / `4` 自动扫描本机已装证书 |
 | `HY2_DOMAIN` | 绑定域名（SNI）。**`HY2_CERT_TYPE=3` 时必填** |
 | `HY2_EMAIL` | Let's Encrypt 通知邮箱 |
+| `HY2_PRESERVE_PORTAL` | 本机已装过时是否沿用现有门户：`1`（默认）保留门户登录凭据、API Key、订阅地址与全部用户；`0` 推倒重建 |
 
 > ⚠️ `HY2_CERT_TYPE=2` **不适合纯无人值守**：它需要你再回答证书与私钥的文件路径。
 > 要做完全免交互请选 `1`、`3`（配 `HY2_DOMAIN`）或 `4`。
@@ -113,6 +116,68 @@ AWG 状态 : 运行中 | 协议线: AWG 3.x | UDP 53821
 > - `扩展服务` 只列本机装过的服务，`AWG 状态` 只在装过 AmneziaWG 时显示；节点被 Teyir 因流量超额停用时会多一行醒目提示，此时 9 / 11 不会手动拉起服务。
 > - 已安装时，第 1 项（重新安装）和第 4 项（重新修改配置）默认**沿用现有门户**：门户登录凭据、API Key、订阅地址、全部用户与代理服务保持不变，已接入 Teyir 控制台的节点不受影响；运行模式与 API Key 也默认保持当前设置。
 > - 任何一项操作失败都只会提示并回到菜单，不会把整个脚本退出；查看日志时按 Ctrl+C 只退出日志。
+
+---
+
+## 🔗 接入 Teyir 控制台
+
+Teyir 控制台可以集中管理多台节点：开户、续费、停用、流量统计、整机流量限额、代理服务与测速。节点需要以 **Agent 模式**运行（安装时运行模式选 `2`，或 `HY2_NODE_MODE=2`）。
+
+### 接入需要的四项信息
+
+| 字段 | 用途 |
+| :--- | :--- |
+| 门户地址 `url` | `https://<域名或 IP>:<订阅端口>/<随机路径>/`，控制台从这里访问节点 |
+| 门户用户名 / 密码 | HTTP Basic，网页通道（版本检查、用户配置、面板更新等） |
+| API Key | `Authorization: Bearer <API Key>`，REST API 通道 |
+
+三种取法，内容完全一致：
+
+- 终端菜单 **第 16 项「显示接入 Teyir 控制台的信息」**；
+- 网页登录后的「接入 TEYIR 控制台」卡片，可一键复制整份 JSON；
+- 仓库里的 `panel-join.py`：在节点上运行，自动从 `config.yaml` / `portal.json` 拼出对外可达的地址，也可以直接登记到控制台：
+
+  ```bash
+  curl -fsSLO https://raw.githubusercontent.com/yys9253462-gif/hysteria2-installer/main/panel-join.py
+  python3 panel-join.py                    # 只打印
+  PANEL_ADMIN_TOKEN=<JWT> python3 panel-join.py --register --panel https://你的控制台地址
+  ```
+
+  管理员令牌建议用环境变量 `PANEL_ADMIN_TOKEN` 传，命令行参数 `--admin-token` 会出现在 `ps` 和 shell 历史里。
+
+> 已接入控制台的节点，用菜单第 1 项（重新安装）或第 4 项（重新修改配置）时，「是否沿用现有门户」请保持默认的 **Y**：门户地址、凭据、API Key 与控制台开的全部用户都不会变，控制台无需任何改动。
+
+### REST API
+
+所有接口都要带 `Authorization: Bearer <API Key>`，请求体为 JSON，每秒最多 50 次请求。
+
+| 方法 | 路径 | 说明 |
+| :--- | :--- | :--- |
+| POST | `/api/v1/users/create` | 开户；已存在的同名用户按传入字段更新。`password` 不能与其他用户重复（返回 409），不传则自动生成 |
+| POST | `/api/v1/users/update` | 修改密码 / 到期时间 / IP 限制 / 状态 |
+| POST | `/api/v1/users/renew` | 续期、加流量 |
+| POST | `/api/v1/users/set_status` | 启用 / 停用（停用会断开现有连接） |
+| POST | `/api/v1/users/delete` | 注销（断开现有连接并收回 Reality 身份） |
+| GET / POST | `/api/v1/users/list` | 全部用户及用量、在线 IP |
+| GET | `/api/v1/users/get/<user_id>` | 单个用户 |
+| GET / POST | `/api/v1/proxy-services/list` | GOST 入站代理列表 |
+| POST | `/api/v1/proxy-services/add` / `delete` | 增删 GOST 代理（自动在 ufw / firewalld 上放行或收回端口） |
+| GET | `/api/v1/node/meta` | 节点参数（不含认证密码与混淆密码） |
+| GET | `/api/v1/node/traffic` | 默认路由网卡的累计收发字节、boot_id、是否处于超额停用 |
+| POST | `/api/v1/node/suspend` | `{"suspended": true/false}`：整机流量超额停用 / 恢复 |
+| GET | `/api/v1/capabilities` | 节点支持的能力 |
+| GET | `/api/v1/speedtest` | 到三网与公共 DNS 的延迟（靶点写死在代码里） |
+| GET | `/api/health` | 存活探针，无需鉴权，只返回 `{"ok": true}` |
+
+撤销类操作（注销、停用、到期）要确认旧连接真的断开、Reality 白名单真的生效才返回成功；做不到时返回 503，并在后台继续重试，调用方重试即可。
+
+### 整机流量超额停用
+
+控制台按「默认路由所在网卡」的流量统计整机用量（VPS 商家也是这么计费的）。超额时调用 `node/suspend` 停掉对外服务（Hysteria 2、Xray、GOST、AmneziaWG），门户自身保持运行，以便新周期远程恢复：
+
+- 停用状态写在 `portal.json`，**重启机器后会自动再停一次**；
+- 停用期间，改 Hy2 配置、增删代理、改 Reality 配置都只写配置文件、不会把服务拉起来；终端菜单的「启动 / 重启服务」也会拒绝执行并说明原因；
+- 恢复时只启动停用前本来开着的服务；某个服务没能启动，会留在停用记录里，控制台下一轮重试会继续启动它。
 
 ---
 
@@ -213,8 +278,19 @@ hy2-awgctl resync                              # 依 meta 重新渲染配置并�
 
 - **服务端主配置文件**：`/etc/hysteria/config.yaml`
 - **自签证书存放目录**：`/etc/hysteria/cert/`
-- **连接元数据备份**：`/etc/hysteria/client_meta.json`
-- **Systemd 服务单元**：`/etc/systemd/system/hysteria-server.service`
+- **连接元数据**：`/etc/hysteria/client_meta.json`（域名、端口、认证 / 混淆密码、证书信任方式）
+- **Systemd 服务单元**：`/etc/systemd/system/hysteria-server.service`、`hysteria-portal.service`
+
+门户（私密信息页 / 订阅 / 鉴权后端 / 控制台 API）相关：
+
+- **门户程序**：`/etc/hysteria/portal.py`、`portal_assets.py` 与 4 个 `usage-meter-*.py` 计量模块（安装时下载，面板可一键自更新）
+- **门户数据**：`/etc/hysteria/portal.json`（用户、代理服务、Reality 配置、计量数据、超额停用状态等，权限 0600）
+- **门户凭据**：`/etc/hysteria/portal-access.json`（门户地址、登录用户名密码、API Key，即接入 Teyir 要的四项）
+- **计量配置**：`/etc/hysteria/usage-meter-config.json`（Hysteria `trafficStats` 与 Xray stats 的地址和密钥）
+- **Reality**：`/etc/hysteria/xray.json`，二进制 `/usr/local/bin/xray`，服务 `xray.service`（在网页里启用后才有）
+- **GOST 代理**：`/etc/hysteria/gost.yml`（含代理账号密码，权限 0600），二进制 `/usr/local/bin/gost`
+- **WARP 出口**：`/etc/wireguard/wgcf.conf`、`wgcf-account.toml`、`wp.conf`，服务 `wireproxy.service`
+- **改配置前的快照**：`*.bak-<时间戳>`（菜单第 1 / 4 项改动前自动备份 meta、门户数据与 config.yaml）
 
 安装 AmneziaWG 后额外产生：
 
@@ -231,7 +307,7 @@ hy2-awgctl resync                              # 依 meta 重新渲染配置并�
 开始前必须完成以下事项：
 
 - 为域名创建指向服务器公网 IPv4 的 `A` 记录；若设置了 `AAAA` 记录，也必须确保 IPv6 可访问，否则请删除它。
-- 在云厂商安全组中放行 **TCP 80**；若启用 Clash 订阅，还需放行脚本显示的订阅 TCP 端口（优先使用 8443，如被占用会自动选择空闲高位端口）。
+- 在云厂商安全组中放行 **TCP 80**，以及安装结束时显示的**订阅 TCP 端口**（私密信息页、订阅和控制台 API 都走它；从 10000-60000 中随机挑一个空闲端口，刻意避开 8443 和端口跳跃区间）。
 - 脚本会自动放行本机 UFW/firewalld 的 TCP 80，但云安全组需要自行放行。
 
 **脚本会先做 DNS 解析预校验**：自动查询 `${SERVER_NAME}` 的 A 记录并与本机公网 IPv4 比对，三种结果——
@@ -255,15 +331,30 @@ tls:
   cert: /etc/hysteria/cert/server.crt
   key: /etc/hysteria/cert/server.key
 
+# 单机模式：固定密码
 auth:
   type: password
   password: your_secure_password
+# Agent 模式（接 Teyir 控制台 / 商城）：每个连接都交给本机门户鉴权
+# auth:
+#   type: http
+#   http:
+#     url: http://127.0.0.1:<门户本地端口>/auth
 
+# 订阅端口上的 HTTPS 转发到只监听 127.0.0.1 的门户（私密信息页 / 订阅 / 控制台 API）
 masquerade:
   type: proxy
   proxy:
-    url: https://www.bing.com/
-    rewriteHost: true
+    url: http://127.0.0.1:<门户本地端口>/
+    rewriteHost: false
+    # 给公网请求打上 X-Forwarded-For，门户据此拒绝公网直打 /auth（v2.8.0+ 支持）
+    xForwarded: true
+  listenHTTPS: :<订阅端口>
+
+# 真实流量计量的只读统计端点，只监听回环地址
+trafficStats:
+  listen: 127.0.0.1:19996
+  secret: your_random_stats_secret
 
 bandwidth:
   up: 1 gbps
@@ -322,21 +413,58 @@ acl:
 
 ## 私密信息页的安全与运行要求
 
-需要 Python 3.9+、qrencode 和 systemd 247+（使用 LoadCredential）。一键脚本内嵌网页程序，不依赖外部二维码网站或第三方 JS。二维码仅在服务器本地生成。
+### 运行要求
 
-Hysteria 在空闲 TCP 端口上提供 HTTPS，并将请求转发到只监听 127.0.0.1 的独立低权限网页服务。共用 Hysteria 当前证书与续期机制；不占用已有网站的 80/443。使用 ACME HTTP-01 申请证书本身仍需要 TCP 80 可用。自签证书会触发浏览器证书告警；推荐使用受信任的域名证书。
+需要 Python 3.9+、qrencode 和 systemd 247+。门户程序由安装脚本下载，不依赖外部二维码网站或第三方 JS，二维码只在服务器本地生成。
 
-页面路径使用 256-bit 随机值，随机密码同样具有 256-bit 熵。页面、二维码、订阅与下载均验证 Basic Auth；没有免登录订阅后门。随机路径不代表端口不可扫描，认证才是访问控制。请保密 URL 与账号密码，订阅 URL 内含凭据。
+Hysteria 在订阅端口上提供 HTTPS，把请求转发给只监听 127.0.0.1 的门户服务（`hysteria-portal`，以 root 运行，因为它要管理 Hysteria、Xray、GOST、AmneziaWG 等系统服务）。门户共用 Hysteria 当前的证书与续期机制，不占用已有网站的 80/443；用 ACME HTTP-01 申请证书时仍需要 TCP 80 可用。自签证书会触发浏览器告警，推荐使用受信任的域名证书。
 
-只开放四个固定路由，禁止目录浏览；响应带 no-store、CSP、禁止嵌入、禁止索引及禁止 referrer 标头。后端不记录访问路径或密码，使用恒定时间摘要比较验证认证。全局每秒最多 20 个请求，60 秒内 30 次失败认证后临时限流；高频攻击仍可能导致暂时不可用。可在云安全组将网页端口限制为自己的 IP。
+> Agent 模式下门户同时是 Hysteria 的鉴权后端：门户停了，所有用户都连不上。终端菜单的状态栏会显示门户状态，第 15 项可单独重启门户。
 
-每次重新配置都会轮换网页路径和登录凭据，旧链接失效，客户端需更新订阅。菜单 3 仅显示已有访问凭据。卸载时停止并删除 hysteria-portal.service 及其配置。已有旧版安装需重新配置才启用网页；本次仓库更新不会自动部署到服务器。
+### 访问控制
+
+- 页面路径是 256-bit 随机值，登录密码同样有 256-bit 熵；随机路径不代表端口扫不到，认证才是访问控制。请保密 URL 与账号密码，订阅 URL 内含凭据。
+- 管理页面、订阅与下载都要求登录（HTTP Basic 或登录后的会话 cookie）。会话 cookie 带签发时间，服务端 30 天后拒绝；cookie 设置了 `HttpOnly`、`SameSite=Strict`、`Secure`。
+- **用户专属分享链接**（`<门户地址>u/<用户>?k=...`）是唯一免登录的入口，只能看到该用户自己的配置。同名用户删掉重建后，旧链接自动失效。
+- REST API 只认 `Authorization: Bearer <API Key>`，权限低于网页登录。
+
+### 防护与限流
+
+- 响应带 `no-store`、CSP、禁止嵌入、禁止索引、禁止 referrer 等标头；后端不记录访问路径或密码，凭据比较都是恒定时间。
+- 网页：每秒最多 50 个请求，60 秒内失败 60 次后临时限流；API：每秒最多 50 个请求。
+- Hysteria 鉴权（`/auth`）：每秒最多 20 次，60 秒内失败 30 次后临时限流。经伪装代理从公网打进来的 `/auth` 请求（带 `X-Forwarded-For`）直接拒绝且不计入失败次数，外人刷不满限流、也就没法让全节点无法登录。老节点要在下次「更新 Hysteria 2 核心」时才会自动补上 `xForwarded` 配置。
+- 高频攻击仍可能让网页暂时不可用，可在云安全组把订阅端口限制为自己（和控制台）的 IP。
+
+### 改配置与卸载
+
+- 菜单第 1 / 4 项在已装机上默认**沿用现有门户**：网页路径、登录凭据、API Key、订阅地址与全部用户都不变，客户端订阅和控制台都不用改。选 `N` 才会重建门户（路径与凭据换新，旧链接失效）。
+- 菜单第 3 项只显示已有凭据，第 14 项按当前参数刷新信息页与订阅，不改任何配置。
+- 卸载时停止并删除 `hysteria-portal`、`xray`、`gost`、`wireproxy` 等服务及 `/etc/hysteria`；`/etc/wireguard` 里只删除 wgcf 自己的文件，系统里其它 WireGuard 配置不受影响。
+
+### 开发
 
 开发检查：`bash -n install.sh` 和 `python3 -m unittest discover -s tests -v`。
 `portal.py` 现在由 `install.sh` **在运行时获取**（三级回退：GitHub API → jsDelivr → raw，
 拿到后做 Python 语法校验），所以**不需要**再手动同步任何内嵌副本 —— 改完 `portal.py`
 直接提交即可，机器上重新执行一次安装/更新就会拿到新版。若要本地调试，把 `portal.py`
 放在 `install.sh` 同目录即可优先使用本地文件。
+
+---
+
+## 🧰 仓库里的辅助脚本
+
+这些脚本**不会**被一键安装自动执行，按需单独下载运行：
+
+| 脚本 | 用途 |
+| :--- | :--- |
+| `panel-join.py` | 在节点上打印（或直接登记）接入 Teyir 控制台所需的地址与 API Key，见[接入 Teyir 控制台](#-接入-teyir-控制台) |
+| `fix_cert_chain.sh` | 修复「证书链不完整」：`tls.cert` 指向只有叶证书的文件时，客户端报 `x509: certificate signed by unknown authority`，脚本把它换成 fullchain |
+| `alpine2debian.sh` | 机器落在 Alpine 救援 / 内存模式时，用 Debian 官方 debootstrap 在本地把系统刷成 Debian 12，不下载第三方安装脚本 |
+| `reinstall-debian13.sh` | 从 Alpine 救援环境重装 Debian 13（借道 InstallNET，负责联网、DNS、GRUB 修复等前后保障）；下载走 HTTPS 证书校验，未指定 root 密码时随机生成并显示 |
+
+> ⚠️ 两个重装脚本都会**清空整块系统盘**，只在你确定要重装时使用。
+>
+> 本安装脚本依赖 systemd，不支持以 OpenRC 运行的 Alpine；Alpine 机器请先用上面两个脚本之一换成 Debian 再安装。
 
 ---
 
