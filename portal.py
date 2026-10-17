@@ -1013,6 +1013,27 @@ def user_view_key(secret, user_id, nonce=''):
     return hmac.new(str(secret).encode(), msg.encode(), hashlib.sha256).hexdigest()[:16]
 
 
+def rotate_user_view_key_on_change(previous, current):
+    """Grandfather legacy links until an actual password/status transition.
+
+    Same-value reconciliation retries preserve links. Disabling rotates even if
+    subsequently re-enabled, so a previously disclosed link cannot revive.
+    """
+    if (previous.get('password') != current.get('password') or
+            (previous.get('status', 'active') != 'disabled' and
+             current.get('status', 'active') == 'disabled')):
+        current['view_nonce'] = secrets.token_hex(16)
+
+
+def user_share_available(user, now=None):
+    now = int(time.time()) if now is None else now
+    expires = int(user.get('expires_at', 0) or 0)
+    limit = int(user.get('limit_bytes', 0) or 0)
+    return (user.get('status', 'active') == 'active' and
+            (not expires or expires > now) and
+            (not limit or int(user.get('used_bytes', 0) or 0) < limit))
+
+
 def format_bytes(b):
     if b < 1024:
         return f"{b} B"
@@ -4614,7 +4635,10 @@ if __name__ == '__main__':
                 # Hy2 核心直连 /auth 从不带 X-Forwarded-For；带了说明是公网请求经
                 # masquerade 代理进来的（config.yaml 里 xForwarded: true）。直接拒，
                 # 且不计入全局失败桶 —— 否则外人刷 30 次错误密码就能让全节点无法登录。
-                if self.headers.get('X-Forwarded-For'):
+                if (self.client_address[0] not in ('127.0.0.1', '::1') or
+                        any(name in self.headers for name in
+                            ('X-Forwarded-For', 'X-Forwarded-Host',
+                             'X-Forwarded-Proto', 'Forwarded'))):
                     return self.reply_json(200, {'ok': False, 'msg': 'Forbidden'})
                 if self.auth_rate_limited():
                     # 用与成功路径相同的 200 + JSON 形态回复：不给爆破者区分信号。
@@ -4734,8 +4758,8 @@ if __name__ == '__main__':
                 # 动态开户 (支持 duration_days, ip_limit, traffic_gb)
                 if sub == 'users/create':
                     user_id = (params.get('user_id') or ('hy2_' + secrets.token_hex(6))).strip()
-                    if not VALID_USER_ID_RE.match(user_id):
-                        return self.reply_json(400, {'ok': False, 'error': 'Invalid user_id format: only 1-64 alphanumeric, dash, dot and underscore characters allowed'})
+                    if not VALID_USER_ID_RE.match(user_id) or user_id == MASTER_USER_ID:
+                        return self.reply_json(400, {'ok': False, 'error': 'Invalid managed user_id'})
 
                     pwd = params.get('password') or secrets.token_hex(16)
                     days = int(params.get('duration_days', 30))
@@ -4779,6 +4803,8 @@ if __name__ == '__main__':
                                     record[field] = existing.get(field, record[field])
                             if 'duration_days' not in params and 'expires_at' not in params:
                                 record['expires_at'] = existing.get('expires_at', record['expires_at'])
+                        if existing is not None:
+                            rotate_user_view_key_on_change(existing, record)
                         data.setdefault('users', {})[user_id] = record
                         pwd, expires = record['password'], record['expires_at']
                         ip_limit, limit_bytes = record['ip_limit'], record['limit_bytes']
@@ -4850,7 +4876,9 @@ if __name__ == '__main__':
                             return self.reply_json(404, {'ok': False, 'error': 'User not found'})
                         if 'password' in changes and password_taken(data.get('users', {}), changes['password'], user_id):
                             return self.reply_json(409, {'ok': False, 'error': 'Password already in use by another user'})
+                        previous = dict(u)
                         u.update(changes)
+                        rotate_user_view_key_on_change(previous, u)
                         result = {k: v for k, v in u.items() if k not in ('password', 'view_nonce')}
                     regenerate_page()
                     # 即使同值也重试权威同步；不得因上次写入已落盘而吞掉重载失败。
@@ -4862,17 +4890,33 @@ if __name__ == '__main__':
                     user_id = str(params.get('user_id', '')).strip()
                     if not VALID_USER_ID_RE.match(user_id):
                         return self.reply_json(400, {'ok': False, 'error': 'Invalid user_id format'})
-                    days = int(params.get('extend_days', 30))
-                    add_traffic_gb = float(params.get('add_traffic_gb', 0))
+                    try:
+                        raw_days = params.get('extend_days', 30)
+                        if isinstance(raw_days, bool) or not str(raw_days).isascii() or not str(raw_days).isdigit():
+                            raise ValueError()
+                        days = int(raw_days)
+                        raw_traffic = params.get('add_traffic_gb', 0)
+                        if isinstance(raw_traffic, bool):
+                            raise ValueError()
+                        add_traffic_gb = float(raw_traffic)
+                        if not 1 <= days <= 36500 or not math.isfinite(add_traffic_gb) or not 0 <= add_traffic_gb <= 1000000:
+                            raise ValueError()
+                        added_bytes = int(add_traffic_gb * (1024**3))
+                    except (ValueError, TypeError, OverflowError):
+                        return self.reply_json(400, {'ok': False, 'error': 'Invalid renewal: extend_days must be 1..36500; add_traffic_gb must be finite and 0..1000000'})
                     with data_lock:
                         u = data.get('users', {}).get(user_id)
                         if not u:
                             return self.reply_json(404, {'ok': False, 'error': 'User not found'})
                         base_time = max(u.get('expires_at', 0), now_ts)
-                        u['expires_at'] = base_time + days * 86400
-                        if add_traffic_gb > 0:
-                            u['limit_bytes'] = int(u.get('limit_bytes', 0)) + int(add_traffic_gb * (1024**3))
-                        u['status'] = 'active'
+                        try:
+                            new_expiry = int(base_time) + days * 86400
+                            new_limit = int(u.get('limit_bytes', 0)) + added_bytes
+                            if not 0 <= new_expiry <= 253402300799 or not 0 <= new_limit <= 2**63 - 1:
+                                raise ValueError()
+                        except (ValueError, TypeError, OverflowError):
+                            return self.reply_json(400, {'ok': False, 'error': 'Renewal exceeds supported limits'})
+                        u.update(expires_at=new_expiry, limit_bytes=new_limit, status='active')
                         exp_at = u['expires_at']
                         lim_b = u.get('limit_bytes', 0)
                     regenerate_page()
@@ -4928,7 +4972,9 @@ if __name__ == '__main__':
                         if not u:
                             return self.reply_json(404, {'ok': False, 'error': 'User not found'})
                         before = u.get('status', 'active')
+                        previous = dict(u)
                         u['status'] = want
+                        rotate_user_view_key_on_change(previous, u)
                     regenerate_page()
                     # ⚠️ 2026-10-04 补：停用/启用必须同步到 xray。
                     #
@@ -6443,6 +6489,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
 
                 if not self.is_authenticated() and not (k_val and hmac.compare_digest(k_val, expected_k)):
                     return self.reply(403, b'Access denied: invalid key')
+                if not user_share_available(u_copy):
+                    return self.reply(403, b'User subscription unavailable')
 
                 m = json.loads(meta_path.read_text(encoding='utf-8')) if meta_path.exists() else {}
                 pwd = u_copy.get('password', '')
@@ -7231,6 +7279,48 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
 
     class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
         daemon_threads = True
+
+        def __init__(self, *args, **kwargs):
+            self.slots = threading.BoundedSemaphore(8)
+            self.deadlines = {}
+            self.deadline_lock = threading.Lock()
+            super().__init__(*args, **kwargs)
+            threading.Thread(target=self.watch_deadlines, daemon=True).start()
+
+        def watch_deadlines(self):
+            while True:
+                time.sleep(0.25)
+                with self.deadline_lock:
+                    for connection, deadline in list(self.deadlines.items()):
+                        if time.monotonic() >= deadline:
+                            try:
+                                connection.shutdown(socket.SHUT_RDWR)
+                            except OSError:
+                                pass
+                            self.deadlines.pop(connection, None)
+
+        def process_request(self, request, address):
+            if not self.slots.acquire(blocking=False):
+                self.shutdown_request(request)
+                return
+            with self.deadline_lock:
+                self.deadlines[request] = time.monotonic() + 30
+            try:
+                super().process_request(request, address)
+            except Exception:
+                with self.deadline_lock:
+                    self.deadlines.pop(request, None)
+                self.slots.release()
+                raise
+
+        def process_request_thread(self, request, address):
+            try:
+                super().process_request_thread(request, address)
+            finally:
+                with self.deadline_lock:
+                    self.deadlines.pop(request, None)
+                self.slots.release()
+
 
     server = ThreadingHTTPServer(('127.0.0.1', data['port']), Handler)
     server.requests, server.failures, server.api_requests = [], [], []

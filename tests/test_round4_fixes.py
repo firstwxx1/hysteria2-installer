@@ -46,6 +46,7 @@ class ForwardedAuthTest(unittest.TestCase):
         body = json.dumps({'auth': 'wrong', 'addr': '203.0.113.9:1'}).encode()
         handler = mock.Mock()
         handler.path = '/auth'
+        handler.client_address = ('127.0.0.1', 12345)
         handler.headers = dict(headers, **{'Content-Length': str(len(body))})
         handler.rfile = io.BytesIO(body)
         handler.auth_rate_limited.return_value = False
