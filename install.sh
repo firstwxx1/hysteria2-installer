@@ -1486,6 +1486,21 @@ outbounds:
     type: socks5
     socks5:
       addr: 127.0.0.1:19898
+
+# 安全：禁止代理用户访问节点本机/内网/云元数据
+acl:
+  inline:
+    - reject(127.0.0.0/8)
+    - reject(10.0.0.0/8)
+    - reject(172.16.0.0/12)
+    - reject(192.168.0.0/16)
+    - reject(169.254.0.0/16)
+    - reject(100.64.0.0/10)
+    - reject(0.0.0.0/8)
+    - reject(::1/128)
+    - reject(fc00::/7)
+    - reject(fe80::/10)
+    - direct_ipv4(all)
 EOF
 
     # 写入 toggle_warp.sh 控制脚本，供 portal.py 或命令行无感知调用
@@ -1498,8 +1513,8 @@ CONFIG="/etc/hysteria/config.yaml"
 # 记录改动前的 acl 段，供收尾判断是否需要重启
 BEFORE_ACL=$(sed -n '/^acl:/,$p' "$CONFIG")
 
-# 清理旧 acl 段
-sed -i "/^acl:/,\$d" "$CONFIG"
+# 清理旧 acl 段：只删 acl 块本身，obfs 等排在其后的顶格段落必须保留
+awk 'BEGIN{d=0} /^acl:/{d=1;next} d && /^[^ \t#]/{d=0} !d' "$CONFIG" > "$CONFIG.tmp" && cat "$CONFIG.tmp" > "$CONFIG" && rm -f "$CONFIG.tmp"
 
 if [[ "$ACTION" == "1" ]]; then
     # 统一走 wgcf + wireproxy 出口（不再依赖官方 warp-cli）：探活失败则拉起 wireproxy
@@ -1510,6 +1525,16 @@ if [[ "$ACTION" == "1" ]]; then
     cat >> "$CONFIG" <<'EOF'
 acl:
   inline:
+    - reject(127.0.0.0/8)
+    - reject(10.0.0.0/8)
+    - reject(172.16.0.0/12)
+    - reject(192.168.0.0/16)
+    - reject(169.254.0.0/16)
+    - reject(100.64.0.0/10)
+    - reject(0.0.0.0/8)
+    - reject(::1/128)
+    - reject(fc00::/7)
+    - reject(fe80::/10)
     - warp_socks(suffix:ipify.org)
     - warp_socks(suffix:cloudflare.com)
     - warp_socks(suffix:openai.com)
@@ -1533,6 +1558,25 @@ acl:
     - warp_socks(generativelanguage.googleapis.com)
     - warp_socks(anthropic.com)
     - warp_socks(claude.ai)
+EOF
+fi
+
+if ! grep -q '^acl:' "$CONFIG"; then
+    # 关闭 WARP 时也保留内网拦截
+    cat >> "$CONFIG" <<'EOF'
+acl:
+  inline:
+    - reject(127.0.0.0/8)
+    - reject(10.0.0.0/8)
+    - reject(172.16.0.0/12)
+    - reject(192.168.0.0/16)
+    - reject(169.254.0.0/16)
+    - reject(100.64.0.0/10)
+    - reject(0.0.0.0/8)
+    - reject(::1/128)
+    - reject(fc00::/7)
+    - reject(fe80::/10)
+    - direct_ipv4(all)
 EOF
 fi
 

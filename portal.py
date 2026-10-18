@@ -432,6 +432,15 @@ def strip_managed_outbounds(cfg_text):
     return '\n'.join(out)
 
 
+# 安全：代理用户不得访问节点本机/内网/云元数据（如 127.0.0.1 上的面板、
+# Docker 网段、169.254.169.254）。所有生成的 ACL 都以这些 reject 开头。
+PRIVATE_REJECT_RULES = ['127.0.0.0/8', '10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16', '169.254.0.0/16', '100.64.0.0/10', '0.0.0.0/8', '::1/128', 'fc00::/7', 'fe80::/10']
+
+
+def _acl_head():
+    return ['acl:', '  inline:'] + ['    - reject(%s)' % c for c in PRIVATE_REJECT_RULES]
+
+
 def build_acl_block(mode, rules, outbounds, tail_outbound='direct', existing_names=None):
     """生成 acl.inline 块。
 
@@ -444,7 +453,7 @@ def build_acl_block(mode, rules, outbounds, tail_outbound='direct', existing_nam
     names = [ob['name'] for ob in (outbounds or [])]
     existing = set(_existing_outbound_names() if existing_names is None else existing_names)
     available = set(names) | existing | {'direct', 'reject'}
-    acl = ['acl:', '  inline:']
+    acl = _acl_head()
 
     if mode == 'global' and names:
         acl.append('    - %s(all)' % names[0])
@@ -488,7 +497,8 @@ def build_warp_acl_config(original, enabled, rules):
     custom_rules = [r for r in (rules or ()) if isinstance(r, dict)
                     and r.get('outbound') not in ('', None, 'warp', 'warp_socks')]
     if not enabled and not custom_rules:
-        return text.rstrip('\n') + '\n'
+        tail0 = 'direct_ipv4' if re.search(r'^\s*-\s*name:\s*direct_ipv4\s*$', text, re.M) else 'direct'
+        return text.rstrip('\n') + '\n\n' + '\n'.join(_acl_head() + ['    - %s(all)' % tail0]) + '\n'
 
     existing = re.findall(r'^\s*-\s*name:\s*(\S+)\s*$', text, re.M)
     warp_name = 'warp_socks' if 'warp_socks' in existing else 'warp'
@@ -505,7 +515,7 @@ def build_warp_acl_config(original, enabled, rules):
     if not re.search(r'^sniff:', text, re.M):
         text = text.rstrip('\n') + '\n\nsniff:\n  enable: true\n  timeout: 2s\n  rewriteDomain: false\n  tcpPorts: 80,443\n  udpPorts: 443\n'
     tail = 'direct_ipv4' if 'direct_ipv4' in existing else 'direct'
-    lines = ['acl:', '  inline:']
+    lines = _acl_head()
     for rule in (rules or ()) if enabled else custom_rules:
         domain = rule.get('domain', '') if isinstance(rule, dict) else rule
         target = rule.get('outbound') or warp_name if isinstance(rule, dict) else warp_name
