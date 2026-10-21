@@ -36,6 +36,44 @@ JS_CONSTANTS = ('SCRIPT', 'LOGIN_SCRIPT', 'USER_SCRIPT')
 SOURCE_FILES = ('portal.py', 'portal_assets.py')
 
 
+class VersionUiBehaviorTests(unittest.TestCase):
+    @unittest.skipUnless(NODE, 'requires node')
+    def test_production_version_check_four_states(self):
+        script = portal.SCRIPT
+        code = script[script.index('// 版本检测与一键更新交互'):script.index('async function waitForCoreUpgrade')]
+        harness = r'''
+const assert = require('assert');
+const elements = {};
+const document = {getElementById: id => elements[id] ||= {style: {}, textContent: ''}};
+const location = {pathname: '/fixture/'};
+let payload;
+const fetch = async () => ({ok:true, json:async () => payload});
+const doUpgrade = () => {};
+'''
+        checks = r'''
+(async () => {
+  for (const state of ['current', 'update', 'unknown', 'partial']) {
+    payload = {ok:true, core_current:'2.6.4', core_latest:'2.6.4',
+      portal_current:'aaaaaaa', portal_latest:state === 'current' ? 'aaaaaaa' : state === 'update' ? 'bbbbbbb' : '',
+      portal_has_update:['update','partial'].includes(state),
+      portal_update_status:state === 'unknown' ? 'unknown' : state === 'current' ? 'up_to_date' : 'update_available',
+      awg_installed:false};
+    assert.strictEqual(await checkVersions(), true);
+    const text = elements['portal-ver-display'].textContent;
+    assert.strictEqual(elements['btn-update-portal'].style.display,
+      payload.portal_has_update ? 'inline-flex' : 'none');
+    if (state === 'current') assert(text.includes('（最新）'));
+    if (state === 'unknown') {assert(text.includes('无法确认')); assert(!text.includes('（最新）'));}
+    if (payload.portal_has_update) assert(text.includes('有新版本'));
+    if (state === 'partial') assert(text.includes('部分文件'));
+  }
+})().catch(e => {console.error(e); process.exitCode = 1;});
+'''
+        result = subprocess.run([NODE, '-e', harness + code + checks], capture_output=True,
+                                text=True, encoding='utf-8')
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+
 def _find_literal(name):
     """在两个源文件里找常量定义，返回 (文件路径, 源码字面量原文)。"""
     for fname in SOURCE_FILES:

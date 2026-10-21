@@ -37,7 +37,10 @@ class WarpAclApplyTests(unittest.TestCase):
     def test_disabled_removes_acl_but_preserves_outbound_and_obfs(self):
         enabled = portal.build_warp_acl_config(BASE_CONFIG, True, ['openai.com'])
         result = portal.build_warp_acl_config(enabled, False, ['openai.com'])
-        self.assertNotIn('\nacl:\n', result)
+        self.assertIn('\nacl:\n', result)
+        for cidr in portal.PRIVATE_REJECT_RULES:
+            self.assertIn('reject(' + cidr + ')', result)
+        self.assertNotIn('warp_socks(suffix:', result)
         self.assertIn('name: warp_socks', result)
         self.assertIn('password: test-only', result)
         self.assertTrue(portal.warp_acl_matches(result, False, ['openai.com']))
@@ -60,7 +63,10 @@ class WarpAclApplyTests(unittest.TestCase):
 
     def test_warp_status_predicate_detects_missing_acl(self):
         self.assertFalse(portal.warp_acl_matches(BASE_CONFIG, True, ['openai.com']))
-        self.assertTrue(portal.warp_acl_matches(BASE_CONFIG, False, ['openai.com']))
+        # 即使关闭 WARP，缺少内网拒绝 ACL 的旧配置也应被判为未应用。
+        self.assertFalse(portal.warp_acl_matches(BASE_CONFIG, False, ['openai.com']))
+        secured = portal.build_warp_acl_config(BASE_CONFIG, False, ['openai.com'])
+        self.assertTrue(portal.warp_acl_matches(secured, False, ['openai.com']))
 
     def test_reload_exception_rolls_back_original_config(self):
         with tempfile.TemporaryDirectory() as tmp:

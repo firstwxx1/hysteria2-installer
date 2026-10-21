@@ -137,6 +137,7 @@ class LiveIpLimitTest(unittest.TestCase):
         body = json.dumps({'auth': 'pw', 'addr': addr}).encode()
 
         class Handler:
+            client_address = ('127.0.0.1', 12345)
             path = '/auth'
             headers = {'Content-Length': str(len(body))}
             rfile = io.BytesIO(body)

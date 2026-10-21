@@ -1486,6 +1486,21 @@ outbounds:
     type: socks5
     socks5:
       addr: 127.0.0.1:19898
+
+# 安全：禁止代理用户访问节点本机/内网/云元数据
+acl:
+  inline:
+    - reject(127.0.0.0/8)
+    - reject(10.0.0.0/8)
+    - reject(172.16.0.0/12)
+    - reject(192.168.0.0/16)
+    - reject(169.254.0.0/16)
+    - reject(100.64.0.0/10)
+    - reject(0.0.0.0/8)
+    - reject(::1/128)
+    - reject(fc00::/7)
+    - reject(fe80::/10)
+    - direct_ipv4(all)
 EOF
 
     # 写入 toggle_warp.sh 控制脚本，供 portal.py 或命令行无感知调用
@@ -1498,8 +1513,8 @@ CONFIG="/etc/hysteria/config.yaml"
 # 记录改动前的 acl 段，供收尾判断是否需要重启
 BEFORE_ACL=$(sed -n '/^acl:/,$p' "$CONFIG")
 
-# 清理旧 acl 段
-sed -i "/^acl:/,\$d" "$CONFIG"
+# 清理旧 acl 段：只删 acl 块本身，obfs 等排在其后的顶格段落必须保留
+awk 'BEGIN{d=0} /^acl:/{d=1;next} d && /^[^ \t#]/{d=0} !d' "$CONFIG" > "$CONFIG.tmp" && cat "$CONFIG.tmp" > "$CONFIG" && rm -f "$CONFIG.tmp"
 
 if [[ "$ACTION" == "1" ]]; then
     # 统一走 wgcf + wireproxy 出口（不再依赖官方 warp-cli）：探活失败则拉起 wireproxy
@@ -1510,6 +1525,16 @@ if [[ "$ACTION" == "1" ]]; then
     cat >> "$CONFIG" <<'EOF'
 acl:
   inline:
+    - reject(127.0.0.0/8)
+    - reject(10.0.0.0/8)
+    - reject(172.16.0.0/12)
+    - reject(192.168.0.0/16)
+    - reject(169.254.0.0/16)
+    - reject(100.64.0.0/10)
+    - reject(0.0.0.0/8)
+    - reject(::1/128)
+    - reject(fc00::/7)
+    - reject(fe80::/10)
     - warp_socks(suffix:ipify.org)
     - warp_socks(suffix:cloudflare.com)
     - warp_socks(suffix:openai.com)
@@ -1533,6 +1558,25 @@ acl:
     - warp_socks(generativelanguage.googleapis.com)
     - warp_socks(anthropic.com)
     - warp_socks(claude.ai)
+EOF
+fi
+
+if ! grep -q '^acl:' "$CONFIG"; then
+    # 关闭 WARP 时也保留内网拦截
+    cat >> "$CONFIG" <<'EOF'
+acl:
+  inline:
+    - reject(127.0.0.0/8)
+    - reject(10.0.0.0/8)
+    - reject(172.16.0.0/12)
+    - reject(192.168.0.0/16)
+    - reject(169.254.0.0/16)
+    - reject(100.64.0.0/10)
+    - reject(0.0.0.0/8)
+    - reject(::1/128)
+    - reject(fc00::/7)
+    - reject(fe80::/10)
+    - direct_ipv4(all)
 EOF
 fi
 
@@ -1592,6 +1636,10 @@ elif [[ "$TARGET" == "portal" ]]; then
     # 说明：Web 控制台的面板自更新已不走本脚本（它在 portal.py 内部用同一套回退
     # 取文件并原子替换），这里保留是为了手工调用 do_upgrade.sh portal 的场景。
     REPO="yys9253462-gif/hysteria2-installer"
+    # 固定一次提交后，所有回退源都读取相同快照。
+    _bundle_ref="$(curl -fsSL --max-time 15 "https://api.github.com/repos/${REPO}/commits/main" |
+        python3 -c 'import json,re,sys; s=json.load(sys.stdin).get("sha", ""); assert re.fullmatch("[0-9a-f]{40}", s); print(s)')" || exit 1
+    [[ "$_bundle_ref" =~ ^[0-9a-f]{40}$ ]] || { echo "无法固定门户版本，保留全部旧文件" >&2; exit 1; }
     _bundle_dir="$(mktemp -d)"
     _bundle_files="portal.py portal_assets.py usage-meter-core-20261007-v1.py usage-meter-readers-20261007-v1.py usage-meter-runtime-20261007-v1.py usage-meter-xray-config-20261007-v1.py"
     # 全部先下载并检查；旧缓存、缺文件或语法错误不允许半更新。
@@ -1604,9 +1652,9 @@ elif [[ "$TARGET" == "portal" ]]; then
         esac
         _tmp_m="$_bundle_dir/$_m"
         _file_ok=0
-        for _url in "https://api.github.com/repos/${REPO}/contents/${_m}?ref=main" \
-                    "https://cdn.jsdelivr.net/gh/${REPO}@main/${_m}" \
-                    "https://raw.githubusercontent.com/${REPO}/main/${_m}"; do
+        for _url in "https://api.github.com/repos/${REPO}/contents/${_m}?ref=${_bundle_ref}" \
+                    "https://cdn.jsdelivr.net/gh/${REPO}@${_bundle_ref}/${_m}" \
+                    "https://raw.githubusercontent.com/${REPO}/${_bundle_ref}/${_m}"; do
             if curl -fsSL --max-time 30 -H "Accept: application/vnd.github.raw" "$_url" -o "$_tmp_m" 2>/dev/null &&
                grep -Fq "$_marker" "$_tmp_m" &&
                python3 -c 'import ast,sys; ast.parse(open(sys.argv[1],encoding="utf-8").read())' "$_tmp_m" 2>/dev/null; then
@@ -2043,7 +2091,7 @@ portal_fetch_files() {
         if [[ "$mode" == "api" ]]; then
             # 逐个文件报错，不要只留最后一个（错误被覆盖会把排查带偏）
             if ! curl -fsSL --max-time 30 -H "Accept: application/vnd.github.raw" \
-                 "${base}/${f}?ref=main" -o "${dir}/${f}" 2>/dev/null; then
+                 "${base}/${f}?ref=${PORTAL_FETCH_REF}" -o "${dir}/${f}" 2>/dev/null; then
                 _fetch_files_err="下载 ${f} 失败"
                 return 1
             fi
@@ -2074,6 +2122,15 @@ portal_fetch_py() {
     PORTAL_FETCH_ERR=""
     PORTAL_FETCH_FILES_ERR=""
     PORTAL_FETCH_ALL_VERIFY_FAILED=0
+    # 只解析一次 main，防止下载过程中 main 前进导致整包跨版本。
+    local PORTAL_FETCH_REF
+    PORTAL_FETCH_REF="$(curl -fsSL --max-time 15 "https://api.github.com/repos/${repo}/commits/main" |
+        python3 -c 'import json,re,sys; s=json.load(sys.stdin).get("sha", ""); assert re.fullmatch("[0-9a-f]{40}", s); print(s)')" || {
+        PORTAL_FETCH_ERR="无法固定门户版本，未下载或修改门户文件"; return 1;
+    }
+    if [[ ! "$PORTAL_FETCH_REF" =~ ^[0-9a-f]{40}$ ]]; then
+        PORTAL_FETCH_ERR="无法固定门户版本，未下载或修改门户文件"; return 1
+    fi
     # spec 格式：名称|base|模式
     while IFS='|' read -r name base mode; do
         [[ -z "$name" ]] && continue
@@ -2095,8 +2152,8 @@ portal_fetch_py() {
         PORTAL_FETCH_ERR="${PORTAL_FETCH_ERR}  [${name}] ${why}"$'\n'
     done <<EOF
 GitHub API|https://api.github.com/repos/${repo}/contents|api
-jsDelivr|https://cdn.jsdelivr.net/gh/${repo}@main|plain
-raw.githubusercontent|https://raw.githubusercontent.com/${repo}/main|plain
+jsDelivr|https://cdn.jsdelivr.net/gh/${repo}@${PORTAL_FETCH_REF}|plain
+raw.githubusercontent|https://raw.githubusercontent.com/${repo}/${PORTAL_FETCH_REF}|plain
 EOF
     return 1
 }

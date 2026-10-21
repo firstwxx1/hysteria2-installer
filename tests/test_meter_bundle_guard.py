@@ -64,6 +64,11 @@ curl() {
       *) shift;;
     esac
   done
+  if [[ "$url" == */commits/main ]]; then
+    printf '{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}'
+    return
+  fi
+  [[ "$url" == *aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa* ]] || return 9
   local file="${url##*/}"; file="${file%%\\?*}"
   cp "$PWD/fixture/$file" "$dest"
 }
@@ -73,6 +78,26 @@ curl() {
                 for name in FILES:
                     expected = ('original-' + name).encode() if stale else (fixture / name).read_bytes()
                     self.assertEqual((target / name).read_bytes(), expected)
+
+    def test_installer_pins_snapshot_and_rejects_unresolvable_ref(self):
+        source = (ROOT / 'install.sh').read_text(encoding='utf-8')
+        body = source.split('portal_fetch_py() {', 1)[1].split('\n}\n', 1)[0]
+        for resolve in (True, False):
+            with self.subTest(resolve=resolve), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                script = '''AWG_REPO=owner/repo
+curl() { printf '%s' 'PAYLOAD'; }
+portal_fetch_files() {
+  [[ "$PORTAL_FETCH_REF" == aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ]] || return 7
+  [[ "$2" != *'@main'* && "$2" != */main ]] || return 8
+  printf '%s' "$PORTAL_FETCH_REF" > "$1/pinned"
+}
+portal_files_ok() { return 0; }
+'''.replace('PAYLOAD', '{"sha":"' + 'a' * 40 + '"}' if resolve else '{}')
+                result = self.run_shell(script + 'portal_fetch_py() {' + body +
+                                        '\n}\nportal_fetch_py "$PWD"\n', root)
+                self.assertEqual(result.returncode == 0, resolve, result.stderr)
+                self.assertEqual((root / 'pinned').exists(), resolve)
 
     def test_generated_upgrade_script_syntax(self):
         source = (ROOT / 'install.sh').read_text(encoding='utf-8')

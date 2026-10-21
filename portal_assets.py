@@ -1540,8 +1540,9 @@ const btnRecheckUpdate = document.getElementById('btn-recheck-update');
 function fmtVer(current, latest, hasUpdate, installed) {
   if (installed === false) return '未安装';
   if (!current || current === '未安装') return '未安装';
+  if (hasUpdate) return current + ' → ' + (latest || '新版本（部分文件尚未完成比对）') + ' 有新版本';
   if (!latest) return current + '（远端未取到，无法比对）';
-  return hasUpdate ? (current + ' → ' + latest + ' 有新版本') : (current + '（最新）');
+  return current + '（最新）';
 }
 
 async function checkVersions(force = false) {
@@ -1560,7 +1561,9 @@ async function checkVersions(force = false) {
     }
 
     // 面板展示
-    portalVerDisplay.textContent = fmtVer(json.portal_current, json.portal_latest, json.portal_has_update, true);
+    portalVerDisplay.textContent = json.portal_update_status === 'unknown'
+      ? json.portal_current + '（整包检测不完整，无法确认是否最新）'
+      : fmtVer(json.portal_current, json.portal_latest, json.portal_has_update, true);
     if (btnUpdatePortal) {
       btnUpdatePortal.style.display = json.portal_has_update ? 'inline-flex' : 'none';
       btnUpdatePortal.onclick = () => doUpgrade('portal');

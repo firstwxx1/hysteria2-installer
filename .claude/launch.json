@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "version-check-preview",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["tests/preview_version_check.py"],
+      "port": 8765
+    }
+  ]
+}

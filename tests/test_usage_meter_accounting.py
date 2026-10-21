@@ -190,6 +190,7 @@ class MeterAccountingTest(unittest.TestCase):
         exec(compile(ast.fix_missing_locations(ast.Module(body=[fn], type_ignores=[])), 'auth-quota', 'exec'), env)
         body = json.dumps({'auth': 'unchanged', 'addr': '127.0.0.1:1234'}).encode()
         class Handler:
+            client_address = ('127.0.0.1', 12345)
             path = '/auth'
             headers = {'Content-Length': str(len(body))}
             rfile = io.BytesIO(body)
@@ -234,7 +235,11 @@ class MeterAccountingTest(unittest.TestCase):
         def blob(path):
             content = Path(path).read_bytes()
             return hashlib.sha1(b'blob ' + str(len(content)).encode() + b'\0' + content).hexdigest()
-        env = {'Path': Path, 'PORTAL_SELF': ROOT / 'portal.py', 'AWG_CTL': ROOT / 'awgctl.sh',
+        import portal
+        env = {'PORTAL_BUNDLE_FILES': portal.PORTAL_BUNDLE_FILES,
+               'portal_bundle_version': portal.portal_bundle_version,
+               '_remote_root_shas': lambda: None,
+               'Path': Path, 'PORTAL_SELF': ROOT / 'portal.py', 'AWG_CTL': ROOT / 'awgctl.sh',
                '_local_blob_sha': blob, '_version_triple': lambda path, name: ('current', 'latest', True),
                '_usage_runtime': runtime, 'usage_meter': self.meter,
                'usage_summary': self.meter.summary, 'MASTER_USER_ID': 'admin_master',

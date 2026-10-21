@@ -432,6 +432,15 @@ def strip_managed_outbounds(cfg_text):
     return '\n'.join(out)
 
 
+# 安全：代理用户不得访问节点本机/内网/云元数据（如 127.0.0.1 上的面板、
+# Docker 网段、169.254.169.254）。所有生成的 ACL 都以这些 reject 开头。
+PRIVATE_REJECT_RULES = ['127.0.0.0/8', '10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16', '169.254.0.0/16', '100.64.0.0/10', '0.0.0.0/8', '::1/128', 'fc00::/7', 'fe80::/10']
+
+
+def _acl_head():
+    return ['acl:', '  inline:'] + ['    - reject(%s)' % c for c in PRIVATE_REJECT_RULES]
+
+
 def build_acl_block(mode, rules, outbounds, tail_outbound='direct', existing_names=None):
     """生成 acl.inline 块。
 
@@ -444,7 +453,7 @@ def build_acl_block(mode, rules, outbounds, tail_outbound='direct', existing_nam
     names = [ob['name'] for ob in (outbounds or [])]
     existing = set(_existing_outbound_names() if existing_names is None else existing_names)
     available = set(names) | existing | {'direct', 'reject'}
-    acl = ['acl:', '  inline:']
+    acl = _acl_head()
 
     if mode == 'global' and names:
         acl.append('    - %s(all)' % names[0])
@@ -488,7 +497,8 @@ def build_warp_acl_config(original, enabled, rules):
     custom_rules = [r for r in (rules or ()) if isinstance(r, dict)
                     and r.get('outbound') not in ('', None, 'warp', 'warp_socks')]
     if not enabled and not custom_rules:
-        return text.rstrip('\n') + '\n'
+        tail0 = 'direct_ipv4' if re.search(r'^\s*-\s*name:\s*direct_ipv4\s*$', text, re.M) else 'direct'
+        return text.rstrip('\n') + '\n\n' + '\n'.join(_acl_head() + ['    - %s(all)' % tail0]) + '\n'
 
     existing = re.findall(r'^\s*-\s*name:\s*(\S+)\s*$', text, re.M)
     warp_name = 'warp_socks' if 'warp_socks' in existing else 'warp'
@@ -505,7 +515,7 @@ def build_warp_acl_config(original, enabled, rules):
     if not re.search(r'^sniff:', text, re.M):
         text = text.rstrip('\n') + '\n\nsniff:\n  enable: true\n  timeout: 2s\n  rewriteDomain: false\n  tcpPorts: 80,443\n  udpPorts: 443\n'
     tail = 'direct_ipv4' if 'direct_ipv4' in existing else 'direct'
-    lines = ['acl:', '  inline:']
+    lines = _acl_head()
     for rule in (rules or ()) if enabled else custom_rules:
         domain = rule.get('domain', '') if isinstance(rule, dict) else rule
         target = rule.get('outbound') or warp_name if isinstance(rule, dict) else warp_name
@@ -836,6 +846,31 @@ def portal_update_restart_script(port, backups, created, wait_seconds=20):
             'logger -t hysteria-portal "面板更新后未能启动，已自动回滚到旧版本"; '
             '%s %s systemctl restart hysteria-portal'
             % (int(wait_seconds), shlex.quote(probe), restore, remove))
+
+
+PORTAL_BUNDLE_FILES = (
+    'portal.py', 'portal_assets.py', 'usage-meter-core-20261007-v1.py',
+    'usage-meter-readers-20261007-v1.py', 'usage-meter-runtime-20261007-v1.py',
+    'usage-meter-xray-config-20261007-v1.py',
+)
+
+
+def portal_bundle_version(local_shas, remote_shas):
+    """Compare every required file; partial observations cannot establish currency."""
+    remote_shas = remote_shas or {}
+    valid = lambda sha: isinstance(sha, str) and re.fullmatch(r'[0-9a-f]{40}', sha)
+    changed = [name for name in PORTAL_BUNDLE_FILES
+               if valid(remote_shas.get(name)) and local_shas.get(name) != remote_shas[name]]
+    unknown = [name for name in PORTAL_BUNDLE_FILES if not valid(remote_shas.get(name))]
+    status = 'update_available' if changed else ('unknown' if unknown else 'up_to_date')
+    def fingerprint(shas):
+        if not all(valid(shas.get(name)) for name in PORTAL_BUNDLE_FILES):
+            return ''
+        return hashlib.sha256(''.join(name + ':' + shas[name] + '\n'
+                                     for name in PORTAL_BUNDLE_FILES).encode()).hexdigest()[:7]
+    return {'status': status, 'has_update': bool(changed), 'changed_files': changed,
+            'unknown_files': unknown, 'current': fingerprint(local_shas) or '不完整',
+            'latest': fingerprint(remote_shas)}
 
 
 def resolve_update_ref(ref):
@@ -1995,7 +2030,7 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
     </div>
 
     <p style="font-size:11.5px;color:var(--muted);margin:10px 0 0;line-height:1.75">
-      版本按<b>文件内容哈希</b>（git blob sha）与仓库 main 分支当前内容比对，不是按日期或提交号 —— 面板文件本身不带 git 元数据。
+      面板按<b>六个文件的整包内容指纹</b>与仓库 main 分支比对，任何文件不同或缺失都会提示更新；远端检测不完整时会明确提示。核心与 AWG 分别检测版本与文件内容。
       更新面板时会先留一份 <code>.bak</code> 备份再原子替换，并自动重启面板服务；更新 AWG 引擎不会影响已发放的客户端配置。
       远端结果在服务端缓存 5 分钟，避免触发 GitHub 的接口限流。
     </p>
@@ -6787,8 +6822,12 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             # 面板自身与 AWG 引擎：用 git blob sha 比对文件内容。
             # 原实现依赖 data['portal_sha']，但那个字段从来没被写入过，
             # 导致 portal_has_update 恒为 False、「更新面板」按钮永远不显示。
-            portal_curr, portal_latest, portal_has_update = _version_triple(
-                str(PORTAL_SELF), 'portal.py')
+            local_bundle = {name: _local_blob_sha(PORTAL_SELF.parent / name)
+                            for name in PORTAL_BUNDLE_FILES}
+            bundle_version = portal_bundle_version(local_bundle, _remote_root_shas())
+            portal_curr = bundle_version['current']
+            portal_latest = bundle_version['latest']
+            portal_has_update = bundle_version['has_update']
             awg_curr, awg_latest, awg_has_update = _version_triple(
                 AWG_CTL, 'awgctl.sh')
 
@@ -6801,11 +6840,12 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 'portal_current': portal_curr,
                 'portal_latest': portal_latest,
                 'portal_has_update': portal_has_update,
+                'portal_update_status': bundle_version['status'],
                 'portal_bundle': {
-                    'files': {name: _local_blob_sha(PORTAL_SELF.parent / name) for name in (
-                        'portal.py', 'portal_assets.py', 'usage-meter-core-20261007-v1.py',
-                        'usage-meter-readers-20261007-v1.py', 'usage-meter-runtime-20261007-v1.py',
-                        'usage-meter-xray-config-20261007-v1.py')},
+                    'files': local_bundle,
+                    'status': bundle_version['status'],
+                    'changed_files': bundle_version['changed_files'],
+                    'unknown_files': bundle_version['unknown_files'],
                     'runtime_revision': getattr(_usage_runtime, 'ACCOUNTING_REVISION', '')
                                         if usage_meter is not None else '',
                     'meter_initialized': usage_meter is not None,
