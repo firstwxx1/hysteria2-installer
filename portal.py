@@ -1432,7 +1432,7 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
         </div>
 
         <div class="form-field">
-          <label for="f_iplimit">同时在线 IP 限制 <span>0 为不限</span></label>
+          <label for="f_iplimit">同时在线网络数 <span>按公网 IP 计，0 为不限</span></label>
           <input id="f_iplimit" name="ip_limit" type="number" min="0" max="100" value="0" placeholder="例如填 1 或 2">
           <small>限制单人或单家庭设备同时使用</small>
         </div>
@@ -2193,7 +2193,8 @@ def user_page_html(server_name, host, listen_port, obfs_badge, uid, uinfo, uri, 
 
     expires_str = time.strftime("%Y-%m-%d %H:%M", time.localtime(uinfo["expires_at"])) if uinfo.get("expires_at") is not None and uinfo["expires_at"] < 2000000000 else "永久有效"
     ip_limit = uinfo.get("ip_limit", 0)
-    ip_limit_str = f"{ip_limit} 台设备" if ip_limit > 0 else "不限制"
+    # 按公网 IP 计：同一 Wi-Fi 下多台设备只占 1 个名额，文案不能写成「台设备」。
+    ip_limit_str = f"{ip_limit} 个网络（同一网络下设备不限）" if ip_limit > 0 else "不限制"
 
     if limit_bytes > 0:
         percent = min(round((used_bytes / limit_bytes) * 100), 100)
