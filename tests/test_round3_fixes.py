@@ -122,7 +122,7 @@ class RestartWhileSuspendedTest(unittest.TestCase):
 
 
 class LiveIpLimitTest(unittest.TestCase):
-    def auth(self, addr, live_ips):
+    def auth(self, addr, live_ips, reality_ips=()):
         auth_if = next(n for n in ast.walk(TREE) if isinstance(n, ast.If)
                        and ast.unparse(n.test) == "self.path == '/auth'")
         fn = ast.parse('def handle(self):\n    pass').body[0]
@@ -132,7 +132,8 @@ class LiveIpLimitTest(unittest.TestCase):
         env = {'json': json, 'time': time, 'hmac': __import__('hmac'),
                'ipaddress': __import__('ipaddress'), 'data_lock': threading.RLock(),
                'data': data, 'ip_tracker': {}, 'IP_TIMEOUT_SECONDS': 180,
-               'live_online_ips': lambda uid: set(live_ips)}
+               'live_online_ips': lambda uid: set(live_ips),
+               'reality_live_ips': lambda uid: set(reality_ips)}
         exec(compile(ast.fix_missing_locations(ast.Module(body=[fn], type_ignores=[])), 'auth', 'exec'), env)
         body = json.dumps({'auth': 'pw', 'addr': addr}).encode()
 
@@ -157,6 +158,12 @@ class LiveIpLimitTest(unittest.TestCase):
         response = self.auth('198.51.100.2:5000', live_ips={'198.51.100.1'})
         self.assertFalse(response['ok'])
         self.assertIn('Concurrent IP limit', response['msg'])
+
+    def test_reality_device_counts_against_hy2_quota(self):
+        """两个协议共用一个上限：Reality 已占满时 Hy2 新 IP 也要被拒。"""
+        response = self.auth('198.51.100.2:5000', live_ips=(), reality_ips={'198.51.100.1'})
+        self.assertFalse(response['ok'])
+        self.assertTrue(self.auth('198.51.100.1:5000', live_ips=(), reality_ips={'198.51.100.1'})['ok'])
 
     def test_same_device_reconnecting_is_allowed(self):
         self.assertTrue(self.auth('198.51.100.1:5001', live_ips={'198.51.100.1'})['ok'])

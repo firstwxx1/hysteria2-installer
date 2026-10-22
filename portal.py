@@ -2807,6 +2807,143 @@ def user_access_allowed(info, now=None):
     except (ValueError, TypeError):
         return False
 
+REALITY_IPLIMIT_RELEASE_SECONDS = 180
+REALITY_IPLIMIT_TAG_PREFIX = 'iplimit-'
+
+
+def plan_reality_iplimit(limits, reality_ips, hy2_ips, state, now,
+                         release_after=REALITY_IPLIMIT_RELEASE_SECONDS):
+    """决定 Reality 上哪些 IP 放行、哪些拦截（纯函数，便于测试）。
+
+    Xray 没有按用户限 IP 的能力，所以由门户在外面做：每轮读一次 Reality 在线 IP，
+    与 Hy2 正在用的 IP 合并计数，「先到先得」放行前 N 个，其余的交给
+    apply_reality_iplimit 下发黑洞路由规则。
+
+    limits      {uid: ip_limit}，只含 ip_limit > 0 的用户
+    reality_ips {uid: set(ip)}，本轮 Xray 报告在线的 IP（被拦的 IP 也会出现：
+                连接进得来、鉴权通过，只是被路由进黑洞）
+    hy2_ips     {uid: set(ip)}，Hy2 正在用或 180 秒内鉴权过的 IP
+    state       {uid: {'admitted': {...}, 'blocked': {...}}}，跨轮次保留，原地更新
+
+    被拦的 IP **不计入**占用，否则会「拦了→掉线→名额空出→放行→又超限」来回跳。
+    放行过的 IP 断开后保留 release_after 秒，与 Hy2 的 IP_TIMEOUT_SECONDS 同一口径；
+    这也意味着满额用户切换网络后，旧 IP 要等这段时间才释放。
+    返回 {uid: set(要拦截的 ip)}。
+    """
+    for uid in list(state):
+        if uid not in limits:
+            state.pop(uid)
+    blocked_out = {}
+    for uid, limit in limits.items():
+        row = state.setdefault(uid, {'admitted': {}, 'blocked': {}})
+        # admitted: {ip: last_seen}；blocked: {ip: [first_blocked, last_seen]}。
+        # 被拦 IP 要单独记「开始等待的时间」，名额空出时按它排队。
+        admitted, blocked = row['admitted'], row['blocked']
+        seen = set(reality_ips.get(uid) or ())
+        for ip in list(admitted):
+            if ip in seen:
+                admitted[ip] = now
+            elif now - admitted[ip] >= release_after:
+                admitted.pop(ip)
+        for ip in list(blocked):
+            if ip in seen:
+                blocked[ip][1] = now
+            elif now - blocked[ip][1] >= release_after:
+                blocked.pop(ip)
+        occupied = set(hy2_ips.get(uid) or ()) | set(admitted)
+        # 先处理等待最久的被拦 IP，再处理新出现的；同一时间按 IP 排序保证结果确定。
+        waiting = sorted((ip for ip in seen if ip not in admitted),
+                         key=lambda ip: (ip not in blocked, blocked[ip][0] if ip in blocked else now, ip))
+        for ip in waiting:
+            if ip in occupied or len(occupied) < limit:
+                blocked.pop(ip, None)
+                admitted[ip] = now
+                occupied.add(ip)
+            elif ip not in blocked:
+                blocked[ip] = [now, now]
+        if blocked:
+            blocked_out[uid] = set(blocked)
+        if not admitted and not blocked:
+            state.pop(uid)
+    return blocked_out
+
+
+def reality_iplimit_rules(blocked):
+    """{uid: ips} -> {ruleTag: rule}。tag 由用户和 IP 集合派生：内容变了 tag 就变，
+    同步时只比对 tag 即可，不需要依赖 lsrules 回显规则内容（它不回显）。"""
+    rules = {}
+    for uid, ips in blocked.items():
+        if not ips:
+            continue
+        ips = sorted(ips)
+        digest = hashlib.sha256((uid + '|' + ','.join(ips)).encode()).hexdigest()
+        tag = '%s%s-%s' % (REALITY_IPLIMIT_TAG_PREFIX,
+                           hashlib.sha256(uid.encode()).hexdigest()[:12], digest[:12])
+        rules[tag] = {'ruleTag': tag, 'type': 'field', 'user': [uid], 'source': ips,
+                      'outboundTag': 'iplimit-block'}
+    return rules
+
+
+def apply_reality_iplimit(binary, address, desired, run=subprocess.run):
+    """把运行中 Xray 的 iplimit-* 规则同步成 desired。
+
+    规则只存在于 Xray 内存：Xray 一重启就清空，所以每轮都用 lsrules 对一次账，
+    而不是记住「上次下发过什么」。返回 (added, removed) 的 tag 数。
+    """
+    if not address.startswith('127.0.0.1:'):
+        raise ValueError('xray api must be loopback')
+    server = '--server=' + address
+    listed = run([binary, 'api', 'lsrules', server], capture_output=True, text=True, timeout=5)
+    if listed.returncode != 0:
+        raise RuntimeError('xray lsrules failed')
+    current = {str(r.get('ruleTag')) for r in (json.loads(listed.stdout or '{}').get('rules') or [])
+               if str(r.get('ruleTag', '')).startswith(REALITY_IPLIMIT_TAG_PREFIX)}
+    missing = [tag for tag in sorted(desired) if tag not in current]
+    stale = sorted(current - set(desired))
+    if missing:
+        with tempfile.NamedTemporaryFile('w', suffix='.json', delete=False, encoding='utf-8') as fh:
+            json.dump({'routing': {'rules': [desired[tag] for tag in missing]}}, fh)
+            rule_file = fh.name
+        try:
+            added = run([binary, 'api', 'adrules', server, '-append', rule_file],
+                        capture_output=True, text=True, timeout=5)
+        finally:
+            os.unlink(rule_file)
+        if added.returncode != 0:
+            raise RuntimeError('xray adrules failed')
+    # 先加新规则再删旧规则：同一用户换 IP 集合时不留「没有规则」的空窗。
+    if stale:
+        removed = run([binary, 'api', 'rmrules', server] + stale,
+                      capture_output=True, text=True, timeout=5)
+        if removed.returncode != 0:
+            raise RuntimeError('xray rmrules failed')
+    return len(missing), len(stale)
+
+
+def read_reality_online_ips(binary, address, uids, run=subprocess.run):
+    """{uid: set(ip)}：只查 uids 里当前在线的用户。读不到就抛异常，由调用方放行。"""
+    server = '--server=' + address
+    out = run([binary, 'api', 'statsgetallonlineusers', server], capture_output=True, text=True, timeout=5)
+    if out.returncode != 0:
+        raise RuntimeError('xray statsgetallonlineusers failed')
+    names = json.loads(out.stdout or '{}').get('users') or []
+    online = set()
+    for name in names:
+        parts = str(name).split('>>>')
+        online.add(parts[1] if len(parts) == 3 and parts[0] == 'user' else str(name))
+    result = {}
+    for uid in sorted(set(uids) & online):
+        got = run([binary, 'api', 'statsonlineiplist', server, '--email=' + uid],
+                  capture_output=True, text=True, timeout=5)
+        if got.returncode != 0:
+            raise RuntimeError('xray statsonlineiplist failed')
+        ips = json.loads(got.stdout or '{}').get('ips') or {}
+        if not isinstance(ips, dict):
+            raise ValueError('invalid online ip list')
+        result[uid] = {str(ipaddress.ip_address(ip)) for ip in ips}
+    return result
+
+
 def _systemd_state(unit):
     """systemctl is-active 的结果；拿不到（无 systemd、超时）时返回空串。"""
     try:
@@ -3801,6 +3938,87 @@ def serve(path):
             return set()
         return {str(item.get('ip')) for item in row.get('ips') or [] if item.get('ip')}
 
+    # ---- Reality 设备上限（2026-10-23）----
+    # Hy2 的上限在 /auth 里拦；Reality 不经过 /auth，由这个循环每轮读 Xray 在线 IP、
+    # 与 Hy2 合并计数，超出的 IP 下发黑洞路由规则。读不到在线数据时一律不拦人。
+    reality_iplimit_state = {}
+    reality_ip_snapshot = {'ips': {}, 'at': 0.0}
+
+    def reality_live_ips(uid):
+        """本循环最近一轮读到的该用户 Reality **放行中**的 IP，供 /auth 合并计数。"""
+        with data_lock:
+            if time.time() - reality_ip_snapshot['at'] >= 30:
+                return set()
+            row = reality_iplimit_state.get(uid) or {}
+            return set(row.get('admitted') or ())
+
+    def reality_iplimit_worker():
+        cfg_path = portal_path.parent / 'usage-meter-config.json'
+        xray_path = portal_path.parent / 'xray.json'
+        stats_path = Path(__file__).parent / 'usage-meter-xray-config-20261007-v1.py'
+        ready = False
+        enable_retry_at = 0.0
+        last_error = ''
+        binary = address = ''
+        while True:
+            try:
+                rcfg = (json.loads(cfg_path.read_text(encoding='utf-8')) if cfg_path.exists() else {}).get('reality') or {}
+                binary, address = rcfg.get('binary', ''), rcfg.get('address', '')
+                if not (binary and address and xray_path.exists() and Path(binary).is_file()):
+                    time.sleep(30); continue
+                if unit_suspended('xray') or _systemd_state('xray') != 'active':
+                    time.sleep(10); continue
+                if not ready:
+                    # 开启路由接口要重启一次 Xray；失败后 10 分钟内不再尝试，免得反复重启。
+                    if time.time() < enable_retry_at:
+                        time.sleep(30); continue
+                    enable_retry_at = time.time() + 600
+                    spec = importlib.util.spec_from_file_location('portal_iplimit_cfg', stats_path)
+                    mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+                    # 与到期收回（access_apply_lock）、Reality 重生成（reality_apply_lock）串行，
+                    # 否则两边同时改 xray.json，会有一方以「并发修改」失败一轮（jp 上线时踩过）。
+                    with access_apply_lock, reality_apply_lock:
+                        outcome = mod.enable_iplimit_routing(str(xray_path), binary, address)
+                    if outcome.get('changed'):
+                        print('[iplimit] 已为 Reality 开启设备上限路由接口，备份: %s' % outcome.get('backup'),
+                              file=sys.stderr)
+                    ready = True
+                    enable_retry_at = 0.0
+                with data_lock:
+                    limits = {uid: int(info.get('ip_limit', 0)) for uid, info in data.get('users', {}).items()
+                              if int(info.get('ip_limit', 0) or 0) > 0 and user_access_allowed(info)}
+                    now_ts = time.time()
+                    hy2 = {uid: {ip for ip, t in ip_tracker.get(uid, {}).items() if now_ts - t < IP_TIMEOUT_SECONDS}
+                           for uid in limits}
+                for uid in limits:
+                    hy2[uid] |= live_online_ips(uid)
+                reality = read_reality_online_ips(binary, address, limits)
+                with data_lock:
+                    blocked = plan_reality_iplimit(limits, reality, hy2, reality_iplimit_state, time.time())
+                    reality_ip_snapshot.update(ips=reality, at=time.time())
+                added, removed = apply_reality_iplimit(binary, address, reality_iplimit_rules(blocked))
+                if added or removed:
+                    print('[iplimit] Reality 拦截规则更新: +%d -%d，当前拦截 %d 个用户'
+                          % (added, removed, len(blocked)), file=sys.stderr)
+                last_error = ''
+            except Exception as exc:
+                # 读不到在线数据就不知道谁超限：放行（撤掉全部拦截），下一轮重试。
+                with data_lock:
+                    reality_ip_snapshot.update(ips={}, at=0.0)
+                    reality_iplimit_state.clear()
+                msg = type(exc).__name__ + ': ' + str(exc)[:120]
+                if msg != last_error:
+                    print('[iplimit] Reality 设备上限本轮跳过（已放行）: ' + msg, file=sys.stderr)
+                    last_error = msg
+                if ready:
+                    try:
+                        apply_reality_iplimit(binary, address, {})
+                    except Exception:
+                        pass
+                # 下一轮重新核对路由接口还在（xray.json 可能被别处重写）；已就绪时不会重启 Xray。
+                ready = False
+            time.sleep(5)
+
     def usage_summary(uid):
         if usage_meter is not None:
             return usage_meter.summary(uid)
@@ -4739,7 +4957,8 @@ if __name__ == '__main__':
                         active_ips = {ip: t for ip, t in tracker.items() if now_ts - t < IP_TIMEOUT_SECONDS}
                         ip_tracker[matched_uid] = active_ips
                         # 已连着的设备即使超过 180 秒没重新鉴权也要算在内。
-                        occupied = set(active_ips) | live_online_ips(matched_uid)
+                        # Reality 放行中的 IP 也占名额：两个协议共用同一个设备上限。
+                        occupied = set(active_ips) | live_online_ips(matched_uid) | reality_live_ips(matched_uid)
 
                         if client_ip not in occupied and len(occupied) >= ip_limit:
                             return self.reply_json(200, {'ok': False, 'msg': f'Concurrent IP limit exceeded ({ip_limit} max)'})
@@ -7414,6 +7633,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
     if usage_meter is not None:
         usage_meter.start()
     threading.Thread(target=expiry_access_worker,name="portal-expiry-enforcer",daemon=True).start()
+    threading.Thread(target=reality_iplimit_worker,name="portal-reality-iplimit",daemon=True).start()
     server.serve_forever()
 
 
