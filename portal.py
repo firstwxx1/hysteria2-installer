@@ -1328,12 +1328,12 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
 
 <!-- 顶部 Tab 导航栏 -->
 <div class="tab-bar">
-  <button class="tab-btn active" data-tab="connect">🚀 节点导入 (Connect)</button>
-  <button class="tab-btn" data-tab="users">👥 多用户管理 ({active_count}/{len(users)})</button>
-  <button class="tab-btn" data-tab="proxies">🧩 扩展服务</button>
-  <button class="tab-btn" data-tab="reality">🛡️ 备用通道与网络</button>
-  <button class="tab-btn" data-tab="cluster">🔑 接入控制台 / REST API</button>
-  <button class="tab-btn" data-tab="configs">⚙️ 系统与版本</button>
+  <button class="tab-btn active" data-tab="connect" type="button">🚀 节点导入 (Connect)</button>
+  <button class="tab-btn" data-tab="users" type="button">👥 多用户管理 ({active_count}/{len(users)})</button>
+  <button class="tab-btn" data-tab="proxies" type="button">🧩 扩展服务</button>
+  <button class="tab-btn" data-tab="reality" type="button">🛡️ 备用通道与网络</button>
+  <button class="tab-btn" data-tab="cluster" type="button">🔑 接入控制台 / REST API</button>
+  <button class="tab-btn" data-tab="configs" type="button">⚙️ 系统与版本</button>
 </div>
 
 <!-- Tab 1: 节点连接视图 -->
@@ -2575,6 +2575,82 @@ def _resolve_live_cert(root, config_path='/etc/hysteria/config.yaml'):
         cert_file = Path(root) / 'cert' / 'server.crt'
     cn, sans, self_signed = _parse_cert_subject(cert_file)
     return cert_file, cn, sans, self_signed
+
+
+def _cert_key_candidates(cert_file):
+    """按部署布局列出私钥可能的位置。
+
+    三种真实布局：
+      * ACME（Hysteria 内置）：<domain>.crt 与 <domain>.key 同目录；
+      * 安装器自签 / 指定证书：cert/server.crt 配 cert/server.key；
+      * Caddy / certbot：fullchain.pem 配 privkey.pem，*.crt 配同名 *.key。
+    只按文件名推断，不跨目录乱找 —— 找错私钥比找不到更危险。
+    """
+    cert_file = Path(cert_file)
+    name = cert_file.name
+    out = []
+    if name.endswith('.crt'):
+        out.append(cert_file.with_suffix('.key'))
+    if name.endswith('.pem'):
+        out.append(cert_file.with_name(name[:-4] + '.key'))
+    out.append(cert_file.with_name('privkey.pem'))
+    return out
+
+
+def cert_key_matches(cert_file, key_file):
+    """证书与私钥是否成对：比较二者的公钥指纹。"""
+    try:
+        pub = subprocess.run(['openssl', 'x509', '-in', str(cert_file), '-noout', '-pubkey'],
+                             capture_output=True, timeout=5)
+        if pub.returncode != 0:
+            return False
+        pub_digest = subprocess.run(['openssl', 'sha256'], input=pub.stdout,
+                                    capture_output=True, timeout=5)
+        prv = subprocess.run(['openssl', 'pkey', '-in', str(key_file), '-pubout'],
+                             capture_output=True, timeout=5)
+        if prv.returncode != 0:
+            return False
+        prv_digest = subprocess.run(['openssl', 'sha256'], input=prv.stdout,
+                                    capture_output=True, timeout=5)
+    except Exception:
+        return False
+    a = pub_digest.stdout.split()[-1] if pub_digest.stdout.split() else b''
+    b = prv_digest.stdout.split()[-1] if prv_digest.stdout.split() else b''
+    return bool(a) and a == b
+
+
+def _find_cert_key(cert_file, cfg_dir):
+    """为已选定的证书找出**配对**的私钥；找不到返回 None。
+
+    先看 config.yaml 的 tls.key（显式配置优先），再按布局推断。
+    """
+    cfg_dir = Path(cfg_dir)
+    candidates = []
+    try:
+        text = (cfg_dir / 'config.yaml').read_text(encoding='utf-8')
+    except OSError:
+        text = ''
+    in_tls = False
+    for raw in text.splitlines():
+        if not raw.strip() or raw.lstrip().startswith('#'):
+            continue
+        if not raw.startswith((' ', '\t')):
+            in_tls = raw.split(':', 1)[0].strip() == 'tls'
+            continue
+        if in_tls and raw.strip().startswith('key:'):
+            value = raw.strip().split(':', 1)[1].strip().strip('"').strip("'")
+            path = Path(value)
+            candidates.append(path if path.is_absolute() else cfg_dir / path)
+            break
+    candidates.extend(_cert_key_candidates(cert_file))
+    seen = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        if candidate.is_file() and cert_key_matches(cert_file, candidate):
+            return candidate
+    return None
 
 
 # 到期告警阈值（天）。设成常量是为了让界面文案、API 返回、日志措辞一致 ——
@@ -6365,16 +6441,10 @@ WantedBy=multi-user.target
             if domain not in names:
                 raise RuntimeError('证书不包含域名 %s（现有: %s）' % (
                     domain, ', '.join(sorted(names)) or '无'))
-            key_file = Path('/etc/hysteria/cert/server.key')
-            for raw in Path('/etc/hysteria/config.yaml').read_text(encoding='utf-8').splitlines():
-                stripped = raw.strip()
-                if stripped.startswith('key:'):
-                    value = stripped.split(':', 1)[1].strip().strip('"').strip("'")
-                    candidate = Path(value)
-                    key_file = candidate if candidate.is_absolute() else cfg_dir / candidate
-                    break
-            if not key_file.is_file():
-                raise RuntimeError('证书私钥不存在: %s' % key_file)
+            key_file = _find_cert_key(Path(cert_file), cfg_dir)
+            if key_file is None:
+                raise RuntimeError(
+                    '找不到与证书 %s 配对的私钥；VMess 需要证书与私钥成对可用' % cert_file)
             return str(cert_file), str(key_file), domain
 
         def _vmess_ws_path(self):
@@ -6400,9 +6470,13 @@ WantedBy=multi-user.target
             cert_file, key_file, sni = self._vmess_certificate(domain)
             with data_lock:
                 old = dict(data.get('vmess_config') or {})
+                reality_port = (data.get('reality_config') or {}).get('port')
+            # 必须显式避开 Reality 的端口：它可能刚写进配置、尚未重启，
+            # 监听表里还看不到，只靠 ss 探测会让两者撞同一个端口。
+            blocked = {m.get('listen_port'), m.get('subscription_port'), reality_port}
             listen_port, reason = _pick_reality_port(
                 preferred=old.get('port') or 2087,
-                extra_blocked={m.get('listen_port'), m.get('subscription_port')})
+                extra_blocked=blocked)
             if not listen_port:
                 raise RuntimeError(reason)
             ws_path = self._vmess_ws_path()
@@ -7605,11 +7679,18 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             is_installed = Path('/usr/local/bin/xray').exists()
+            # 判据必须是「Reality 入站是否存在」，不能只看 Xray 进程：
+            # VMess 上线后，只开 VMess 的节点上 Xray 同样是 active，
+            # 按进程判断会让 Reality 卡片显示「运行中」，而用户拿到的
+            # Reality 链接根本连不上（2026-10-24 接入 VMess 时暴露）。
             is_active = False
             if is_installed:
                 try:
-                    out = subprocess.run(['systemctl', 'is-active', 'xray'], capture_output=True, text=True, timeout=3).stdout.strip()
-                    is_active = (out == 'active')
+                    xray_path = Path('/etc/hysteria/xray.json')
+                    if xray_path.exists():
+                        is_active = has_managed_inbound(
+                            json.loads(xray_path.read_text(encoding='utf-8')),
+                            REALITY_INBOUND_TAG)
                 except Exception:
                     is_active = False
 

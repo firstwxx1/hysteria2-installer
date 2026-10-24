@@ -165,5 +165,55 @@ class ArtifactsVmessTests(unittest.TestCase):
         self.assertEqual(json.loads(clash)['proxy-groups'][0]['type'], 'url-test')
 
 
+class CertKeyLookupTests(unittest.TestCase):
+    """证书与私钥的配对查找。
+
+    锁住一个真实故障（2026-10-24）：ACME 节点的证书在
+    acme/.../<domain>.crt，私钥是同目录的 <domain>.key，
+    而旧实现只找 cert/server.key ⇒ 所有 ACME 节点都无法启用 VMess。
+    """
+
+    def test_acme_layout_finds_sibling_key(self):
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            acme = root / 'acme/certificates/ca-directory/node.example.com'
+            acme.mkdir(parents=True)
+            (root / 'config.yaml').write_text(
+                'acme:\n  domains:\n    - node.example.com\n', encoding='utf-8')
+            cert = acme / 'node.example.com.crt'
+            key = acme / 'node.example.com.key'
+            cert.write_text('cert', encoding='utf-8')
+            key.write_text('key', encoding='utf-8')
+            self.assertIn(key, portal._cert_key_candidates(cert))
+
+    def test_self_signed_layout_uses_cert_server_key(self):
+        from pathlib import Path
+        cert = Path('/etc/hysteria/cert/server.crt')
+        self.assertIn(Path('/etc/hysteria/cert/server.key'),
+                      portal._cert_key_candidates(cert))
+
+    def test_caddy_layout_uses_privkey_pem(self):
+        from pathlib import Path
+        cert = Path('/data/caddy/certificates/acme/node.example.com/node.example.com.crt')
+        names = [p.name for p in portal._cert_key_candidates(cert)]
+        self.assertIn('node.example.com.key', names)
+        self.assertIn('privkey.pem', names)
+
+
+class ManagedInboundStatusTests(unittest.TestCase):
+    def test_vmess_only_node_reports_reality_inactive(self):
+        """只开 VMess 时 Xray 是 active，但 Reality 入站不存在 ⇒ 必须判为未启用。"""
+        cfg = {'inbounds': [dict(VMESS)]}
+        self.assertTrue(portal.has_managed_inbound(cfg, portal.VMESS_INBOUND_TAG))
+        self.assertFalse(portal.has_managed_inbound(cfg, portal.REALITY_INBOUND_TAG))
+
+    def test_reality_only_node_reports_vmess_inactive(self):
+        cfg = {'inbounds': [dict(REALITY)]}
+        self.assertTrue(portal.has_managed_inbound(cfg, portal.REALITY_INBOUND_TAG))
+        self.assertFalse(portal.has_managed_inbound(cfg, portal.VMESS_INBOUND_TAG))
+
+
 if __name__ == '__main__':
     unittest.main()

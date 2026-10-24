@@ -512,6 +512,11 @@ if (location.hash) {
   const [tabId, subId] = hash.split('/');
   if (document.getElementById('pane-' + tabId)) {
     switchTab(tabId, subId);
+    // 直达链接同样要刷新：否则从书签/外部链接进来时看到的是页面加载瞬间的旧状态。
+    if (tabId === 'reality') {
+      checkRealityStatus();
+      checkVmessStatus();
+    }
   }
 }
 
@@ -1219,7 +1224,8 @@ async function checkRealityStatus() {
     if (btnToggleReality) btnToggleReality.style.display = 'inline-flex';
 
     if (json.active) {
-      realityBadge.textContent = '● 运行中 (TCP 443 端口)';
+      // 端口来自实际配置，不能写死 443：Reality 会自动避让到 8443 等空闲端口。
+      realityBadge.textContent = '● 运行中 (TCP ' + (json.config?.port || '--') + ' 端口)';
       realityBadge.style.background = '#eaf3de';
       realityBadge.style.color = '#27500a';
       btnToggleReality.textContent = '已开启 (点击关闭)';
@@ -1858,7 +1864,7 @@ const proxyTbody = document.getElementById('proxy-tbody');
 const btnInstallGost = document.getElementById('btn-install-gost');
 const proxyModal = document.getElementById('proxy-modal');
 const pmClose = document.getElementById('pm-close');
-const resPType = document.getElementById('res-ptype');
+const resPType = document.getElementById('res-ptype-badge');
 const resPHost = document.getElementById('res-phost');
 const resPPort = document.getElementById('res-pport');
 const resPUser = document.getElementById('res-puser');
@@ -2299,9 +2305,10 @@ function renderAwgPeers(peers) {
     const enc = encodeURIComponent(p.name);
     const bs = 'padding:3px 10px;font-size:11px';
     return '<tr>'
-      + '<td><strong>' + p.name + '</strong></td>'
-      + '<td>' + p.address + '</td>'
-      + '<td style="color:var(--muted);font-size:11.5px">' + (p.created_at || '-') + '</td>'
+      // 名称/地址虽受后端正则限制，仍统一走 obEsc —— 与其他表格保持同一套转义习惯。
+      + '<td><strong>' + obEsc(p.name) + '</strong></td>'
+      + '<td>' + obEsc(p.address) + '</td>'
+      + '<td style="color:var(--muted);font-size:11.5px">' + obEsc(p.created_at || '-') + '</td>'
       + '<td style="white-space:nowrap">'
       + '<button class="button" type="button" data-awg-conf="' + enc + '" style="' + bs + '">下载配置</button> '
       + '<button class="button" type="button" data-awg-qr="' + enc + '" style="' + bs + '">二维码</button> '
