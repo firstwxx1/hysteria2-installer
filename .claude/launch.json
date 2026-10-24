@@ -6,6 +6,12 @@
       "runtimeExecutable": "python",
       "runtimeArgs": ["tests/preview_version_check.py"],
       "port": 8765
+    },
+    {
+      "name": "portal-layout-preview",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["tests/preview_portal_layout.py"],
+      "port": 8766
     }
   ]
 }

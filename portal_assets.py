@@ -30,6 +30,14 @@ main{max-width:1160px;margin:auto;padding:32px 28px 48px}.topbar{display:flex;ju
 .tab-pane.active{display:block;animation:fadeIn .2s ease-out}
 @keyframes fadeIn{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:translateY(0)}}
 
+/* 组内子标签：一页里放多块独立服务时，避免纵向堆成几屏 */
+.subtab-bar{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:18px;padding:6px;background:#e9f1ef;border-radius:14px}
+.subtab-btn{border:1px solid transparent;background:transparent;color:#4c6b70;font:700 13px/1.4 inherit;padding:9px 16px;border-radius:10px;cursor:pointer;transition:all .15s ease;white-space:nowrap}
+.subtab-btn:hover{background:#f5faf8;color:var(--ink)}
+.subtab-btn.active{background:#fff;color:var(--accent);border-color:#cfe3dd;box-shadow:0 2px 8px #183f350d}
+.subtab-pane{display:none}
+.subtab-pane.active{display:block;animation:fadeIn .18s ease-out}
+
 /* 卡片与网格 */
 .layout{display:grid;grid-template-columns:320px minmax(0,1fr);gap:22px;align-items:start}
 .card{background:#fff;border:1px solid var(--line);border-radius:20px;padding:24px;box-shadow:0 5px 22px #183f3505}
@@ -102,6 +110,7 @@ footer{display:flex;justify-content:space-between;margin-top:32px;color:#879996;
   main{padding:20px 16px 32px}.topbar{padding-bottom:20px}.layout,.config-grid{grid-template-columns:1fr}.qr-frame{max-width:248px;margin:18px auto}.card{padding:20px}h1{font-size:26px}.advanced-title{display:block}footer{gap:15px;flex-direction:column}.private{font-size:10px}.brand{font-size:13px}
   .login-card{padding:28px 20px;border-radius:20px}
   .tab-btn{padding:9px 12px;font-size:13px}
+  .subtab-btn{padding:8px 12px;font-size:12.5px}
   .modal-form{grid-template-columns:1fr;gap:14px;padding:16px}
 }
 
@@ -443,26 +452,55 @@ document.querySelectorAll('form.js-confirm-delete').forEach(form => {
   });
 });
 
-function switchTab(tabId) {
+function switchSubtab(paneId, subId) {
+  const pane = document.getElementById('pane-' + paneId);
+  if (!pane) return;
+  pane.querySelectorAll('.subtab-btn').forEach(b => b.classList.remove('active'));
+  pane.querySelectorAll('.subtab-pane').forEach(p => p.classList.remove('active'));
+  const btn = pane.querySelector('[data-subtab="' + subId + '"]');
+  const sub = document.getElementById('sub-' + subId);
+  if (btn && sub) {
+    btn.classList.add('active');
+    sub.classList.add('active');
+  }
+}
+
+// 顶层标签：默认打开组内第一个子页；也支持 #proxies/awg 这种直达写法。
+function switchTab(tabId, subId) {
   document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
   document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
   const btn = document.querySelector('[data-tab="' + tabId + '"]');
   const pane = document.getElementById('pane-' + tabId);
-  if (btn && pane) {
-    btn.classList.add('active');
-    pane.classList.add('active');
-    history.replaceState(null, null, '#' + tabId);
+  if (!btn || !pane) return;
+  btn.classList.add('active');
+  pane.classList.add('active');
+  const subs = pane.querySelectorAll('.subtab-btn');
+  if (subs.length) {
+    const wanted = subId && pane.querySelector('[data-subtab="' + subId + '"]');
+    switchSubtab(tabId, wanted ? subId : subs[0].dataset.subtab);
   }
+  history.replaceState(null, null, '#' + tabId + (subs.length ? '/' + (subId || subs[0].dataset.subtab) : ''));
 }
 
 document.querySelectorAll('[data-tab]').forEach(btn => {
   btn.addEventListener('click', () => switchTab(btn.dataset.tab));
 });
 
+document.querySelectorAll('.subtab-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    const pane = btn.closest('.tab-pane');
+    if (!pane) return;
+    const paneId = pane.id.replace(/^pane-/, '');
+    switchSubtab(paneId, btn.dataset.subtab);
+    history.replaceState(null, null, '#' + paneId + '/' + btn.dataset.subtab);
+  });
+});
+
 if (location.hash) {
   const hash = location.hash.substring(1);
-  if (document.getElementById('pane-' + hash)) {
-    switchTab(hash);
+  const [tabId, subId] = hash.split('/');
+  if (document.getElementById('pane-' + tabId)) {
+    switchTab(tabId, subId);
   }
 }
 

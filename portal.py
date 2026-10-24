@@ -1330,10 +1330,10 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
 <div class="tab-bar">
   <button class="tab-btn active" data-tab="connect">🚀 节点导入 (Connect)</button>
   <button class="tab-btn" data-tab="users">👥 多用户管理 ({active_count}/{len(users)})</button>
-  <button class="tab-btn" data-tab="proxies">🧩 代理 · WARP · AWG</button>
-  <button class="tab-btn" data-tab="reality">🛡️ VLESS-Reality (备用)</button>
+  <button class="tab-btn" data-tab="proxies">🧩 扩展服务</button>
+  <button class="tab-btn" data-tab="reality">🛡️ 备用通道与网络</button>
   <button class="tab-btn" data-tab="cluster">🔑 接入控制台 / REST API</button>
-  <button class="tab-btn" data-tab="configs">⚙️ 高级配置</button>
+  <button class="tab-btn" data-tab="configs">⚙️ 系统与版本</button>
 </div>
 
 <!-- Tab 1: 节点连接视图 -->
@@ -1458,17 +1458,18 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
   </section>
 </div>
 
-<!-- Tab 3: 入站代理与 WARP 扩展服务视图 (独立专区) -->
+<!-- Tab 3: 扩展服务视图 —— 入站代理 / WARP 分流 / 自定义出站 / AmneziaWG -->
 <div class="tab-pane" id="pane-proxies">
-  <!-- 本页三块：入站代理 / WARP 分流 / AmneziaWG。
-       标签原来只写「入站代理 & WARP」，而 AmneziaWG 是 README 的重点功能，
-       藏在第三张卡片里新手根本找不到 —— 所以标签和页内都补上说明。 -->
-  <div style="margin-bottom:16px;padding:12px 14px;background:#f3f7f6;border-radius:10px;font-size:12.5px;color:#456972;line-height:1.75">
-    本页是三块<b>互相独立</b>的功能，只想要其中某一项就找到对应卡片操作，互不影响：<br>
-    <b>① 入站代理</b> —— 把服务器当普通 SOCKS5 / HTTP 代理用（客户端不用装 Hysteria）<br>
-    <b>② Cloudflare WARP 分流</b> —— 让指定域名走干净的住宅出口，用于解锁 AI 服务<br>
-    <b>③ AmneziaWG</b> —— 抗 DPI 的 WireGuard 分支，需要客户端额外装一个 WireGuard 类 App
+  <!-- 这四块互相独立，原来全部纵向堆在一页里：最长的「自定义出站」把
+       AmneziaWG 推到几屏之外，用户以为没有这个功能。改为组内子标签，
+       每页只呈现一件事；按钮 id 与接口保持不变。 -->
+  <div class="subtab-bar" role="tablist" aria-label="扩展服务分类">
+    <button class="subtab-btn active" data-subtab="ingress" type="button">🌐 入站代理</button>
+    <button class="subtab-btn" data-subtab="warp" type="button">⚡ WARP 分流</button>
+    <button class="subtab-btn" data-subtab="outbound" type="button">🔀 自定义出站</button>
+    <button class="subtab-btn" data-subtab="awg" type="button">🛡️ AmneziaWG</button>
   </div>
+  <div class="subtab-pane active" id="sub-ingress">
   <!-- 区块 1: 入站代理服务 (GOST 驱动) -->
   <section class="card" style="margin-bottom:22px">
     <div class="user-header">
@@ -1510,7 +1511,9 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
       </table>
     </div>
   </section>
+  </div>
 
+  <div class="subtab-pane" id="sub-warp">
   <!-- 区块 2: Cloudflare WARP 智能分流出口 -->
   <section class="card warp-section">
     <div class="user-header">
@@ -1560,9 +1563,11 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
       </div>
     </div>
   </section>
+  </div>
 
+  <div class="subtab-pane" id="sub-outbound">
   <!-- 区块 2.5: 自定义出站（全局出口 / 自定义 http·socks5 代理） -->
-  <section class="card ob-card" style="margin-top:22px">
+  <section class="card ob-card" style="margin-top:0">
     <div class="ob-head">
       <div class="ob-title-box">
         <h2 class="ob-title">🌐 自定义出站（全局出口 · 第三方代理）</h2>
@@ -1693,9 +1698,11 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
       </div>
     </div>
   </section>
+  </div>
 
+  <div class="subtab-pane" id="sub-awg">
   <!-- 区块 3: AmneziaWG 抗 DPI 协议 (用户态 WireGuard 分支) -->
-  <section class="card awg-card" style="margin-top:22px">
+  <section class="card awg-card" style="margin-top:0">
     <div class="awg-head">
       <div class="awg-title-box">
         <h2 class="awg-title">🛡️ AmneziaWG (抗 DPI 的 WireGuard 分支)</h2>
@@ -1756,10 +1763,17 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
       </p>
     </div>
   </section>
+  </div>
 </div>
 
-<!-- Tab 4: VLESS-Reality 独立备用专区 -->
+<!-- Tab 4: 备用通道与网络加速（Reality / 证书 / BBR） -->
 <div class="tab-pane" id="pane-reality">
+  <div class="subtab-bar" role="tablist" aria-label="备用通道与网络分类">
+    <button class="subtab-btn active" data-subtab="reality-node" type="button">🛡️ Reality 备用节点</button>
+    <button class="subtab-btn" data-subtab="cert" type="button">🔐 证书状态</button>
+    <button class="subtab-btn" data-subtab="bbr" type="button">🚀 BBR 加速</button>
+  </div>
+  <div class="subtab-pane active" id="sub-reality-node">
   <section class="card" style="margin-bottom:22px">
     <div class="user-header">
       <div>
@@ -1823,7 +1837,9 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
       </div>
     </div>
   </section>
+  </div>
 
+  <div class="subtab-pane" id="sub-cert">
   <!-- 区块: 证书状态与到期告警
        为什么放在最前面：证书过期/临期是「昨天还好好的、今天突然连不上」里最高频的真凶，
        而自动自愈只对齐信任模型、不会去续期证书 —— 不把剩余天数摆出来就只能在掉线后才发现。 -->
@@ -1857,7 +1873,9 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
     <div class="cert-alert" id="cert-alert"></div>
     <div class="cert-heal-note" id="cert-heal-note" style="display:none"></div>
   </section>
+  </div>
 
+  <div class="subtab-pane" id="sub-bbr">
   <!-- 区块: TCP 拥塞控制加速引擎 (BBR V1 / V2 / V3) -->
   <section class="card bbr-section">
     <div class="user-header">
@@ -1920,6 +1938,7 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
       </div>
     </div>
   </section>
+  </div>
 </div>
 
 <!-- Tab 3: 集群与通用 REST API 对接视图 -->
