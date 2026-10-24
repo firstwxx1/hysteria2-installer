@@ -12,6 +12,12 @@
       "runtimeExecutable": "python",
       "runtimeArgs": ["tests/preview_portal_layout.py"],
       "port": 8766
+    },
+    {
+      "name": "vmess-card-preview",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["tests/preview_vmess_card.py"],
+      "port": 8768
     }
   ]
 }
