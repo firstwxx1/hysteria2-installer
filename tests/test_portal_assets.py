@@ -73,6 +73,62 @@ const doUpgrade = () => {};
                                 text=True, encoding='utf-8')
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    @unittest.skipUnless(NODE, 'requires node')
+    def test_production_vmess_card_states(self):
+        """VMess 卡片的三态：未装核心、已关闭、运行中。
+
+        重点不是文案，而是「不能把状态说反」：
+          * 没装 Xray 不能显示成「已关闭」（否则用户以为点一下就能开）；
+          * 运行中必须显示端口与直链，且开关文案是「点击关闭」。
+        """
+        script = portal.SCRIPT
+        code = script[script.index('const vmessBadge'):script.index('// BBR 状态获取')]
+        harness = r'''
+const assert = require('assert');
+const elements = {};
+const document = {getElementById: id => elements[id] ||= {
+  style: {}, textContent: '', value: '', disabled: false,
+  addEventListener: () => {}, className: ''}};
+const location = {pathname: '/fixture/'};
+const navigator = {clipboard: {writeText: async () => {}}};
+let payload;
+const fetch = async () => ({ok:true, json:async () => payload});
+const alert = m => {throw new Error('unexpected alert: ' + m)};
+const setTimeout = () => {};
+'''
+        checks = r'''
+(async () => {
+  const badge = elements['vmess-badge'];
+  const toggle = elements['btn-toggle-vmess'];
+  const box = elements['vmess-content-box'];
+
+  payload = {ok:true, installed:false, active:false, config:{}};
+  await checkVmessStatus();
+  assert(badge.textContent.includes('未安装'), badge.textContent);
+  assert.strictEqual(toggle.style.display, 'none');
+  assert.strictEqual(box.style.display, 'none');
+
+  payload = {ok:true, installed:true, active:false, config:{}};
+  await checkVmessStatus();
+  assert(badge.textContent.includes('已关闭'), badge.textContent);
+  assert(toggle.textContent.includes('点击开启'), toggle.textContent);
+  assert.strictEqual(box.style.display, 'none');
+
+  payload = {ok:true, installed:true, active:true, config:{port:2087,
+    domain:'node.example.com', sni:'node.example.com', uuid:'u-1',
+    ws_path:'/AbCdEf123456', uri:'vmess://abc', qr_svg:'<svg></svg>'}};
+  await checkVmessStatus();
+  assert(badge.textContent.includes('2087'), badge.textContent);
+  assert(toggle.textContent.includes('点击关闭'), toggle.textContent);
+  assert.strictEqual(box.style.display, 'block');
+  assert.strictEqual(elements['vmess-uri-val'].value, 'vmess://abc');
+  assert.strictEqual(elements['vmess-path-val'].textContent, '/AbCdEf123456');
+})().catch(e => {console.error(e); process.exitCode = 1;});
+'''
+        result = subprocess.run([NODE, '-e', harness + code + checks], capture_output=True,
+                                text=True, encoding='utf-8')
+        self.assertEqual(result.returncode, 0, result.stderr)
+
 
 def _find_literal(name):
     """在两个源文件里找常量定义，返回 (文件路径, 源码字面量原文)。"""
