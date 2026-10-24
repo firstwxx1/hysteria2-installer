@@ -36,6 +36,8 @@ main{max-width:1160px;margin:auto;padding:32px 28px 48px}.topbar{display:flex;ju
 .subtab-btn:hover{background:#f5faf8;color:var(--ink)}
 .subtab-btn.active{background:#fff;color:var(--accent);border-color:#cfe3dd;box-shadow:0 2px 8px #183f350d}
 .subtab-pane{display:none}
+/* 切换中的按钮必须有可见反馈，否则用户会以为没点上而反复点击 */
+.toggle-btn:disabled,.button:disabled{opacity:.55;cursor:not-allowed;filter:saturate(.6)}
 .subtab-pane.active{display:block;animation:fadeIn .18s ease-out}
 
 /* 卡片与网格 */
@@ -1353,12 +1355,17 @@ const vmessUuidVal = document.getElementById('vmess-uuid-val');
 const vmessPathVal = document.getElementById('vmess-path-val');
 const btnCopyVmessUri = document.getElementById('btn-copy-vmess-uri');
 
+// 请求序号：切换标签/子页会并发触发多次状态查询，旧响应晚到时
+// 会把新状态覆盖回旧值（实测会出现徽章闪回「已关闭」）。
+let vmessStatusSeq = 0;
 async function checkVmessStatus() {
   if (!vmessBadge) return;
+  const seq = ++vmessStatusSeq;
   try {
     const res = await fetch(location.pathname + 'vmess-status', { credentials: 'same-origin' });
-    if (!res.ok) return;
+    if (!res.ok) { if (seq === vmessStatusSeq) vmessBadge.textContent = '● 状态未知（请求失败）'; return; }
     const json = await res.json();
+    if (seq !== vmessStatusSeq) return;   // 已有更新的请求，丢弃本次结果
     if (!json.ok) return;
     if (!json.installed) {
       // 没有 Xray 核心时不能显示「已关闭」—— 那会让人以为点一下就能开。
@@ -1398,8 +1405,10 @@ async function checkVmessStatus() {
 
 if (btnToggleVmess) {
   btnToggleVmess.addEventListener('click', async () => {
+    // 双击防护：请求未返回前直接忽略后续点击。
+    // 否则两次 toggle 会一开一关，最终状态与用户预期相反。
+    if (btnToggleVmess.disabled) return;
     btnToggleVmess.disabled = true;
-    const orig = btnToggleVmess.textContent;
     btnToggleVmess.textContent = '切换中...';
     try {
       const res = await fetch(location.pathname + 'manage-vmess', {
@@ -1408,16 +1417,21 @@ if (btnToggleVmess) {
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
         body: 'action=toggle'
       });
-      const json = await res.json();
-      // 启用失败时必须把原因原样告诉用户（常见：没有域名 / 自签证书 / 端口冲突），
-      // 只写「切换失败」会让人反复点。
-      if (!json.ok) alert(json.error || '切换失败');
+      // 先看 HTTP 状态：反向代理出错时返回的是 HTML 错误页，
+      // 直接 res.json() 会抛「Unexpected token <」，把真实原因盖掉。
+      let json = null;
+      try { json = await res.json(); } catch (_) { json = null; }
+      if (!res.ok || !json || !json.ok) {
+        alert((json && json.error) || ('切换失败（HTTP ' + res.status + '）'));
+      }
+      // 只有成功时才刷新；失败保留原状态，避免把错误状态画到界面上。
       await checkVmessStatus();
     } catch (e) {
       alert('请求异常: ' + e.message);
     } finally {
+      // 只恢复 disabled —— 文案由 checkVmessStatus() 按真实状态决定。
+      // 旧实现在这里写回 orig，会把「已开启 (点击关闭)」又改回「已关闭」。
       btnToggleVmess.disabled = false;
-      btnToggleVmess.textContent = orig;
     }
   });
 }
@@ -1447,12 +1461,15 @@ const vlessencUuidVal = document.getElementById('vlessenc-uuid-val');
 const vlessencTcpVal = document.getElementById('vlessenc-tcp-val');
 const btnCopyVlessencUri = document.getElementById('btn-copy-vlessenc-uri');
 
+let vlessencStatusSeq = 0;
 async function checkVlessencStatus() {
   if (!vlessencBadge) return;
+  const seq = ++vlessencStatusSeq;
   try {
     const res = await fetch(location.pathname + 'vlessenc-status', { credentials: 'same-origin' });
-    if (!res.ok) return;
+    if (!res.ok) { if (seq === vlessencStatusSeq) vlessencBadge.textContent = '● 状态未知（请求失败）'; return; }
     const json = await res.json();
+    if (seq !== vlessencStatusSeq) return;
     if (!json.ok) return;
     if (!json.installed) {
       vlessencBadge.textContent = '● 未安装 Xray 核心';
@@ -1491,8 +1508,8 @@ async function checkVlessencStatus() {
 
 if (btnToggleVlessenc) {
   btnToggleVlessenc.addEventListener('click', async () => {
+    if (btnToggleVlessenc.disabled) return;
     btnToggleVlessenc.disabled = true;
-    const orig = btnToggleVlessenc.textContent;
     btnToggleVlessenc.textContent = '切换中...';
     try {
       const res = await fetch(location.pathname + 'manage-vlessenc', {
@@ -1501,14 +1518,16 @@ if (btnToggleVlessenc) {
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
         body: 'action=toggle'
       });
-      const json = await res.json();
-      if (!json.ok) alert(json.error || '切换失败');
+      let json = null;
+      try { json = await res.json(); } catch (_) { json = null; }
+      if (!res.ok || !json || !json.ok) {
+        alert((json && json.error) || ('切换失败（HTTP ' + res.status + '）'));
+      }
       await checkVlessencStatus();
     } catch (e) {
       alert('请求异常: ' + e.message);
     } finally {
       btnToggleVlessenc.disabled = false;
-      btnToggleVlessenc.textContent = orig;
     }
   });
 }

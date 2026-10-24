@@ -85,7 +85,8 @@ class Lifecycle(unittest.TestCase):
             def reply_json(self, status, payload):
                 return status
         import re
-        env = dict(self=Handler(), user_id='admin_master', MASTER_USER_ID='admin_master',
+        env = dict(self=Handler(), user_id='admin_master',
+                   RESERVED_USER_IDS=frozenset({'admin_master', 'placeholder'}),
                    VALID_USER_ID_RE=re.compile(r'^[a-zA-Z0-9_.-]{1,64}$'))
         fn = ast.FunctionDef(name='guard', args=ast.arguments(posonlyargs=[], args=[],
             kwonlyargs=[], kw_defaults=[], defaults=[]), body=[guard], decorator_list=[])

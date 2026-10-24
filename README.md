@@ -89,7 +89,7 @@ HY2_CERT_TYPE=3 HY2_DOMAIN=hy2.example.com HY2_EMAIL=me@example.com bash install
 ================================================================
 核心状态: 运行中 | 版本: v2.13.0
 门户状态: 运行中 | 运行模式: 商城版（Agent 模式）
-扩展服务: Reality: 运行中  GOST: 运行中  WARP: 运行中
+扩展服务: Xray(Reality/VMess/VLESS-Enc): 运行中  GOST: 运行中  WARP: 运行中
 AWG 状态 : 运行中 | 协议线: AWG 3.x | UDP 53821
 ----------------------------------------------------------------
   1. 重新安装 Hysteria 2 (会覆盖现有配置)

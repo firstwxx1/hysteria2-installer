@@ -3714,7 +3714,9 @@ show_menu_status() {
         echo -e "流量限额: ${RED}已因流量超额被 Teyir 停用${PLAIN}（控制台恢复前不要手动启动服务）"
     fi
     local extra=""
-    [[ -f /etc/systemd/system/xray.service ]] && extra+="Reality: $(unit_state_text xray)  "
+    # Xray 现在承载三种协议（Reality / VMess / VLESS Encryption），
+    # 状态行不能只写 Reality，否则用户会以为只有 Reality 在跑。
+    [[ -f /etc/systemd/system/xray.service ]] && extra+="Xray(Reality/VMess/VLESS-Enc): $(unit_state_text xray)  "
     [[ -f /usr/local/bin/gost ]] && extra+="GOST: $(unit_state_text gost)  "
     [[ -f /etc/systemd/system/wireproxy.service ]] && extra+="WARP: $(unit_state_text wireproxy)"
     [[ -n "$extra" ]] && echo -e "扩展服务: ${extra}"

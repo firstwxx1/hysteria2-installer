@@ -297,5 +297,83 @@ class VlessEncryptionTests(unittest.TestCase):
         self.assertEqual(out['encryption'], self.CFG['encryption'])
 
 
+class PortSelectionSafetyTests(unittest.TestCase):
+    """端口选择的安全边界（2026-10-24 修复的真实缺陷）。"""
+
+    def test_explicitly_blocked_port_is_not_chosen(self):
+        """调用方明确拉黑的端口不能被 preferred 绕过。
+
+        旧实现先判断 `p == pref` 就直接返回 True，导致 VMess 与
+        VLESS Encryption 撞同一端口：预检通过、bind 失败、事务回滚。
+        """
+        port, _ = portal._pick_reality_port(preferred=2087, extra_blocked={2087})
+        self.assertNotEqual(port, 2087)
+
+    def test_reserved_port_is_not_chosen(self):
+        self.assertNotEqual(portal._pick_reality_port(preferred=22)[0], 22)
+
+    def test_free_preferred_port_is_kept(self):
+        """没冲突时仍沿用原端口，不给已有节点无谓换端口。"""
+        self.assertEqual(portal._pick_reality_port(preferred=2087)[0], 2087)
+
+    def test_reserved_ports_helper_collects_every_protocol(self):
+        meta = {'listen_port': 19984, 'subscription_port': 29421}
+        data = {'reality_config': {'port': 443}, 'vmess_config': {'port': 2087},
+                'vlessenc_config': {'port': 2088}}
+        config = {'inbounds': [{'port': 2096}, {'port': None}]}
+        ports = portal.managed_reserved_ports(meta, data, config)
+        self.assertTrue({443, 2087, 2088, 19984, 29421, 2096} <= ports)
+        self.assertNotIn(0, ports)
+
+
+class ManagedInboundRobustnessTests(unittest.TestCase):
+    def test_none_inbounds_is_normalised(self):
+        config = {'inbounds': None}
+        portal.upsert_managed_inbound(config, 'x', {'protocol': 'vmess'})
+        self.assertEqual(config['inbounds'][0]['tag'], 'x')
+
+    def test_untagged_reality_not_taken_when_tagged_ones_exist(self):
+        """已有带 tag 的托管入站时，无 tag 的 Reality 只可能是用户手工加的。"""
+        config = {'inbounds': [
+            {'tag': portal.VMESS_INBOUND_TAG, 'protocol': 'vmess'},
+            {'protocol': 'vless', 'streamSettings': {'security': 'reality'}},
+        ]}
+        self.assertFalse(portal.has_managed_inbound(config, portal.REALITY_INBOUND_TAG))
+
+    def test_untagged_reality_still_adopted_for_legacy_config(self):
+        """纯旧版配置（完全没有 tag）仍要被接管，否则升级后 Reality 失联。"""
+        config = {'inbounds': [
+            {'protocol': 'vless', 'streamSettings': {'security': 'reality'}}]}
+        self.assertTrue(portal.has_managed_inbound(config, portal.REALITY_INBOUND_TAG))
+
+
+class XrayPrivateNetworkGuardTests(unittest.TestCase):
+    """Xray 三协议必须和 Hy2 一样拒绝访问内网 / 云元数据。"""
+
+    def test_guard_adds_block_rule_and_outbound(self):
+        config = {'outbounds': [{'protocol': 'freedom', 'tag': 'direct'}]}
+        out = portal.add_private_network_guard(config)
+        self.assertIn({'protocol': 'blackhole', 'tag': 'block-private'}, out['outbounds'])
+        rule = out['routing']['rules'][0]
+        self.assertEqual(rule['outboundTag'], 'block-private')
+        self.assertIn('127.0.0.0/8', rule['ip'])
+        self.assertIn('169.254.0.0/16', rule['ip'])
+        # 黑洞不能抢默认出站
+        self.assertEqual(out['outbounds'][0]['tag'], 'direct')
+
+    def test_guard_is_idempotent(self):
+        config = {'outbounds': [{'protocol': 'freedom', 'tag': 'direct'}]}
+        once = portal.add_private_network_guard(config)
+        twice = portal.add_private_network_guard(once)
+        self.assertEqual(len(twice['routing']['rules']), 1)
+        self.assertEqual(len([o for o in twice['outbounds'] if o['tag'] == 'block-private']), 1)
+
+
+class ReservedUserNameTests(unittest.TestCase):
+    def test_placeholder_is_reserved(self):
+        self.assertIn('placeholder', portal.RESERVED_USER_IDS)
+        self.assertIn(portal.MASTER_USER_ID, portal.RESERVED_USER_IDS)
+
+
 if __name__ == '__main__':
     unittest.main()

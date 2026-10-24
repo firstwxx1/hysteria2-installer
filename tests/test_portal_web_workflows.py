@@ -276,7 +276,12 @@ class WebWorkflowTests(unittest.TestCase):
             extract_method('_generate_and_apply_reality', self.ns)(self.handler)
         self.assertEqual(self.data['reality_config'], old)
         proposed = self.ns['apply_xray_config_transaction'].call_args.args[0]
-        self.assertEqual(proposed['outbounds'], config['outbounds'])
+        # 用户原有出站必须原样保留；新增的黑洞出站是内网拦截的一部分
+        # （2026-10-24 加），排在最后、不会抢默认出站。
+        self.assertEqual(proposed['outbounds'][0], config['outbounds'][0])
+        self.assertIn({'protocol': 'blackhole', 'tag': 'block-private'},
+                      proposed['outbounds'])
+        self.assertNotEqual(proposed['outbounds'][0]['protocol'], 'blackhole')
 
     def test_xray_transaction_invalid_config_keeps_original_bytes(self):
         path = self.hdir / 'xray.json'

@@ -102,6 +102,16 @@ class TestCapabilitiesEndpoint(unittest.TestCase):
         self.assertIn("'installed': True", self.block,
                       'Hy2 主协议应直接报 installed: True')
 
+    def test_reality_active_follows_inbound_not_process(self):
+        """Reality 的 active 必须看入站是否存在，不能只看 Xray 进程。
+
+        真实缺口：VMess 上线后，只开 VMess 的节点上 Xray 也是 active，
+        按进程判断会让主面板以为 Reality 在服务，实际连不上。
+        """
+        self.assertIn("'active': d_snap['reality_inbound']", self.block,
+                      'Reality 的 active 应使用入站状态，而不是 _svc_active(\'xray\')')
+        self.assertNotIn("'active': _svc_active('xray')", self.block)
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

@@ -54,6 +54,11 @@ except ImportError as _e:      # pragma: no cover - 只在部署缺文件时触�
 # data['users'] 按密码匹配的，这条记录一旦被删，主密码立刻变成 "User not found"，
 # 机主本人都会被踢下线且再也连不上（只能重装）。因此全站禁止注销它。
 MASTER_USER_ID = 'admin_master'
+# 保留名：三种协议的 clients 在「没有任何活跃用户」时都会写一条
+# email='placeholder' 的占位记录（Xray 的 clients 为空会拒绝所有连接）。
+# 若允许真实用户叫这个名字，其流量会与占位记录聚合到同一 email，
+# 统计串号、按 email 收回时也会误伤。与机主账号同样禁止。
+RESERVED_USER_IDS = frozenset({MASTER_USER_ID, 'placeholder'})
 # 面板自更新与 AWG 资源的来源仓库（模块级：resolve_update_ref 也要用）。
 AWG_REPO = 'yys9253462-gif/hysteria2-installer'
 
@@ -65,7 +70,7 @@ AWG_REPO = 'yys9253462-gif/hysteria2-installer'
 #
 # ⚠️ 改动 portal.py 的**能力**时记得同步 +1，否则主面板会按旧能力显示。
 # 格式固定 `PORTAL_VERSION = 'x.y'`（capabilities 端点按行首匹配解析它）。
-PORTAL_VERSION = '2.8'
+PORTAL_VERSION = '2.9'
 
 # ---------------------------------------------------------------------------
 # 流媒体 / AI 解锁检测（2.8，GET /api/v1/unlock-check）
@@ -319,10 +324,15 @@ def validate_outbound(entry):
         if not (0 < int(port) < 65536):
             return False, None, "端口超出范围"
         cleaned['addr'] = addr
-        if entry.get('username'):
-            cleaned['username'] = str(entry['username']).strip()
-        if entry.get('password'):
-            cleaned['password'] = str(entry['password']).strip()
+        # 账号密码会**逐字拼进 YAML**（render_outbound_yaml），
+        # 含换行、# 或引号时会破坏配置结构（2026-10-24 补校验）。
+        # 只放行代理凭据实际会用到的可见 ASCII，其余一律拒绝并说明。
+        for field in ('username', 'password'):
+            if entry.get(field):
+                value = str(entry[field]).strip()
+                if not re.fullmatch(r'[!-~]{1,128}', value):
+                    return False, None, '%s 只能包含可见 ASCII 字符（不含空格与换行），长度 1-128' % field
+                cleaned[field] = value
 
     elif otype == 'http':
         url = (entry.get('url') or '').strip()
@@ -436,6 +446,49 @@ def strip_managed_outbounds(cfg_text):
 # Docker 网段、169.254.169.254）。所有生成的 ACL 都以这些 reject 开头。
 PRIVATE_REJECT_RULES = ['127.0.0.0/8', '10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16', '169.254.0.0/16', '100.64.0.0/10', '0.0.0.0/8', '::1/128', 'fc00::/7', 'fe80::/10']
 
+
+
+# Xray 侧的对应拦截（2026-10-24 补）。
+#
+# Hy2 走 config.yaml 的 ACL，一直有 reject 内网规则；但 Xray 承载的
+# Reality / VMess / VLESS Encryption 三个入站此前是裸 freedom 出站 ——
+# 代理用户可以借它们访问 127.0.0.1 上的门户端口、169.254.169.254 云元数据、
+# Docker / 内网网段，等于绕开了 2026-10-18 针对 Hy2 的那次加固。
+#
+# 规则用 routing.rules 的 ip 匹配（不是 domain）：即使客户端不做 DNS 解析、
+# 直接连 IP 也能挡住。block 出站排在 freedom 之前，且是 blackhole。
+XRAY_PRIVATE_REJECT_IPS = [c for c in PRIVATE_REJECT_RULES]
+XRAY_BLOCK_OUTBOUND_TAG = 'block-private'
+
+
+def add_private_network_guard(config):
+    """给 Xray 配置补「拒绝访问内网 / 云元数据」的路由与黑洞出站。
+
+    幂等：重复调用不会重复追加规则或出站。
+    """
+    if not isinstance(config, dict):
+        return config
+    outbounds = config.setdefault('outbounds', [])
+    if not isinstance(outbounds, list):
+        outbounds = config['outbounds'] = []
+    if not outbounds:
+        outbounds.append({'protocol': 'freedom', 'tag': 'direct'})
+    if not any(isinstance(o, dict) and o.get('tag') == XRAY_BLOCK_OUTBOUND_TAG
+               for o in outbounds):
+        # 黑洞必须排在 freedom 之后，否则会变成默认出站，把正常流量也吞掉。
+        outbounds.append({'protocol': 'blackhole', 'tag': XRAY_BLOCK_OUTBOUND_TAG})
+    routing = config.setdefault('routing', {})
+    if not isinstance(routing, dict):
+        routing = config['routing'] = {}
+    rules = routing.setdefault('rules', [])
+    if not isinstance(rules, list):
+        rules = routing['rules'] = []
+    guard = {'type': 'field', 'ip': list(XRAY_PRIVATE_REJECT_IPS),
+             'outboundTag': XRAY_BLOCK_OUTBOUND_TAG}
+    # 放在最前面：先拒内网，再走其它规则（含计量 API 的回环转发）。
+    if guard not in rules:
+        rules.insert(0, guard)
+    return config
 
 def _acl_head():
     return ['acl:', '  inline:'] + ['    - reject(%s)' % c for c in PRIVATE_REJECT_RULES]
@@ -3037,6 +3090,12 @@ def managed_inbound_index(config, tag):
     for i, item in enumerate(inbounds):
         if isinstance(item, dict) and item.get('tag') == tag:
             return i, item
+    # 兜底匹配只在「配置里还没有任何带 tag 的托管入站」时启用：
+    # 一旦存在带 tag 的，说明这是新版写的配置，此时仍有无 tag 的
+    # vless+reality 入站就只可能是**用户手工加的**，不能当成托管入站
+    # 去删除或改 clients（2026-10-24 修）。
+    if any(isinstance(i, dict) and i.get('tag') in MANAGED_INBOUND_TAGS for i in inbounds):
+        return -1, None
     if tag == REALITY_INBOUND_TAG:
         for i, item in enumerate(inbounds):
             if (isinstance(item, dict) and item.get('protocol') == 'vless'
@@ -3052,11 +3111,15 @@ def upsert_managed_inbound(config, tag, inbound):
     在只有一种协议时没问题；加入 VMess 后那样会**丢掉 VMess 入站**。
     这里只动自己那一个元素，别的原样保留。
     """
+    # inbounds 可能是 None（手工改坏 / 旧版写出），setdefault 不会覆盖
+    # 已存在的 None，随后 .append 直接 AttributeError。先归一化成列表。
+    if not isinstance(config.get('inbounds'), list):
+        config['inbounds'] = []
     idx, current = managed_inbound_index(config, tag)
     inbound = copy.deepcopy(inbound)
     inbound['tag'] = tag
     if idx < 0:
-        config.setdefault('inbounds', []).append(inbound)
+        config['inbounds'].append(inbound)
         return config
     inbounds = config['inbounds']
     # 保留旧入站上可能存在的、本版本不认识的额外键（例如手工加的 sniffing 扩展），
@@ -3517,6 +3580,33 @@ def enforce_node_access(root, snapshot, force_ids=()):
         candidate.unlink(missing_ok=True)
 
 
+
+def managed_reserved_ports(meta, data, config=None):
+    """汇总「本机其它协议正在用 / 配置里已占」的端口，供 _pick_reality_port 避让。
+
+    2026-10-24 修：三个启用流程各自只避开 hy2 与订阅端口，彼此之间不避让 ——
+    实测 VMess 选中 2087 而 VLESS Encryption 正监听 2087，两个入站撞车。
+    这里统一从 data 与现有 xray.json 的 inbounds 收集，避免每处各写一遍再漏。
+    """
+    ports = set()
+    for value in ((meta or {}).get('listen_port'), (meta or {}).get('subscription_port')):
+        try:
+            ports.add(int(value))
+        except (TypeError, ValueError):
+            pass
+    for key in ('reality_config', 'vmess_config', 'vlessenc_config'):
+        try:
+            ports.add(int((data or {}).get(key, {}).get('port')))
+        except (TypeError, ValueError, AttributeError):
+            pass
+    for inbound in ((config or {}).get('inbounds') or []):
+        try:
+            ports.add(int(inbound.get('port')))
+        except (TypeError, ValueError, AttributeError):
+            pass
+    ports.discard(0)
+    return ports
+
 def reality_clients(data):
     """生成 xray inbound.settings.clients —— 每个**在用**的 Hy2 用户一个 VLESS 身份。
 
@@ -3721,10 +3811,17 @@ def _pick_reality_port(preferred=None, extra_blocked=None):
         #   * 该端口在**配置里已经属于 Reality**（preferred == p）
         #     ⇒ 无论监听表还是黑名单都不算冲突 —— 那就是「自己」。
         #   * 否则才看黑名单与监听表。
-        if p == pref:
-            return True
+        # ⚠️ preferred 只有在「没被显式拉黑」时才算自己。
+        # 2026-10-24 修：旧实现无条件 `p == pref: return True`，
+        # 于是调用方即使把某个端口放进 extra_blocked（例如另一个托管协议
+        # 正在用它），preferred 照样胜出 —— 实测 preferred=2087 且
+        # extra_blocked={2087} 仍返回 2087，两个入站撞同一端口，
+        # Xray 预检通过但 bind 失败，事务回滚，用户只看到 500。
+        # 黑名单代表「调用方明确知道这端口不能给」，优先级必须高于偏好值。
         if p in blocked:
             return False
+        if p == pref:
+            return True
         # 以**实际监听表**为准。黑名单只是补充 ——
         # 因为「8443 归谁」在不同节点上完全不同，写死数字必然出错。
         return p not in listening
@@ -5191,6 +5288,15 @@ if __name__ == '__main__':
             except Exception:
                 pass
 
+            # 避开所有托管协议已占用的端口，而不只是 hy2 / 订阅端口。
+            try:
+                _cfg_now = (json.loads(Path('/etc/hysteria/xray.json').read_text(encoding='utf-8'))
+                            if Path('/etc/hysteria/xray.json').exists() else None)
+            except (OSError, ValueError):
+                _cfg_now = None
+            with data_lock:
+                _data_now = dict(data)
+            _avoid |= managed_reserved_ports(m, _data_now, _cfg_now)
             listen_port, port_reason = _pick_reality_port(
                 preferred=rcfg_old.get('port'), extra_blocked=_avoid)
             if not listen_port:
@@ -5257,30 +5363,36 @@ if __name__ == '__main__':
             }
             xray_path = Path('/etc/hysteria/xray.json')
             desired_inbound = xray_json['inbounds'][0]
-            if xray_path.exists():
-                # 只按 tag 替换 Reality 自己那一条；VMess 入站、统计 api 入站、
-                # routing、outbounds 一律原样保留。旧版无 tag 的 Reality 由
-                # managed_inbound_index 的 legacy 匹配接住，写入时补上 tag。
-                previous = json.loads(xray_path.read_text(encoding='utf-8'))
-                xray_json = upsert_managed_inbound(previous, REALITY_INBOUND_TAG, desired_inbound)
-
-            # 重生成 Reality 配置时保留计量能力；仅添加回环 StatsService。
-            # add_stats 是幂等的，且**不改任何 clients**（有断言兜底），
-            # 所以 VMess 入站及其 clients 不会被它重置。
-            _meter_config_path = portal_path.parent / 'usage-meter-config.json'
-            if _meter_config_path.exists():
-                _meter_config = json.loads(_meter_config_path.read_text(encoding='utf-8'))
-                _meter_reality = _meter_config.get('reality')
-                if _meter_reality:
-                    _address = _meter_reality['address']
-                    if not _address.startswith('127.0.0.1:'):
-                        raise ValueError('统计接口必须为回环地址')
-                    _stats_path = Path(__file__).parent / 'usage-meter-xray-config-20261007-v1.py'
-                    _stats_spec = importlib.util.spec_from_file_location('portal_stats_cfg', _stats_path)
-                    _stats_mod = importlib.util.module_from_spec(_stats_spec)
-                    _stats_spec.loader.exec_module(_stats_mod)
-                    xray_json = _stats_mod.add_stats(xray_json, int(_address.rsplit(':', 1)[1]))
+            # 🔴 读-改-写必须整体在 reality_apply_lock 内（2026-10-24 修）。
+            # 旧实现在锁外读 xray.json、锁内才写：两个协议同时启用时，
+            # 后拿到锁的那次会用**较早读到的旧快照**覆盖磁盘，把先写入的
+            # 另一个协议静默丢掉（两个请求都返回成功，用户下次重启才发现）。
             with reality_apply_lock:
+                if xray_path.exists():
+                    # 只按 tag 替换 Reality 自己那一条；VMess 入站、统计 api 入站、
+                    # routing、outbounds 一律原样保留。旧版无 tag 的 Reality 由
+                    # managed_inbound_index 的 legacy 匹配接住，写入时补上 tag。
+                    previous = json.loads(xray_path.read_text(encoding='utf-8'))
+                    xray_json = upsert_managed_inbound(previous, REALITY_INBOUND_TAG, desired_inbound)
+
+                # 重生成 Reality 配置时保留计量能力；仅添加回环 StatsService。
+                # add_stats 是幂等的，且**不改任何 clients**（有断言兜底），
+                # 所以 VMess / VLESS Encryption 入站及其 clients 不会被它重置。
+                _meter_config_path = portal_path.parent / 'usage-meter-config.json'
+                if _meter_config_path.exists():
+                    _meter_config = json.loads(_meter_config_path.read_text(encoding='utf-8'))
+                    _meter_reality = _meter_config.get('reality')
+                    if _meter_reality:
+                        _address = _meter_reality['address']
+                        if not _address.startswith('127.0.0.1:'):
+                            raise ValueError('统计接口必须为回环地址')
+                        _stats_path = Path(__file__).parent / 'usage-meter-xray-config-20261007-v1.py'
+                        _stats_spec = importlib.util.spec_from_file_location('portal_stats_cfg', _stats_path)
+                        _stats_mod = importlib.util.module_from_spec(_stats_spec)
+                        _stats_spec.loader.exec_module(_stats_mod)
+                        xray_json = _stats_mod.add_stats(xray_json, int(_address.rsplit(':', 1)[1]))
+                # 统一补内网 / 云元数据拦截（Reality 入站同样适用）。
+                xray_json = add_private_network_guard(xray_json)
                 # 流量超额停用期间只落配置、不重启，否则等于替 Reality 解除了停用。
                 apply_xray_config_transaction(xray_json, config_path=str(xray_path),
                                               binary=str(Path('/usr/local/bin/xray')),
@@ -5325,6 +5437,12 @@ if __name__ == '__main__':
             self.send_header('Content-Type', 'application/json; charset=utf-8')
             self.send_header('Content-Length', str(len(body)))
             self.send_header('Cache-Control', 'no-store')
+            # 与 reply() 保持一致的安全头（2026-10-24 补）。
+            # JSON 本身不渲染 HTML，但缺少 nosniff 时，某些浏览器/代理会把
+            # 被错误标成 text/html 的响应当页面执行，属于低成本纵深防御。
+            self.send_header('X-Content-Type-Options', 'nosniff')
+            self.send_header('X-Frame-Options', 'DENY')
+            self.send_header('Referrer-Policy', 'no-referrer')
             # BUGFIX portal hang: 强制短连接避免 keepalive 导致 server 端等待 client 下一请求挂死
             self.send_header('Connection', 'close')
             self.end_headers()
@@ -5545,7 +5663,7 @@ if __name__ == '__main__':
                 # 动态开户 (支持 duration_days, ip_limit, traffic_gb)
                 if sub == 'users/create':
                     user_id = (params.get('user_id') or ('hy2_' + secrets.token_hex(6))).strip()
-                    if not VALID_USER_ID_RE.match(user_id) or user_id == MASTER_USER_ID:
+                    if not VALID_USER_ID_RE.match(user_id) or user_id in RESERVED_USER_IDS:
                         return self.reply_json(400, {'ok': False, 'error': 'Invalid managed user_id'})
 
                     pwd = params.get('password') or secrets.token_hex(16)
@@ -5648,7 +5766,7 @@ if __name__ == '__main__':
                 elif sub == 'users/update':
                     # 安全属性更新：不接收用量/创建时间/流量额度，不覆盖用户对象。
                     user_id = str(params.get('user_id', '')).strip()
-                    if not VALID_USER_ID_RE.match(user_id) or user_id == MASTER_USER_ID:
+                    if not VALID_USER_ID_RE.match(user_id) or user_id in RESERVED_USER_IDS:
                         return self.reply_json(400, {'ok': False, 'error': 'Invalid managed user_id'})
                     allowed = {'user_id', 'password', 'expires_at', 'ip_limit', 'status'}
                     if set(params) - allowed:
@@ -6535,7 +6653,7 @@ if __name__ == '__main__':
                     return self.reply_json(500, {'ok': False, 'error': '下载或解压 Xray 核心失败'})
 
                 service_content = '''[Unit]
-Description=Xray Service (VLESS-Reality)
+Description=Xray Service (VLESS-Reality / VMess / VLESS Encryption)
 After=network.target
 
 [Service]
@@ -6582,24 +6700,41 @@ WantedBy=multi-user.target
                 action = form.get('action', ['toggle'])[0]
 
                 if action == 'toggle':
-                    out = subprocess.run(['systemctl', 'is-active', 'xray'], capture_output=True, text=True, timeout=3).stdout.strip()
-                    if out == 'active':
-                        stopped = subprocess.run(['systemctl', 'stop', 'xray'], capture_output=True, timeout=5)
-                        actual = subprocess.run(['systemctl', 'is-active', 'xray'], capture_output=True, text=True, timeout=3).stdout.strip()
-                        if stopped.returncode != 0 or actual == 'active':
-                            return self.reply_json(500, {'ok': False, 'error': 'Reality 停止失败，服务状态未改变'})
+                    # 🔴 只动 Reality 自己的入站（2026-10-24 修）。
+                    # 旧实现用 `systemctl stop xray` 关闭 Reality —— 那会把
+                    # 同一进程里的 VMess / VLESS Encryption 一起停掉；
+                    # 而开启时又直接 restart，会把用户先前**主动关掉**的
+                    # 其它协议一并复活。现在与另两个协议同一套语义：
+                    # 移除/写回自己的入站，再重启一次（restart，不是 stop）。
+                    xray_path = Path('/etc/hysteria/xray.json')
+                    try:
+                        cfg_now = (json.loads(xray_path.read_text(encoding='utf-8'))
+                                   if xray_path.exists() else None)
+                    except ValueError:
+                        return self.reply_json(500, {'ok': False, 'error':
+                            'xray.json 不是合法 JSON，未做任何修改'})
+                    reality_on = bool(cfg_now) and has_managed_inbound(cfg_now, REALITY_INBOUND_TAG)
+                    if reality_on:
+                        with reality_apply_lock:
+                            try:
+                                current = json.loads(xray_path.read_text(encoding='utf-8'))
+                            except (OSError, ValueError):
+                                current = cfg_now
+                            remove_managed_inbound(current, REALITY_INBOUND_TAG)
+                            apply_xray_config_transaction(
+                                current, config_path=str(xray_path),
+                                binary='/usr/local/bin/xray',
+                                restart=not unit_suspended('xray'))
                         new_active = False
                     else:
                         if unit_suspended('xray'):
                             return self.reply_json(409, {'ok': False, 'error': '节点因流量超额停用中，Reality 将在控制台恢复节点时自动启动'})
-                        if not Path('/etc/hysteria/xray.json').exists():
-                            self._generate_and_apply_reality(True)
-                        else:
-                            subprocess.run(['systemctl', 'reset-failed', 'xray'], capture_output=True, timeout=5)
-                            started = subprocess.run(['systemctl', 'restart', 'xray'], capture_output=True, timeout=15)
-                            if started.returncode != 0:
-                                return self.reply_json(500, {'ok': False, 'error': 'Reality 启动失败，请检查服务日志'})
-                        actual = subprocess.run(['systemctl', 'is-active', 'xray'], capture_output=True, text=True, timeout=3).stdout.strip()
+                        # _generate_and_apply_reality 内部已加锁并做事务重启。
+                        self._generate_and_apply_reality(True)
+                        if not Path('/usr/local/bin/xray').exists():
+                            return self.reply_json(500, {'ok': False, 'error': 'Xray 未安装'})
+                        actual = subprocess.run(['systemctl', 'is-active', 'xray'],
+                                                capture_output=True, text=True, timeout=3).stdout.strip()
                         if actual != 'active':
                             return self.reply_json(500, {'ok': False, 'error': 'Reality 尚未运行，不能报告已开启'})
                         new_active = True
@@ -6615,21 +6750,24 @@ WantedBy=multi-user.target
             except Exception as e:
                 return self.reply_json(500, {'ok': False, 'error': str(e)})
 
-        def _vmess_certificate(self, domain):
-            """挑一张**能对外出示**的证书给 VMess 用，返回 (cert, key, sni)。
+        def _vmess_certificate(self, domain, protocol='VMess'):
+            """挑一张**能对外出示**的证书给 TLS 协议用，返回 (cert, key, sni)。
 
-            与 Reality 不同，VMess-WS 是真正的 TLS 服务端，必须出示一张
-            客户端能验证通过的证书。这里只认「有 SAN 且覆盖域名」的证书：
+            与 Reality 不同，VMess-WS 与 VLESS Encryption 都是真正的 TLS 服务端，
+            必须出示一张客户端能验证通过的证书。这里只认「有 SAN 且覆盖域名」的证书：
               * 自签证书在多数客户端会直接报错，不静默降级成 insecure；
               * 证书与私钥必须配对，否则 Xray 预检会失败。
             做不到就抛异常，让调用方明确拒绝启用，而不是生成一份必然连不上的配置。
+
+            protocol 只影响错误文案：两个协议共用同一套校验，但报错必须说清
+            是哪个协议启用失败，否则用户会去查错地方。
             """
             cfg_dir = Path('/etc/hysteria')
             cert_file, cn, sans, self_signed = _resolve_live_cert(cfg_dir)
             if not cert_file or not Path(cert_file).is_file():
-                raise RuntimeError('找不到可用 TLS 证书，VMess 需要先配置证书')
+                raise RuntimeError('找不到可用 TLS 证书，%s 需要先配置证书' % protocol)
             if self_signed:
-                raise RuntimeError('当前为自签证书，VMess 客户端无法校验；请先配置域名证书')
+                raise RuntimeError('当前为自签证书，%s 客户端无法校验；请先配置域名证书' % protocol)
             names = set(sans or []) | ({cn} if cn else set())
             if domain not in names:
                 raise RuntimeError('证书不包含域名 %s（现有: %s）' % (
@@ -6637,7 +6775,20 @@ WantedBy=multi-user.target
             key_file = _find_cert_key(Path(cert_file), cfg_dir)
             if key_file is None:
                 raise RuntimeError(
-                    '找不到与证书 %s 配对的私钥；VMess 需要证书与私钥成对可用' % cert_file)
+                    '找不到与证书 %s 配对的私钥；%s 需要证书与私钥成对可用'
+                    % (cert_file, protocol))
+            # 证书链必须完整（至少叶证书 + 中间证书）。Go 系客户端
+            # （Xray / v2rayN / hysteria）不会通过 AIA 补齐中间证书，
+            # 只给叶证书时握手会报 x509: certificate signed by unknown authority。
+            # 安装器 _accept_cert_pair 有同样的判据，门户这边此前漏了。
+            try:
+                pem_text = Path(cert_file).read_text(encoding='utf-8', errors='ignore')
+            except OSError:
+                pem_text = ''
+            if pem_text.count('BEGIN CERTIFICATE') < 2:
+                raise RuntimeError(
+                    '证书 %s 只有叶证书、缺少中间证书链；客户端会报 unknown authority。'
+                    '请使用 fullchain 或包含完整链的证书文件' % cert_file)
             return str(cert_file), str(key_file), domain
 
         def _vmess_ws_path(self):
@@ -6666,7 +6817,15 @@ WantedBy=multi-user.target
                 reality_port = (data.get('reality_config') or {}).get('port')
             # 必须显式避开 Reality 的端口：它可能刚写进配置、尚未重启，
             # 监听表里还看不到，只靠 ss 探测会让两者撞同一个端口。
-            blocked = {m.get('listen_port'), m.get('subscription_port'), reality_port}
+            try:
+                _cfg_now = (json.loads(Path('/etc/hysteria/xray.json').read_text(encoding='utf-8'))
+                            if Path('/etc/hysteria/xray.json').exists() else None)
+            except (OSError, ValueError):
+                _cfg_now = None
+            with data_lock:
+                _data_now = dict(data)
+            blocked = managed_reserved_ports(m, _data_now, _cfg_now)
+            blocked.add(reality_port)
             listen_port, reason = _pick_reality_port(
                 preferred=old.get('port') or 2087,
                 extra_blocked=blocked)
@@ -6696,24 +6855,27 @@ WantedBy=multi-user.target
             xray_path = Path('/etc/hysteria/xray.json')
             if not Path('/usr/local/bin/xray').exists():
                 raise RuntimeError('Xray 核心未安装')
-            config = (json.loads(xray_path.read_text(encoding='utf-8'))
-                      if xray_path.exists() else {'log': {'loglevel': 'warning'},
-                                                  'outbounds': [{'protocol': 'freedom',
-                                                                 'tag': 'direct'}]})
-            config = upsert_managed_inbound(config, VMESS_INBOUND_TAG, inbound)
-            meter_cfg = portal_path.parent / 'usage-meter-config.json'
-            if meter_cfg.exists():
-                meter = json.loads(meter_cfg.read_text(encoding='utf-8')).get('reality') or {}
-                address = meter.get('address', '')
-                if address:
-                    if not address.startswith('127.0.0.1:'):
-                        raise ValueError('统计接口必须为回环地址')
-                    stats_path = Path(__file__).parent / 'usage-meter-xray-config-20261007-v1.py'
-                    spec = importlib.util.spec_from_file_location('portal_stats_cfg', stats_path)
-                    mod = importlib.util.module_from_spec(spec)
-                    spec.loader.exec_module(mod)
-                    config = mod.add_stats(config, int(address.rsplit(':', 1)[1]))
+            # 读-改-写整体在锁内：否则并发启用另一个协议时，本次会用旧快照
+            # 覆盖磁盘、把对方静默丢掉（2026-10-24 修，理由同 Reality）。
             with reality_apply_lock:
+                config = (json.loads(xray_path.read_text(encoding='utf-8'))
+                          if xray_path.exists() else {'log': {'loglevel': 'warning'},
+                                                      'outbounds': [{'protocol': 'freedom',
+                                                                     'tag': 'direct'}]})
+                config = upsert_managed_inbound(config, VMESS_INBOUND_TAG, inbound)
+                meter_cfg = portal_path.parent / 'usage-meter-config.json'
+                if meter_cfg.exists():
+                    meter = json.loads(meter_cfg.read_text(encoding='utf-8')).get('reality') or {}
+                    address = meter.get('address', '')
+                    if address:
+                        if not address.startswith('127.0.0.1:'):
+                            raise ValueError('统计接口必须为回环地址')
+                        stats_path = Path(__file__).parent / 'usage-meter-xray-config-20261007-v1.py'
+                        spec = importlib.util.spec_from_file_location('portal_stats_cfg', stats_path)
+                        mod = importlib.util.module_from_spec(spec)
+                        spec.loader.exec_module(mod)
+                        config = mod.add_stats(config, int(address.rsplit(':', 1)[1]))
+                config = add_private_network_guard(config)
                 apply_xray_config_transaction(
                     config, config_path=str(xray_path),
                     binary='/usr/local/bin/xray',
@@ -6740,7 +6902,7 @@ WantedBy=multi-user.target
             domain = (m.get('server_name') or '').strip()
             if not domain or not _is_dns_name(domain):
                 raise RuntimeError('VLESS Encryption 需要先绑定域名（当前无可用 server_name）')
-            cert_file, key_file, sni = self._vmess_certificate(domain)
+            cert_file, key_file, sni = self._vmess_certificate(domain, 'VLESS Encryption')
             with data_lock:
                 old = dict(data.get('vlessenc_config') or {})
                 blocked_ports = {
@@ -6748,6 +6910,14 @@ WantedBy=multi-user.target
                     (data.get('reality_config') or {}).get('port'),
                     (data.get('vmess_config') or {}).get('port'),
                 }
+            try:
+                _cfg_now = (json.loads(Path('/etc/hysteria/xray.json').read_text(encoding='utf-8'))
+                            if Path('/etc/hysteria/xray.json').exists() else None)
+            except (OSError, ValueError):
+                _cfg_now = None
+            with data_lock:
+                _data_now = dict(data)
+            blocked_ports |= managed_reserved_ports(m, _data_now, _cfg_now)
             listen_port, reason = _pick_reality_port(
                 preferred=old.get('port') or 2088, extra_blocked=blocked_ports)
             if not listen_port:
@@ -6778,24 +6948,26 @@ WantedBy=multi-user.target
             xray_path = Path('/etc/hysteria/xray.json')
             if not Path('/usr/local/bin/xray').exists():
                 raise RuntimeError('Xray 核心未安装')
-            config = (json.loads(xray_path.read_text(encoding='utf-8'))
-                      if xray_path.exists() else {'log': {'loglevel': 'warning'},
-                                                  'outbounds': [{'protocol': 'freedom',
-                                                                 'tag': 'direct'}]})
-            config = upsert_managed_inbound(config, VLESSENC_INBOUND_TAG, inbound)
-            meter_cfg = portal_path.parent / 'usage-meter-config.json'
-            if meter_cfg.exists():
-                meter = json.loads(meter_cfg.read_text(encoding='utf-8')).get('reality') or {}
-                address = meter.get('address', '')
-                if address:
-                    if not address.startswith('127.0.0.1:'):
-                        raise ValueError('统计接口必须为回环地址')
-                    stats_path = Path(__file__).parent / 'usage-meter-xray-config-20261007-v1.py'
-                    spec = importlib.util.spec_from_file_location('portal_stats_cfg', stats_path)
-                    mod = importlib.util.module_from_spec(spec)
-                    spec.loader.exec_module(mod)
-                    config = mod.add_stats(config, int(address.rsplit(':', 1)[1]))
+            # 读-改-写整体在锁内（2026-10-24 修，理由同 Reality / VMess）。
             with reality_apply_lock:
+                config = (json.loads(xray_path.read_text(encoding='utf-8'))
+                          if xray_path.exists() else {'log': {'loglevel': 'warning'},
+                                                      'outbounds': [{'protocol': 'freedom',
+                                                                     'tag': 'direct'}]})
+                config = upsert_managed_inbound(config, VLESSENC_INBOUND_TAG, inbound)
+                meter_cfg = portal_path.parent / 'usage-meter-config.json'
+                if meter_cfg.exists():
+                    meter = json.loads(meter_cfg.read_text(encoding='utf-8')).get('reality') or {}
+                    address = meter.get('address', '')
+                    if address:
+                        if not address.startswith('127.0.0.1:'):
+                            raise ValueError('统计接口必须为回环地址')
+                        stats_path = Path(__file__).parent / 'usage-meter-xray-config-20261007-v1.py'
+                        spec = importlib.util.spec_from_file_location('portal_stats_cfg', stats_path)
+                        mod = importlib.util.module_from_spec(spec)
+                        spec.loader.exec_module(mod)
+                        config = mod.add_stats(config, int(address.rsplit(':', 1)[1]))
+                config = add_private_network_guard(config)
                 apply_xray_config_transaction(
                     config, config_path=str(xray_path),
                     binary='/usr/local/bin/xray',
@@ -6845,10 +7017,16 @@ WantedBy=multi-user.target
                                                  'message': 'VMess 本来就没有启用'})
                 with data_lock:
                     closed_port = int((data.get('vmess_config') or {}).get('port') or 0)
-                remove_managed_inbound(config, VMESS_INBOUND_TAG)
+                # 在锁内重新读取磁盘内容再删：handler 开头读到的 config 可能
+                # 已被另一个协议的启用覆盖，用旧副本写回会把它静默丢掉。
                 with reality_apply_lock:
+                    try:
+                        current = json.loads(xray_path.read_text(encoding='utf-8'))
+                    except (OSError, ValueError):
+                        current = config
+                    remove_managed_inbound(current, VMESS_INBOUND_TAG)
                     apply_xray_config_transaction(
-                        config, config_path=str(xray_path),
+                        current, config_path=str(xray_path),
                         binary='/usr/local/bin/xray',
                         restart=not unit_suspended('xray'))
                 with data_lock:
@@ -6931,10 +7109,16 @@ WantedBy=multi-user.target
                                                  'message': 'VLESS Encryption 本来就没有启用'})
                 with data_lock:
                     closed_port = int((data.get('vlessenc_config') or {}).get('port') or 0)
-                remove_managed_inbound(config, VLESSENC_INBOUND_TAG)
+                # 在锁内重新读取磁盘内容再删：handler 开头读到的 config 可能
+                # 已被另一个协议的启用覆盖，用旧副本写回会把它静默丢掉。
                 with reality_apply_lock:
+                    try:
+                        current = json.loads(xray_path.read_text(encoding='utf-8'))
+                    except (OSError, ValueError):
+                        current = config
+                    remove_managed_inbound(current, VLESSENC_INBOUND_TAG)
                     apply_xray_config_transaction(
-                        config, config_path=str(xray_path),
+                        current, config_path=str(xray_path),
                         binary='/usr/local/bin/xray',
                         restart=not unit_suspended('xray'))
                 with data_lock:
@@ -7523,7 +7707,9 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                             'vless_reality': dict(
                                 {
                                     'installed': _bin('xray'),
-                                    'active': _svc_active('xray'),
+                                    # 与 /reality-status 同一判据：看 Reality 入站是否存在。
+                                    # 只看 Xray 进程会让「只开了 VMess」的节点报 Reality 运行中。
+                                    'active': d_snap['reality_inbound'],
                                     'port': int(d_snap['reality'].get('port', 0) or 0),
                                     # 是否已配置。
                                     #
@@ -8096,14 +8282,16 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 'installed': is_installed,
                 'active': is_active,
                 'config': {
-                    'uri': rcfg.get('uri', ''),
+                    # 停用后不再下发 URI（与 VMess / VLESS Encryption 对齐）：
+                    # 前端虽已隐藏内容区，但接口仍返回可用链接会误导脚本调用方。
+                    'uri': rcfg.get('uri', '') if is_active else '',
                     'uuid': rcfg.get('uuid', ''),
                     'pub_key': rcfg.get('public_key', ''),
                     'short_id': rcfg.get('short_id', ''),
                     'flow': 'xtls-rprx-vision',
                     'sni': rcfg.get('dest_sni', 'www.apple.com'),
-                    'port': rcfg.get('port', 443),
-                    'qr_svg': qr_svg
+                    'port': rcfg.get('port', 443) if is_active else 0,
+                    'qr_svg': qr_svg if is_active else ''
                 }
             })
 

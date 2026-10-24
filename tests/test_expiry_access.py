@@ -36,3 +36,52 @@ class ExpiryTests(unittest.TestCase):
   self.assertEqual(env['delete'](Fake(),{'user_id':'probe'})[0],503)
   self.assertEqual(state['_pending_revocations'],['probe'])
 if __name__=='__main__':unittest.main()
+
+
+class MultiProtocolRevocationTests(unittest.TestCase):
+    """撤销必须覆盖**所有**托管入站。
+
+    真实缺口（2026-10-24 接入 VMess 时暴露）：enforce_node_access 曾经只找
+    第一个 Reality 入站，于是 VMess-only 节点上「停用/到期/超额」的用户
+    仍然能用 VMess 继续连。这里锁住三种协议同时被收回。
+    """
+
+    def _xray(self, root):
+        cfg = {'inbounds': [
+            {'tag': portal.REALITY_INBOUND_TAG, 'port': 443, 'protocol': 'vless',
+             'settings': {'clients': [], 'decryption': 'none'},
+             'streamSettings': {'network': 'tcp', 'security': 'reality',
+                                'realitySettings': {'privateKey': 'k', 'shortIds': ['s']}}},
+            {'tag': portal.VMESS_INBOUND_TAG, 'port': 2087, 'protocol': 'vmess',
+             'settings': {'clients': []},
+             'streamSettings': {'network': 'ws', 'security': 'tls'}},
+            {'tag': portal.VLESSENC_INBOUND_TAG, 'port': 2088, 'protocol': 'vless',
+             'settings': {'clients': [], 'decryption': 'mlkem768x25519plus.native.600s.x'},
+             'streamSettings': {'network': 'tcp', 'security': 'tls'}},
+        ]}
+        (root / 'xray.json').write_text(json.dumps(cfg), encoding='utf-8')
+
+    def test_all_three_protocols_drop_disabled_user(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = pathlib.Path(d)
+            self._xray(root)
+            # Hy2 撤销分支要求回环统计可用；这里给它一个真实回环地址，
+            # 并把 /online 固定返回空表（没有在线会话要踢）。
+            (root / 'usage-meter-config.json').write_text(json.dumps(
+                {'hysteria': {'url': 'http://127.0.0.1:19996', 'secret': 'fixture'}}),
+                encoding='utf-8')
+            data = {'users': {'alive': {'expires_at': 2085974400, 'status': 'active'},
+                              'dead': {'expires_at': 2085974400, 'status': 'disabled'}}}
+            with patch.object(portal.urllib.request, 'urlopen', return_value=Resp({})),                     patch.object(portal.subprocess, 'run') as run:
+                self.assertTrue(portal.enforce_node_access(root, data, ['dead']))
+            written = json.loads((root / 'xray.json').read_text(encoding='utf-8'))
+            by_tag = {i['tag']: i for i in written['inbounds']}
+            for tag in (portal.REALITY_INBOUND_TAG, portal.VMESS_INBOUND_TAG,
+                        portal.VLESSENC_INBOUND_TAG):
+                emails = [c['email'] for c in by_tag[tag]['settings']['clients']]
+                self.assertIn('alive', emails, tag)
+                self.assertNotIn('dead', emails, tag)
+            # 三种协议都在同一份配置里 → 只需重启一次 xray。
+            restarts = [c for c in run.call_args_list
+                        if c.args and c.args[0][:2] == ['systemctl', 'restart']]
+            self.assertEqual(len(restarts), 1)

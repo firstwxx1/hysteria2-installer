@@ -76,7 +76,11 @@ def enable_iplimit_routing(config_path, binary, address):
     add_iplimit_routing(config)
     assert clients==[i.get('settings',{}).get('clients') for i in config.get('inbounds',[])]
     candidate=path.with_name(path.name+'.iplimit-candidate.json')
-    backup=path.with_name(path.name+'.before-iplimit-'+str(time.time_ns()))
+    # 只保留最近一份备份（2026-10-24 修）：旧实现每次都用纳秒时间戳新建
+    # `xray.json.before-iplimit-<ns>`，而这个函数在每次 Xray 重启后都会被调用，
+    # /etc/hysteria 下会无界累积备份文件（实测已出现）。
+    # 固定文件名既保留回滚能力，又不会随重启增长。
+    backup=path.with_name(path.name+'.before-iplimit')
     replaced=False
     try:
         candidate.write_text(json.dumps(config,indent=2),encoding='utf-8')
