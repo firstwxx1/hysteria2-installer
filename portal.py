@@ -1824,6 +1824,65 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
     </div>
   </section>
 
+  <!-- VMess-WS-TLS 独立卡片（2026-10-24 加）。
+       与 Reality 分开一张卡、各自一个开关：两者共用 Xray 进程，但启用条件
+       完全不同（Reality 偷握手，VMess 必须出示自己的域名证书），
+       混在一个开关里会出现「点了开启，其实只开了其中一个」。 -->
+  <section class="card" style="margin-bottom:22px">
+    <div class="user-header">
+      <div>
+        <h2>🧩 VMess-WS-TLS 兼容通道</h2>
+        <p style="font-size:13px">WebSocket + TLS 标准协议，兼容仅支持 VMess 的老客户端；与 Reality 共用 Xray 核心，可同时开启</p>
+      </div>
+      <div style="display:flex;gap:10px;align-items:center">
+        <span class="status-pill" id="vmess-badge" style="background:#f1efe8;color:#5f5e5a">检测中...</span>
+        <button class="toggle-btn off" id="btn-toggle-vmess" type="button" style="display:none">切换中...</button>
+      </div>
+    </div>
+    <div class="warp-switch-card" style="background:#f7f9fc;border-color:#d7e2ee">
+      <div class="warp-desc-title" style="color:#1a365d">🔐 与 Reality 的区别</div>
+      <p class="warp-desc-text" style="color:#4a5568">
+        Reality 借用大厂证书握手，无需自己的域名；VMess-WS 是真正的 TLS 服务端，
+        <b>必须已绑定域名且持有可被客户端校验的证书</b>（自签证书会被拒绝启用）。
+        端口自动挑选空闲 TCP 端口，WS 路径随机生成并保持稳定。
+      </p>
+    </div>
+    <div id="vmess-content-box" style="display:none">
+      <div class="layout" style="margin-top:10px">
+        <section class="card qr-card" style="background:#fbfcfd;border-color:var(--line)">
+          <div class="eyebrow" style="color:#7c3aed">VMESS CONNECT</div>
+          <h2>VMess 节点扫码</h2>
+          <p class="hint">适用于 v2rayN / NekoBox / Shadowrocket</p>
+          <div class="qr-frame" style="max-width:220px;margin:16px auto;padding:10px"><div id="vmess-qr-box" style="width:100%;height:auto"></div></div>
+          <div class="tags"><span class="tag">VMess</span><span class="tag">WebSocket</span><span class="tag">TLS</span><span class="tag" id="vmess-port-tag">TCP --</span></div>
+        </section>
+        <div class="stack">
+          <section class="card" style="border-color:#d7e2ee">
+            <div class="card-head"><span class="step" style="background:#f3e8ff;color:#7c3aed">01</span><div><h2>VMess 直链 (URI)</h2><p>Base64 标准格式，导入即用</p></div></div>
+            <textarea class="link" id="vmess-uri-val" readonly style="height:86px;font-size:11.5px"></textarea>
+            <div class="actions" style="margin-top:12px">
+              <button class="button primary" id="btn-copy-vmess-uri" type="button">复制 VMess 直链</button>
+            </div>
+          </section>
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px">
+            <div style="background:#fbfcfd;border:1px solid var(--line);border-radius:12px;padding:12px">
+              <div style="font-size:11px;color:var(--muted);font-weight:700;margin-bottom:2px">域名 / SNI</div>
+              <div style="font-size:13px;font-weight:750;color:var(--ink);font-family:monospace" id="vmess-domain-val">-</div>
+            </div>
+            <div style="background:#fbfcfd;border:1px solid var(--line);border-radius:12px;padding:12px">
+              <div style="font-size:11px;color:var(--muted);font-weight:700;margin-bottom:2px">用户 UUID</div>
+              <div style="font-size:12px;font-weight:750;color:var(--ink);font-family:monospace;word-break:break-all" id="vmess-uuid-val">-</div>
+            </div>
+            <div style="background:#fbfcfd;border:1px solid var(--line);border-radius:12px;padding:12px">
+              <div style="font-size:11px;color:var(--muted);font-weight:700;margin-bottom:2px">WS 路径</div>
+              <div style="font-size:12px;font-weight:750;color:var(--ink);font-family:monospace;word-break:break-all" id="vmess-path-val">-</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
   <!-- 区块: 证书状态与到期告警
        为什么放在最前面：证书过期/临期是「昨天还好好的、今天突然连不上」里最高频的真凶，
        而自动自愈只对齐信任模型、不会去续期证书 —— 不把剩余天数摆出来就只能在掉线后才发现。 -->
@@ -2793,6 +2852,127 @@ def reality_registry(data):
     return reg
 
 
+# ---- 项目托管的 Xray 入站（2026-10-24 VMess 接入时统一）----
+#
+# 背景：此前 Reality 的生成/撤销/启停全都按「第一个 protocol=vless 且
+# security=reality 的入站」来定位，一旦同一份 xray.json 里再放一个 VMess
+# 入站，这些函数就会**看不见它** —— 停用/到期只收回 Reality，VMess 照样能连。
+# 现在所有托管入站都带固定 tag，定位一律按 tag（旧的无 tag Reality 由
+# legacy 匹配兜底，升级后第一次写入即补上 tag）。
+REALITY_INBOUND_TAG = 'vless-reality-in'
+VMESS_INBOUND_TAG = 'vmess-ws-in'
+MANAGED_INBOUND_TAGS = (REALITY_INBOUND_TAG, VMESS_INBOUND_TAG)
+
+
+def managed_inbound_index(config, tag):
+    """返回 (下标, 入站)。先按 tag 找；找不到再按协议特征兜底旧配置。
+
+    兜底只对 Reality 生效：旧版配置里的 Reality 入站没有 tag，
+    但 VMess 是本版本才引入的，不存在无 tag 的历史配置。
+    """
+    inbounds = config.get('inbounds') or []
+    for i, item in enumerate(inbounds):
+        if isinstance(item, dict) and item.get('tag') == tag:
+            return i, item
+    if tag == REALITY_INBOUND_TAG:
+        for i, item in enumerate(inbounds):
+            if (isinstance(item, dict) and item.get('protocol') == 'vless'
+                    and (item.get('streamSettings') or {}).get('security') == 'reality'):
+                return i, item
+    return -1, None
+
+
+def upsert_managed_inbound(config, tag, inbound):
+    """把托管入站按 tag 写入/替换，**保留**其它入站、api、routing、outbounds。
+
+    旧实现重生成 Reality 时是「整份 previous 覆盖 + 改第一个 Reality」，
+    在只有一种协议时没问题；加入 VMess 后那样会**丢掉 VMess 入站**。
+    这里只动自己那一个元素，别的原样保留。
+    """
+    idx, current = managed_inbound_index(config, tag)
+    inbound = copy.deepcopy(inbound)
+    inbound['tag'] = tag
+    if idx < 0:
+        config.setdefault('inbounds', []).append(inbound)
+        return config
+    inbounds = config['inbounds']
+    # 保留旧入站上可能存在的、本版本不认识的额外键（例如手工加的 sniffing 扩展），
+    # 但 settings/streamSettings 必须整体以新值为准，否则 clients 会新旧混在一起。
+    merged = copy.deepcopy(current)
+    merged.update(inbound)
+    inbounds[idx] = merged
+    return config
+
+
+def remove_managed_inbound(config, tag):
+    """按 tag 移除托管入站，返回是否真的移除了。"""
+    idx, _ = managed_inbound_index(config, tag)
+    if idx < 0:
+        return False
+    del config['inbounds'][idx]
+    return True
+
+
+def has_managed_inbound(config, tag):
+    return managed_inbound_index(config, tag)[0] >= 0
+
+
+def vmess_uuid_for_user(user_id):
+    """为某个用户派生**稳定**的 VMess UUID。
+
+    命名空间与 Reality **不同**：同一 user_id 在两种协议下得到不同 UUID。
+    这不是为了安全，而是为了排查时能一眼分辨「这条连接走的是哪个协议」；
+    也避免用户误把 Reality 的 UUID 填进 VMess 客户端还能连上的混淆。
+    命名空间固定，换掉会让已下发的 VMess 订阅全部失效。
+    """
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, 'hy2-portal-vmess:' + str(user_id)))
+
+
+def vmess_clients(data):
+    """生成 VMess 入站的 clients —— 与 reality_clients 同一套准入判据。
+
+    ⚠️ 两个必须遵守的差异：
+      1. **不能带 flow**：flow 是 VLESS 专用字段，VMess 客户端见到会报配置错误。
+      2. 空表同样要给占位 client —— 与 Reality 同理，Xray 的 VMess 入站
+         clients 为空时同样不接受任何连接，而服务状态仍是 active。
+    """
+    users = data.get('users', {}) or {}
+    clients = []
+    for uid in sorted(users):
+        if not user_access_allowed(users.get(uid) or {}):
+            continue
+        clients.append({'id': vmess_uuid_for_user(uid), 'email': uid})
+    if not clients:
+        clients = [{'id': str(uuid.uuid4()), 'email': 'placeholder'}]
+    return clients
+
+
+def vmess_uri_for_user(vcfg, user_id, public_ip, label=None):
+    """拼一条标准 vmess:// 直链（Base64 JSON，v2rayN / NekoBox / Shadowrocket 通用）。
+
+    与 vless:// 不同，vmess 没有查询串格式，主流客户端都认 Base64(JSON)。
+    字段名必须用小写 `v`/`ps` 等老字段：v2rayN 与 Shadowrocket 都按这套解析，
+    新版 `vmess://` URI 草案（带 path 查询串）支持面反而更窄。
+    """
+    if not vcfg:
+        return ''
+    host = vcfg.get('domain') or public_ip
+    port = vcfg.get('port')
+    path = vcfg.get('ws_path') or '/'
+    if not (host and port and path):
+        return ''
+    tag = label or ('VMess-WS-' + str(user_id))
+    payload = {
+        'v': '2', 'ps': tag, 'add': str(host), 'port': str(port),
+        'id': vmess_uuid_for_user(user_id), 'aid': '0', 'scy': 'auto',
+        'net': 'ws', 'type': 'none', 'host': str(host), 'path': path,
+        'tls': 'tls', 'sni': str(vcfg.get('sni') or host), 'alpn': '',
+        'fp': 'chrome',
+    }
+    raw = json.dumps(payload, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+    return 'vmess://' + base64.b64encode(raw).decode('ascii')
+
+
 _ACCESS_APPLIED = {}
 
 def user_access_allowed(info, now=None):
@@ -3039,19 +3219,28 @@ def enforce_node_access(root, snapshot, force_ids=()):
         return True
     original=xj.read_bytes()
     xcfg=json.loads(original)
-    inbound=next((i for i in xcfg.get('inbounds',[]) if i.get('protocol')=='vless' and
-                  i.get('streamSettings',{}).get('security')=='reality'),None)
-    if inbound is None:
+    # 收回必须覆盖**所有**托管入站：只看 Reality 的话，VMess-only 节点上
+    # 停用/到期/超额的用户会继续用 VMess 连（2026-10-24 接入 VMess 时的关键缺口）。
+    wanted_by_tag={}
+    for tag in MANAGED_INBOUND_TAGS:
+        idx,_inbound=managed_inbound_index(xcfg,tag)
+        if idx<0:
+            continue
+        wanted_by_tag[tag]=reality_clients(snapshot) if tag==REALITY_INBOUND_TAG else vmess_clients(snapshot)
+    if not wanted_by_tag:
         return True
-    wanted=reality_clients(snapshot)
-    signature=hashlib.sha256(json.dumps(wanted,sort_keys=True).encode()).hexdigest()
+    signature=hashlib.sha256(json.dumps(wanted_by_tag,sort_keys=True).encode()).hexdigest()
     epoch=subprocess.run(['systemctl','show','xray','--property=InvocationID','--value'],capture_output=True,text=True,timeout=4,check=True).stdout.strip()
-    if inbound.get('settings',{}).get('clients')==wanted and _ACCESS_APPLIED.get(str(root))==(signature,epoch):
+    current={tag:xcfg['inbounds'][managed_inbound_index(xcfg,tag)[0]].get('settings',{}).get('clients')
+             for tag in wanted_by_tag}
+    if current==wanted_by_tag and _ACCESS_APPLIED.get(str(root))==(signature,epoch):
         return True
     # 首次升级/删除请求也核验实际重载，不能仅比较磁盘配置。
-    if not blocked and not force_ids and inbound.get('settings',{}).get('clients')==wanted:
+    if not blocked and not force_ids and current==wanted_by_tag:
         return True
-    inbound.setdefault('settings',{})['clients']=wanted
+    for tag,wanted in wanted_by_tag.items():
+        idx,_inbound=managed_inbound_index(xcfg,tag)
+        xcfg['inbounds'][idx].setdefault('settings',{})['clients']=wanted
     candidate=xj.with_name('xray.expiry-candidate.json')
     candidate.write_text(json.dumps(xcfg,indent=2),encoding='utf-8')
     candidate.chmod(xj.stat().st_mode & 0o777)
@@ -3060,7 +3249,7 @@ def enforce_node_access(root, snapshot, force_ids=()):
     try:
         subprocess.run([binary,'run','-test','-c',str(candidate)],capture_output=True,timeout=10,check=True)
         if xj.read_bytes()!=original:
-            raise RuntimeError('Reality configuration changed concurrently; retry')
+            raise RuntimeError('Xray configuration changed concurrently; retry')
         shutil.copy2(xj,xj.with_name('xray.expiry-last-good.json'))
         candidate.replace(xj); replaced=True
         state=subprocess.run(['systemctl','is-active','xray'],capture_output=True,text=True,timeout=4).stdout.strip()
@@ -3334,12 +3523,18 @@ def reality_uri_for_user(rcfg, user_id, public_ip, label=None):
             f"&sni={dest_sni}&sid={short_id}#{quote(tag)}")
 
 
-def artifacts(m, auth_override=None, name_override=None, reality=None, user_id=None):
+def artifacts(m, auth_override=None, name_override=None, reality=None, user_id=None,
+              vmess=None):
     """生成 hy2:// 直链 + Clash / Sing-box 配置。
 
     reality（可选）—— 传 rcfg 时会**额外产出一条 VLESS-Reality 节点**，
     并把 Clash 的 PROXY 组改成 url-test（Hy2 与 Reality 自动择优），
     这样「UDP 被 QoS 的网络」会自己切到 TCP 通道（2026-10-03）。
+
+    vmess（可选）—— 传 data['vmess_config'] 时再追加一条 VMess-WS-TLS。
+    ⚠️ 返回值仍是三元组 (uri, clash, sing)，不新增返回位：调用点有 7 处，
+    改返回结构会让任何漏改的一处静默错位。VMess 的 vmess:// 直链由
+    vmess_uri_for_user() 单独生成，在需要的端点里作为额外字段下发。
     """
     is_insecure = m.get('is_insecure', False)
     server_name = m.get('server_name') or m.get('public_ip', 'localhost')
@@ -3420,13 +3615,42 @@ def artifacts(m, auth_override=None, name_override=None, reality=None, user_id=N
                                         utls=dict(enabled=True,
                                                   fingerprint='chrome')))
 
-    proxies = [proxy] + ([reality_proxy] if reality_proxy else [])
-    sing_outbounds = [sing] + ([reality_sing] if reality_sing else [])
+    # ---- VMess-WS-TLS 备用通道（可选，2026-10-24 加）----
+    #
+    # 与 Reality 同样是 TCP 通道，但依赖**自己的域名证书**：Reality 偷别人的
+    # 握手，VMess 必须真的出示证书。因此只在启用且拿到域名时才追加。
+    vmess_proxy = None
+    vmess_sing = None
+    if vmess and user_id and vmess.get('domain') and vmess.get('port'):
+        v_name = name + '-VMess'
+        v_uuid = vmess_uuid_for_user(user_id)
+        v_host = vmess['domain']
+        v_sni = vmess.get('sni') or v_host
+        v_path = vmess.get('ws_path') or '/'
+        vmess_proxy = dict(name=v_name, type='vmess', server=v_host,
+                           port=int(vmess['port']), uuid=v_uuid, alterId=0,
+                           cipher='auto', udp=True, tls=True, servername=v_sni,
+                           network='ws', **{'ws-opts': {'path': v_path,
+                                                        'headers': {'Host': v_sni}}},
+                           client_fingerprint='chrome')
+        vmess_sing = dict(type='vmess', tag=v_name, server=v_host,
+                          server_port=int(vmess['port']), uuid=v_uuid,
+                          security='auto', alter_id=0,
+                          transport=dict(type='ws', path=v_path,
+                                         headers={'Host': v_sni}),
+                          tls=dict(enabled=True, server_name=v_sni,
+                                   utls=dict(enabled=True, fingerprint='chrome')))
 
-    if reality_proxy:
-        # url-test：客户端定时探测两条链路，自动选延迟低的。
-        # 比 select 好在「不需要用户手动切」——UDP 被 QoS 时会自己落到 Reality。
-        group_proxies = [name, reality_proxy['name']]
+    proxies = [proxy] + ([reality_proxy] if reality_proxy else []) + \
+              ([vmess_proxy] if vmess_proxy else [])
+    sing_outbounds = [sing] + ([reality_sing] if reality_sing else []) + \
+                     ([vmess_sing] if vmess_sing else [])
+    alternates = [p['name'] for p in (reality_proxy, vmess_proxy) if p]
+
+    if alternates:
+        # url-test：客户端定时探测多条链路，自动选延迟低的。
+        # 比 select 好在「不需要用户手动切」——UDP 被 QoS 时会自己落到 TCP 通道。
+        group_proxies = [name] + alternates
         group = {'name': 'PROXY', 'type': 'url-test', 'proxies': group_proxies,
                  'url': 'https://www.gstatic.com/generate_204',
                  'interval': 300, 'tolerance': 50}
@@ -3437,11 +3661,12 @@ def artifacts(m, auth_override=None, name_override=None, reality=None, user_id=N
              'proxies': proxies, 'proxy-groups': [group],
              'rules': ['MATCH,PROXY']}
     sing_doc = {'outbounds': sing_outbounds}
-    if reality_sing:
+    if alternates:
         # sing-box 侧同样给一个 urltest outbound，让 SFA/SFI 自动择优。
         sing_doc['outbounds'].append({
             'type': 'urltest', 'tag': 'PROXY',
-            'outbounds': [sing['tag'], reality_sing['tag']],
+            'outbounds': [sing['tag']] + [o['tag'] for o in
+                                          (reality_sing, vmess_sing) if o],
             'url': 'https://www.gstatic.com/generate_204',
             'interval': '5m', 'tolerance': 50,
         })
@@ -4465,6 +4690,34 @@ if __name__ == '__main__':
                        'created_at': p.get('created_at', '')} for p in peers_raw],
         }
 
+    def _active_reality_config():
+        """Reality 的配置，**仅在托管入站真的存在时**返回，否则 None。
+
+        为什么按入站判断而不是 data['reality_config']：后者是「上次生成成功」
+        的残留。Reality 被停掉后它还在，照着它生成订阅会下发一个连不上的节点。
+        """
+        try:
+            cfg = json.loads(Path('/etc/hysteria/xray.json').read_text(encoding='utf-8'))
+        except Exception:
+            return None
+        if not has_managed_inbound(cfg, REALITY_INBOUND_TAG):
+            return None
+        with data_lock:
+            rcfg = dict(data.get('reality_config') or {})
+        return rcfg or None
+
+    def _active_vmess_config():
+        """VMess 的配置，同样以托管入站是否存在为准。"""
+        try:
+            cfg = json.loads(Path('/etc/hysteria/xray.json').read_text(encoding='utf-8'))
+        except Exception:
+            return None
+        if not has_managed_inbound(cfg, VMESS_INBOUND_TAG):
+            return None
+        with data_lock:
+            vcfg = dict(data.get('vmess_config') or {})
+        return vcfg or None
+
     def regenerate_page():
         m = json.loads(meta_path.read_text(encoding='utf-8')) if meta_path.exists() else {}
         uri, clash, sing = artifacts(m)
@@ -4564,6 +4817,8 @@ if __name__ == '__main__':
 
     class Handler(BaseHTTPRequestHandler):
         def _sync_reality_clients(self):
+            # 名字保留（调用点很多），实际语义已扩展为「同步所有托管入站」：
+            # Reality 与 VMess 的 clients 都由 enforce_node_access 一并收回。
             return apply_access()
 
         def _reality_restart_allowed(self, min_interval=3.0):
@@ -4720,21 +4975,17 @@ if __name__ == '__main__':
                 "outbounds": [{"protocol": "freedom", "tag": "direct"}]
             }
             xray_path = Path('/etc/hysteria/xray.json')
+            desired_inbound = xray_json['inbounds'][0]
             if xray_path.exists():
+                # 只按 tag 替换 Reality 自己那一条；VMess 入站、统计 api 入站、
+                # routing、outbounds 一律原样保留。旧版无 tag 的 Reality 由
+                # managed_inbound_index 的 legacy 匹配接住，写入时补上 tag。
                 previous = json.loads(xray_path.read_text(encoding='utf-8'))
-                old_inbound = next((i for i in previous.get('inbounds', [])
-                    if i.get('protocol') == 'vless' and
-                    (i.get('streamSettings') or {}).get('security') == 'reality'), None)
-                if old_inbound is not None:
-                    desired = xray_json['inbounds'][0]
-                    old_inbound['port'] = desired['port']
-                    old_inbound.setdefault('settings', {}).update(desired['settings'])
-                    old_inbound.setdefault('streamSettings', {}).setdefault('realitySettings', {}).update(
-                        desired['streamSettings']['realitySettings'])
-                    xray_json = previous
+                xray_json = upsert_managed_inbound(previous, REALITY_INBOUND_TAG, desired_inbound)
 
             # 重生成 Reality 配置时保留计量能力；仅添加回环 StatsService。
-            # 没有计量配置时保持原行为，有配置却不可应用时禁止静默覆盖。
+            # add_stats 是幂等的，且**不改任何 clients**（有断言兜底），
+            # 所以 VMess 入站及其 clients 不会被它重置。
             _meter_config_path = portal_path.parent / 'usage-meter-config.json'
             if _meter_config_path.exists():
                 _meter_config = json.loads(_meter_config_path.read_text(encoding='utf-8'))
@@ -5067,6 +5318,7 @@ if __name__ == '__main__':
                         # 对应一个 VLESS UUID，开户即生效。
                         reality_registry(data)
                         rcfg = dict(data.get('reality_config', {}) or {})
+                        vcfg_active = dict(data.get('vmess_config') or {})
                     regenerate_page()
 
                     # 受控对账开户必须确认Reality生效；失败可GET→update同值重试。
@@ -5082,10 +5334,13 @@ if __name__ == '__main__':
                     # 且 Clash / Sing-box 的策略组变成 url-test（自动择优）。
                     uri, clash_yaml, sing_json = artifacts(
                         m, auth_override=pwd, name_override=f"Teyir-Hy2-{user_id}",
-                        reality=rcfg, user_id=user_id)
+                        reality=rcfg, user_id=user_id, vmess=vcfg_active)
                     public_ip = m.get('public_ip', '127.0.0.1')
                     reality_uri = reality_uri_for_user(
                         rcfg, user_id, public_ip, label=f"Teyir-Reality-{user_id}")
+                    vmess_uri = vmess_uri_for_user(
+                        vcfg_active, user_id, public_ip,
+                        label=f"Teyir-VMess-{user_id}") if vcfg_active else ''
                     return self.reply_json(200, {
                         'ok': True,
                         'user_id': user_id,
@@ -5096,6 +5351,8 @@ if __name__ == '__main__':
                         'uri': uri,
                         'reality_uri': reality_uri,
                         'reality_uuid': reality_uuid_for_user(user_id),
+                        'vmess_uri': vmess_uri,
+                        'vmess_uuid': vmess_uuid_for_user(user_id) if vcfg_active else '',
                         'clash': clash_yaml,
                         'sing_box': sing_json
                     })
@@ -5355,6 +5612,9 @@ if __name__ == '__main__':
 
             if self.path == prefix + 'manage-reality':
                 return self._h_post_manage_reality(prefix)
+
+            if self.path == prefix + 'manage-vmess':
+                return self._h_post_manage_vmess(prefix)
 
             if self.path == prefix + 'set-bbr':
                 return self._h_post_set_bbr(prefix)
@@ -6064,6 +6324,209 @@ WantedBy=multi-user.target
             except Exception as e:
                 return self.reply_json(500, {'ok': False, 'error': str(e)})
 
+        def _vmess_certificate(self, domain):
+            """挑一张**能对外出示**的证书给 VMess 用，返回 (cert, key, sni)。
+
+            与 Reality 不同，VMess-WS 是真正的 TLS 服务端，必须出示一张
+            客户端能验证通过的证书。这里只认「有 SAN 且覆盖域名」的证书：
+              * 自签证书在多数客户端会直接报错，不静默降级成 insecure；
+              * 证书与私钥必须配对，否则 Xray 预检会失败。
+            做不到就抛异常，让调用方明确拒绝启用，而不是生成一份必然连不上的配置。
+            """
+            cfg_dir = Path('/etc/hysteria')
+            cert_file, cn, sans, self_signed = _resolve_live_cert(cfg_dir)
+            if not cert_file or not Path(cert_file).is_file():
+                raise RuntimeError('找不到可用 TLS 证书，VMess 需要先配置证书')
+            if self_signed:
+                raise RuntimeError('当前为自签证书，VMess 客户端无法校验；请先配置域名证书')
+            names = set(sans or []) | ({cn} if cn else set())
+            if domain not in names:
+                raise RuntimeError('证书不包含域名 %s（现有: %s）' % (
+                    domain, ', '.join(sorted(names)) or '无'))
+            key_file = Path('/etc/hysteria/cert/server.key')
+            for raw in Path('/etc/hysteria/config.yaml').read_text(encoding='utf-8').splitlines():
+                stripped = raw.strip()
+                if stripped.startswith('key:'):
+                    value = stripped.split(':', 1)[1].strip().strip('"').strip("'")
+                    candidate = Path(value)
+                    key_file = candidate if candidate.is_absolute() else cfg_dir / candidate
+                    break
+            if not key_file.is_file():
+                raise RuntimeError('证书私钥不存在: %s' % key_file)
+            return str(cert_file), str(key_file), domain
+
+        def _vmess_ws_path(self):
+            """随机且**持久**的 WS 路径。路径本身不是机密，但随机值能挡掉
+            按固定路径扫描的主动探测；它写在订阅里，所以必须稳定。"""
+            with data_lock:
+                existing = (data.get('vmess_config') or {}).get('ws_path')
+            if isinstance(existing, str) and re.fullmatch(r'/[A-Za-z0-9_\-]{8,48}', existing):
+                return existing
+            return '/' + secrets.token_urlsafe(18).replace('=', '')
+
+        def _apply_vmess_enable(self):
+            """启用 VMess：写托管入站 → 事务替换 → 重启 xray → 落配置。
+
+            顺序刻意如此：**配置先落地、数据后写入**。反过来一旦事务失败，
+            data 里就留下一个「显示已启用、实际没有」的状态。
+            """
+            m = json.loads(meta_path.read_text(encoding='utf-8')) if meta_path.exists() else {}
+            public_ip = m.get('public_ip', '127.0.0.1')
+            domain = (m.get('server_name') or '').strip()
+            if not domain or not _is_dns_name(domain):
+                raise RuntimeError('VMess 需要先绑定域名（当前无可用 server_name）')
+            cert_file, key_file, sni = self._vmess_certificate(domain)
+            with data_lock:
+                old = dict(data.get('vmess_config') or {})
+            listen_port, reason = _pick_reality_port(
+                preferred=old.get('port') or 2087,
+                extra_blocked={m.get('listen_port'), m.get('subscription_port')})
+            if not listen_port:
+                raise RuntimeError(reason)
+            ws_path = self._vmess_ws_path()
+            with data_lock:
+                clients = vmess_clients(data)
+            inbound = {
+                'tag': VMESS_INBOUND_TAG,
+                'port': listen_port,
+                'protocol': 'vmess',
+                'settings': {'clients': clients},
+                'streamSettings': {
+                    'network': 'ws',
+                    'security': 'tls',
+                    'tlsSettings': {
+                        'serverName': sni,
+                        'certificates': [{'certificateFile': cert_file,
+                                          'keyFile': key_file}],
+                    },
+                    'wsSettings': {'path': ws_path},
+                },
+                'sniffing': {'enabled': True,
+                             'destOverride': ['http', 'tls', 'quic']},
+            }
+            xray_path = Path('/etc/hysteria/xray.json')
+            if not Path('/usr/local/bin/xray').exists():
+                raise RuntimeError('Xray 核心未安装')
+            config = (json.loads(xray_path.read_text(encoding='utf-8'))
+                      if xray_path.exists() else {'log': {'loglevel': 'warning'},
+                                                  'outbounds': [{'protocol': 'freedom',
+                                                                 'tag': 'direct'}]})
+            config = upsert_managed_inbound(config, VMESS_INBOUND_TAG, inbound)
+            meter_cfg = portal_path.parent / 'usage-meter-config.json'
+            if meter_cfg.exists():
+                meter = json.loads(meter_cfg.read_text(encoding='utf-8')).get('reality') or {}
+                address = meter.get('address', '')
+                if address:
+                    if not address.startswith('127.0.0.1:'):
+                        raise ValueError('统计接口必须为回环地址')
+                    stats_path = Path(__file__).parent / 'usage-meter-xray-config-20261007-v1.py'
+                    spec = importlib.util.spec_from_file_location('portal_stats_cfg', stats_path)
+                    mod = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(mod)
+                    config = mod.add_stats(config, int(address.rsplit(':', 1)[1]))
+            with reality_apply_lock:
+                apply_xray_config_transaction(
+                    config, config_path=str(xray_path),
+                    binary='/usr/local/bin/xray',
+                    restart=not unit_suspended('xray'))
+            new_cfg = {'port': listen_port, 'domain': domain, 'sni': sni,
+                       'ws_path': ws_path, 'uuid': vmess_uuid_for_user(MASTER_USER_ID)}
+            new_cfg['uri'] = vmess_uri_for_user(new_cfg, MASTER_USER_ID, public_ip,
+                                                label='VMess-WS-' + domain)
+            with data_lock:
+                data['vmess_config'] = new_cfg
+            save_data()
+            firewall_port(listen_port, 'tcp', open_=True)
+            return new_cfg
+
+        def _h_post_manage_vmess(self, prefix):
+            """POST /manage-vmess —— 独立启停 VMess，不影响 Reality。
+
+            ⚠️ 关闭时**必须重载 Xray**：仅从 xray.json 删掉入站不会断开
+            已经建立的连接，Xray 只在重载时才会重建监听。所以即便 Reality
+            仍在运行，这里也要 restart 一次（不是 stop），
+            这样 Reality 的用户只会短暂重连，不会被整体停掉。
+            """
+            if not self.is_authenticated():
+                return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
+            try:
+                length = int(self.headers.get('Content-Length', 0))
+                body = self.rfile.read(length).decode('utf-8') if length > 0 else ''
+                form = parse_qs(body)
+                action = form.get('action', ['toggle'])[0]
+                xray_path = Path('/etc/hysteria/xray.json')
+                config = (json.loads(xray_path.read_text(encoding='utf-8'))
+                          if xray_path.exists() else None)
+                enabled = bool(config) and has_managed_inbound(config, VMESS_INBOUND_TAG)
+                if action == 'toggle':
+                    action = 'disable' if enabled else 'enable'
+                if action not in ('enable', 'disable'):
+                    return self.reply_json(400, {'ok': False, 'error': 'Invalid action'})
+                if action == 'enable':
+                    if unit_suspended('xray'):
+                        return self.reply_json(409, {'ok': False, 'error':
+                            '节点因流量超额停用中，VMess 将在控制台恢复节点时一并恢复'})
+                    cfg = self._apply_vmess_enable()
+                    return self.reply_json(200, {'ok': True, 'active': True,
+                                                 'port': cfg['port'], 'uri': cfg['uri']})
+                if not enabled:
+                    return self.reply_json(200, {'ok': True, 'active': False,
+                                                 'message': 'VMess 本来就没有启用'})
+                with data_lock:
+                    closed_port = int((data.get('vmess_config') or {}).get('port') or 0)
+                remove_managed_inbound(config, VMESS_INBOUND_TAG)
+                with reality_apply_lock:
+                    apply_xray_config_transaction(
+                        config, config_path=str(xray_path),
+                        binary='/usr/local/bin/xray',
+                        restart=not unit_suspended('xray'))
+                with data_lock:
+                    data.pop('vmess_config', None)
+                save_data()
+                if closed_port:
+                    firewall_port(closed_port, 'tcp', open_=False)
+                return self.reply_json(200, {'ok': True, 'active': False})
+            except Exception as exc:
+                return self.reply_json(500, {'ok': False, 'error': str(exc)})
+
+        def _h_get_vmess_status(self, subpath):
+            """GET /vmess-status —— 状态以**实际入站**为准，不看 data 里的残留配置。"""
+            if not self.is_authenticated():
+                return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
+            installed = Path('/usr/local/bin/xray').exists()
+            xray_path = Path('/etc/hysteria/xray.json')
+            active = False
+            if xray_path.exists():
+                try:
+                    cfg = json.loads(xray_path.read_text(encoding='utf-8'))
+                    active = has_managed_inbound(cfg, VMESS_INBOUND_TAG)
+                except Exception:
+                    active = False
+            with data_lock:
+                vcfg = dict(data.get('vmess_config') or {})
+            qr_svg = ''
+            if active and vcfg.get('uri'):
+                try:
+                    qr = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'],
+                                        input=vcfg['uri'].encode('utf-8'),
+                                        capture_output=True, timeout=3)
+                    if qr.returncode == 0:
+                        qr_svg = qr.stdout.decode('utf-8')
+                except Exception as exc:
+                    _log_ignored('vmess_qr', exc)
+            return self.reply_json(200, {
+                'ok': True, 'installed': installed, 'active': active,
+                'config': {
+                    'uri': vcfg.get('uri', '') if active else '',
+                    'uuid': vcfg.get('uuid', '') if active else '',
+                    'domain': vcfg.get('domain', ''),
+                    'sni': vcfg.get('sni', ''),
+                    'ws_path': vcfg.get('ws_path', ''),
+                    'port': vcfg.get('port', 0) if active else 0,
+                    'qr_svg': qr_svg,
+                },
+            })
+
         def _h_post_set_bbr(self, prefix):
             """Apply only an available kernel algorithm, verify it, and restore on failure."""
             if not self.is_authenticated():
@@ -6531,10 +6994,21 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     with data_lock:
                         d_snap = {
                             'reality': dict(data.get('reality_config') or {}),
+                            'vmess': dict(data.get('vmess_config') or {}),
                             'warp_enabled': bool(data.get('warp_enabled')),
                             'users_count': len(data.get('users', {})),
                             'proxy_services': list(data.get('proxy_services') or []),
                         }
+                    # 协议是否真的在服务，以 xray.json 里有没有托管入站为准 ——
+                    # data 里的配置是「上次生成成功」的残留，停用后仍在。
+                    try:
+                        _xcfg = json.loads(Path('/etc/hysteria/xray.json')
+                                           .read_text(encoding='utf-8'))
+                        d_snap['vmess_inbound'] = has_managed_inbound(_xcfg, VMESS_INBOUND_TAG)
+                        d_snap['reality_inbound'] = has_managed_inbound(_xcfg, REALITY_INBOUND_TAG)
+                    except Exception:
+                        d_snap['vmess_inbound'] = False
+                        d_snap['reality_inbound'] = False
 
                     def _svc_active(unit):
                         try:
@@ -6609,6 +7083,24 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                                 # 客户端人手一份，不是机密。
                                 # **private_key 永远不在此输出**，它才是真正的服务端机密。
                                 **_reality_public_params(d_snap['reality']),
+                            ),
+                            # VMess-WS-TLS（2026-10-24 加）。与 Reality 一样只给
+                            # 客户端公开参数；ws_path 本来就是订阅里的公开路径，
+                            # 证书私钥路径绝不在此输出。
+                            'vmess': dict(
+                                {
+                                    'installed': _bin('xray'),
+                                    'active': d_snap['vmess_inbound'],
+                                    'configured': bool(d_snap['vmess'].get('domain')),
+                                },
+                                **({'port': int(d_snap['vmess'].get('port') or 0)}
+                                   if d_snap['vmess'].get('port') else {}),
+                                **({'domain': d_snap['vmess']['domain']}
+                                   if d_snap['vmess'].get('domain') else {}),
+                                **({'ws_path': d_snap['vmess']['ws_path']}
+                                   if d_snap['vmess'].get('ws_path') else {}),
+                                **({'sni': d_snap['vmess']['sni']}
+                                   if d_snap['vmess'].get('sni') else {}),
                             ),
                         },
                         'extras': {
@@ -6749,7 +7241,10 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
 
                 m = json.loads(meta_path.read_text(encoding='utf-8')) if meta_path.exists() else {}
                 pwd = u_copy.get('password', '')
-                uri, clash_yaml, sing_json = artifacts(m, auth_override=pwd, name_override=f"Hy2-{target_uid}")
+                uri, clash_yaml, sing_json = artifacts(
+                    m, auth_override=pwd, name_override=f"Hy2-{target_uid}",
+                    reality=_active_reality_config(), user_id=target_uid,
+                    vmess=_active_vmess_config())
 
                 if action_file == 'clash.yaml':
                     return self.reply(200, clash_yaml.encode('utf-8'), 'application/yaml')
@@ -6787,6 +7282,9 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
 
             if subpath == 'reality-status':
                 return self._h_get_reality_status(subpath)
+
+            if subpath == 'vmess-status':
+                return self._h_get_vmess_status(subpath)
 
             if subpath == 'bbr-status':
                 return self._h_get_bbr_status(subpath)
@@ -6832,7 +7330,10 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
 
                 m = json.loads(meta_path.read_text(encoding='utf-8')) if meta_path.exists() else {}
                 pwd = u_copy.get('password', '')
-                uri, clash_yaml, sing_json = artifacts(m, auth_override=pwd, name_override=f"Hy2-{target_uid}")
+                uri, clash_yaml, sing_json = artifacts(
+                    m, auth_override=pwd, name_override=f"Hy2-{target_uid}",
+                    reality=_active_reality_config(), user_id=target_uid,
+                    vmess=_active_vmess_config())
                 qr_svg = ""
                 try:
                     qr_svg = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'], input=uri.encode(), capture_output=True, check=True, timeout=10).stdout.decode('utf-8')
@@ -7598,23 +8099,26 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
     try:
         if Path('/etc/hysteria/xray.json').exists():
             with data_lock:
-                _want = reality_clients(data)
-            _got = []
+                _want = {REALITY_INBOUND_TAG: reality_clients(data),
+                         VMESS_INBOUND_TAG: vmess_clients(data)}
+            _got = {}
             try:
                 _cfg = json.loads(Path('/etc/hysteria/xray.json').read_text(encoding='utf-8'))
-                for _i in (_cfg.get('inbounds') or []):
-                    if _i.get('protocol') == 'vless' and \
-                       (_i.get('streamSettings') or {}).get('security') == 'reality':
-                        _got = _i.get('settings', {}).get('clients') or []
-                        break
+                # 同样覆盖所有托管入站：只补 Reality 的话，VMess-only 节点重启后
+                # 新增用户永远进不了白名单（要等到下次有人开户才可能碰巧修好）。
+                for _tag in MANAGED_INBOUND_TAGS:
+                    _idx, _inb = managed_inbound_index(_cfg, _tag)
+                    if _idx >= 0:
+                        _got[_tag] = _inb.get('settings', {}).get('clients') or []
             except Exception:
-                _got = []
-            if [c.get('email') for c in _want] != [c.get('email') for c in _got]:
+                _got = {}
+            if any([c.get('email') for c in _want[t]] != [c.get('email') for c in _got.get(t, [])]
+                   for t in _got):
                 subprocess.run(['systemctl', 'reset-failed', 'xray'],
                                capture_output=True, timeout=5)
                 subprocess.run(['systemctl', 'restart', 'xray'],
                                capture_output=True, timeout=10)
-                print('[portal] 启动时补同步了 xray clients（%d 个）' % len(_want),
+                print('[portal] 启动时补同步了 xray clients',
                       file=sys.stderr)
     except Exception as e:
         print('[portal] 启动补同步跳过: %s' % str(e)[:120], file=sys.stderr)

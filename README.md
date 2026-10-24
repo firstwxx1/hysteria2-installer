@@ -17,6 +17,7 @@
 - 🛡️ **AmneziaWG 抗 DPI 协议 (可选安装)**：一键部署 WireGuard 的抗审查分支，密码学内核完全不变，只把数据包的头部、长度与时序特征随机化。采用**用户态 `amneziawg-go`** 部署 —— 不编译内核模块、不引入 Docker、不在服务器上装 Go 工具链：二进制由本仓库的 GitHub Actions 交叉编译成**全静态**产物（amd64 / arm64 / armv7）后发布到 Release 下载。支持 **AWG 2.x / 3.x 双协议线可切换**、多客户端管理、`.conf` 下载与二维码导入，并在 Web 控制台提供独立的客户端管理与状态面板。
 - 🌐 **Cloudflare WARP 智能分流 (AI 加速)**：内置 `wgcf` + `wireproxy` 自建本地出口（socks5 `127.0.0.1:19898`，免 apt、无需官方 MASQUE 客户端，绕开 Debian 12 上 `cloudflare-warp` 因 apt keyring bug 装不上的问题），配合 3 分钟探活自愈 Watchdog，并在 Web 控制台独立扩展页面提供一键按需启闭开关，实现 OpenAI、Claude、Gemini 干净住宅出口与 VPS 原生极速直连。
 - 🧭 **VLESS-Reality 备用通道 (可选)**：在 Web 控制台一键启用 Xray Reality（TCP）。订阅里同时下发 Hy2 与 Reality 两个节点，Clash 用 url-test 自动择优 —— UDP 被 QoS 或阻断时自动切到 TCP 通道；每个 Hy2 用户对应一个 Reality 身份，停用 / 删除用户时两边同步生效。
+- 🧩 **VMess-WS-TLS 兼容通道 (可选)**：与 Reality 共用 Xray 核心，可在 Web 控制台独立启停，互不影响。使用独立 TCP 端口、随机且稳定的 WebSocket 路径，**需要已绑定域名并持有客户端可校验的证书**（自签证书会被拒绝启用）。每个 Hy2 用户对应一个 VMess 身份，订阅同时下发 `vmess://`、Clash 与 sing-box 配置，停用 / 到期 / 超额与 Reality 一并收回。
 - 🔄 **Web 端双重版本检测与一键升级**：在 Web 仪表盘在线比对 Hysteria 2 官方内核与控制面板自身版本，发现新版一键升级。面板更新检测覆盖 `portal.py`、`portal_assets.py` 和四个计量模块，任一差异或缺失都会提示更新，检测不完整时显示无法确认。在线安装、终端门户升级与面板自更新均先把 `main` 锁定到具体 commit 再下载（完整本地文件快路径除外）；若 GitHub API 无法解析 commit 则中止，不回退到浮动 `main`，以免跨版本混装。锁定后仍支持 API / jsDelivr / raw 三源回退，每个文件都做内容特征与 Python 语法校验，任一不过就整体放弃；换上新版后若 20 秒内健康检查（`/api/health`）不通过，自动换回旧版本。
 - 🕳️ **独立「入站代理 & WARP」扩展专区 (SOCKS5 / HTTP / HTTPS)**：集成 GOST 引擎，支持 Web 端一键安装/修复核心；解耦独立页面一键添加/删除三种入站代理服务（独立账号密码认证），客户端无需安装 Hysteria 也能直接把服务器当普通代理用，配置动态生成并平滑热重载。
 - 📱 **多客户端格式全覆盖**：

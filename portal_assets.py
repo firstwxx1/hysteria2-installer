@@ -456,7 +456,15 @@ function switchTab(tabId) {
 }
 
 document.querySelectorAll('[data-tab]').forEach(btn => {
-  btn.addEventListener('click', () => switchTab(btn.dataset.tab));
+  btn.addEventListener('click', () => {
+    switchTab(btn.dataset.tab);
+    // 备用通道页的状态可能在别处（终端、REST API、整机停用）被改过，
+    // 每次切回来都重新拉一次，避免显示上次加载时的旧状态。
+    if (btn.dataset.tab === 'reality') {
+      checkRealityStatus();
+      checkVmessStatus();
+    }
+  });
 });
 
 if (location.hash) {
@@ -1283,6 +1291,100 @@ if (btnCopyRealityUri) {
 }
 
 checkRealityStatus();
+
+// VMess-WS-TLS 卡片：与 Reality 分开显示，状态以「入站是否真的存在」为准。
+const vmessBadge = document.getElementById('vmess-badge');
+const btnToggleVmess = document.getElementById('btn-toggle-vmess');
+const vmessContentBox = document.getElementById('vmess-content-box');
+const vmessUriVal = document.getElementById('vmess-uri-val');
+const vmessQrBox = document.getElementById('vmess-qr-box');
+const vmessDomainVal = document.getElementById('vmess-domain-val');
+const vmessUuidVal = document.getElementById('vmess-uuid-val');
+const vmessPathVal = document.getElementById('vmess-path-val');
+const btnCopyVmessUri = document.getElementById('btn-copy-vmess-uri');
+
+async function checkVmessStatus() {
+  if (!vmessBadge) return;
+  try {
+    const res = await fetch(location.pathname + 'vmess-status', { credentials: 'same-origin' });
+    if (!res.ok) return;
+    const json = await res.json();
+    if (!json.ok) return;
+    if (!json.installed) {
+      // 没有 Xray 核心时不能显示「已关闭」—— 那会让人以为点一下就能开。
+      vmessBadge.textContent = '● 未安装 Xray 核心';
+      vmessBadge.style.background = '#fff1f0';
+      vmessBadge.style.color = '#cf3c3c';
+      if (btnToggleVmess) btnToggleVmess.style.display = 'none';
+      if (vmessContentBox) vmessContentBox.style.display = 'none';
+      return;
+    }
+    if (btnToggleVmess) btnToggleVmess.style.display = 'inline-flex';
+    if (json.active) {
+      vmessBadge.textContent = '● 运行中 (TCP ' + (json.config.port || '--') + ')';
+      vmessBadge.style.background = '#eaf3de';
+      vmessBadge.style.color = '#27500a';
+      btnToggleVmess.textContent = '已开启 (点击关闭)';
+      btnToggleVmess.className = 'toggle-btn on';
+      if (vmessContentBox) vmessContentBox.style.display = 'block';
+      const cfg = json.config || {};
+      if (vmessUriVal) vmessUriVal.value = cfg.uri || '';
+      if (vmessQrBox) vmessQrBox.innerHTML = cfg.qr_svg || '';
+      if (vmessDomainVal) vmessDomainVal.textContent = (cfg.domain || '-') + (cfg.sni && cfg.sni !== cfg.domain ? ' / ' + cfg.sni : '');
+      if (vmessUuidVal) vmessUuidVal.textContent = cfg.uuid || '-';
+      if (vmessPathVal) vmessPathVal.textContent = cfg.ws_path || '-';
+      const portTag = document.getElementById('vmess-port-tag');
+      if (portTag) portTag.textContent = 'TCP ' + (cfg.port || '--');
+    } else {
+      vmessBadge.textContent = '○ 已关闭';
+      vmessBadge.style.background = '#f1efe8';
+      vmessBadge.style.color = '#5f5e5a';
+      btnToggleVmess.textContent = '已关闭 (点击开启)';
+      btnToggleVmess.className = 'toggle-btn off';
+      if (vmessContentBox) vmessContentBox.style.display = 'none';
+    }
+  } catch (_) {}
+}
+
+if (btnToggleVmess) {
+  btnToggleVmess.addEventListener('click', async () => {
+    btnToggleVmess.disabled = true;
+    const orig = btnToggleVmess.textContent;
+    btnToggleVmess.textContent = '切换中...';
+    try {
+      const res = await fetch(location.pathname + 'manage-vmess', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: 'action=toggle'
+      });
+      const json = await res.json();
+      // 启用失败时必须把原因原样告诉用户（常见：没有域名 / 自签证书 / 端口冲突），
+      // 只写「切换失败」会让人反复点。
+      if (!json.ok) alert(json.error || '切换失败');
+      await checkVmessStatus();
+    } catch (e) {
+      alert('请求异常: ' + e.message);
+    } finally {
+      btnToggleVmess.disabled = false;
+      btnToggleVmess.textContent = orig;
+    }
+  });
+}
+
+if (btnCopyVmessUri) {
+  btnCopyVmessUri.addEventListener('click', () => {
+    if (vmessUriVal && vmessUriVal.value) {
+      navigator.clipboard.writeText(vmessUriVal.value).then(() => {
+        const orig = btnCopyVmessUri.textContent;
+        btnCopyVmessUri.textContent = '✓ 已复制直链';
+        setTimeout(() => btnCopyVmessUri.textContent = orig, 1500);
+      });
+    }
+  });
+}
+
+checkVmessStatus();
 
 // BBR 状态获取与一键切换交互
 const bbrBadge = document.getElementById('bbr-badge');
