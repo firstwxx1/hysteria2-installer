@@ -97,8 +97,12 @@ if [[ -n "${HY2_CERT_TYPE:-}" ]] && [[ ! "${HY2_CERT_TYPE}" =~ ^[1-4]$ ]]; then
     log_err "环境变量 HY2_CERT_TYPE='${HY2_CERT_TYPE}' 无效，只能是 1 / 2 / 3 / 4。"
     exit 1
 fi
-if [[ -n "${HY2_NODE_MODE:-}" ]] && [[ ! "${HY2_NODE_MODE}" =~ ^[12]$ ]]; then
-    log_err "环境变量 HY2_NODE_MODE='${HY2_NODE_MODE}' 无效，只能是 1（单机）或 2（集群 Agent）。"
+# 本项目只提供商城版（Agent）节点，单机私密模式已移除。
+# 旧脚本里的 HY2_NODE_MODE=1 不再静默改成商城版 —— 那会让 Teyir 节点
+# 「看起来装好了但 API 没开」，所以直接报错并说明如何继续。
+if [[ -n "${HY2_NODE_MODE:-}" ]] && [[ "${HY2_NODE_MODE}" != "2" ]]; then
+    log_err "环境变量 HY2_NODE_MODE='${HY2_NODE_MODE}' 无效：本项目仅提供商城版（Agent）节点。"
+    log_err "请留空或设置 HY2_NODE_MODE=2；单机私密模式已移除。"
     exit 1
 fi
 if [[ "${HY2_CERT_TYPE:-}" == "3" && -z "${HY2_DOMAIN:-}" ]]; then
@@ -1035,48 +1039,28 @@ setup_ports_and_obfs() {
         AUTH_PASSWORD="$HY2_PASSWORD"
         log_info "已使用环境变量 HY2_PASSWORD 指定认证密码。"
     else
-        read -rsp "请输入连接认证密码 [回车自动生成]: " AUTH_PASSWORD || true; echo
+        read -rsp "请输入机主账号连接密码 [回车自动生成]: " AUTH_PASSWORD || true; echo
         AUTH_PASSWORD=${AUTH_PASSWORD:-$RANDOM_PASS}
     fi
 
-    # 运行模式选择 (单机私密 vs 商城集群 Agent 模式)
-    # 已装机时默认沿用当前模式与 API Key：原来一律默认「1 单机」并重新随机 API Key，
-    # Teyir 管理的节点改个端口、一路回车下来就变成单机模式，控制台开的用户全部连不上。
-    _cur_mode=1
-    _cur_api_key=""
-    if [[ -f "$HY2_CONFIG" ]] && awk '/^auth:/{f=1;next} /^[^ ]/{f=0} f&&/type: *http/{found=1} END{exit !found}' "$HY2_CONFIG"; then
-        _cur_mode=2
-        _cur_api_key="$(jq -r '.api_key // empty' "$HY2_DIR/portal.json" 2>/dev/null || true)"
-    fi
+    # 运行模式：本项目只提供商城版（Agent）节点。
+    # 这里不再询问模式，只沿用/生成节点通信 API Key。已装机时**必须**沿用旧 Key，
+    # 否则 Teyir 控制台保存的凭据立刻失效，控制台开的用户全部连不上。
+    NODE_MODE="agent"
+    _cur_api_key="$(jq -r '.api_key // empty' "$HY2_DIR/portal.json" 2>/dev/null || true)"
+    echo -e "\n${CYAN}商城版节点（Agent 模式）${PLAIN}：开启 REST API，支持动态开户 / 续费 / 对接商城。"
     if [[ -n "${HY2_NODE_MODE:-}" ]]; then
-        node_mode_choice="$HY2_NODE_MODE"
-        log_info "已使用环境变量 HY2_NODE_MODE=${node_mode_choice} 指定运行模式。"
-    else
-        echo -e "\n请选择当前 Hysteria 2 节点的运行模式："
-        echo -e "  ${GREEN}1.${PLAIN} 单机私密模式 (默认：单用户/自用，提供 Web 信息中心)"
-        echo -e "  ${GREEN}2.${PLAIN} 商城集群 Agent 模式 (开启 REST API 接口，支持动态开户/续费，对接商城)"
-        echo -e "  ${YELLOW}拿不准就选 1${PLAIN}：自用或几个朋友共用选 1；要接发卡商城自动开户才选 2。"
-        [[ "$_cur_mode" == "2" ]] && echo -e "  ${YELLOW}本机当前是 Agent 模式（已接入商城 / Teyir 控制台），回车保持不变。${PLAIN}"
-        read -rp "请输入选项 [1-2, 默认 ${_cur_mode}]: " node_mode_choice || true
-        node_mode_choice="$(echo "${node_mode_choice:-}" | tr -d '[:space:]')"
-        node_mode_choice=${node_mode_choice:-$_cur_mode}
+        log_info "已确认商城版节点（HY2_NODE_MODE=2）。"
     fi
-
-    if [[ "$node_mode_choice" == "2" ]]; then
-        NODE_MODE="agent"
-        if [[ -n "$_cur_api_key" ]]; then
-            read -rsp "请设置节点通信 API Key [回车沿用现有 Key，控制台无需改动]: " NODE_API_KEY || true; echo
-            NODE_API_KEY=${NODE_API_KEY:-$_cur_api_key}
-            log_info "当前已选：商城集群 Agent 模式"
-        else
-            RANDOM_API_KEY="hy2_sec_$(openssl rand -hex 16)"
-            read -rsp "请设置节点通信 API Key [回车自动生成]: " NODE_API_KEY || true; echo
-            NODE_API_KEY=${NODE_API_KEY:-$RANDOM_API_KEY}
-            log_info "当前已选：商城集群 Agent 模式 (Node API Key 已生成)"
-        fi
+    if [[ -n "$_cur_api_key" ]]; then
+        read -rsp "请设置节点通信 API Key [回车沿用现有 Key，控制台无需改动]: " NODE_API_KEY || true; echo
+        NODE_API_KEY=${NODE_API_KEY:-$_cur_api_key}
+        log_info "已沿用现有 API Key。"
     else
-        NODE_MODE="standalone"
-        NODE_API_KEY=""
+        RANDOM_API_KEY="hy2_sec_$(openssl rand -hex 16)"
+        read -rsp "请设置节点通信 API Key [回车自动生成]: " NODE_API_KEY || true; echo
+        NODE_API_KEY=${NODE_API_KEY:-$RANDOM_API_KEY}
+        log_info "已生成新的节点通信 API Key。"
     fi
 
     # ⚠️ 主监听端口占用检测（2026-10-09 修）：
@@ -1434,20 +1418,14 @@ tls:
 EOF
     fi
 
-    if [[ "$NODE_MODE" == "agent" ]]; then
-        cat >> "$HY2_CONFIG" <<EOF
+    # 商城版固定走门户鉴权：门户按用户/到期/流量/IP 限制逐连接判定。
+    # 单机固定密码模式已移除（HY2_NODE_MODE 只接受 2）。
+    cat >> "$HY2_CONFIG" <<EOF
 auth:
   type: http
   http:
     url: http://127.0.0.1:${PORTAL_LOCAL_PORT}/auth
 EOF
-    else
-        cat >> "$HY2_CONFIG" <<EOF
-auth:
-  type: password
-  password: $(jq -Rn --arg value "$AUTH_PASSWORD" '$value')
-EOF
-    fi
 
     cat >> "$HY2_CONFIG" <<EOF
 
@@ -1990,7 +1968,7 @@ show_client_configs() {
     key=$(jq -r '.api_key // empty' "$HY2_DIR/portal-access.json" 2>/dev/null) || true
     if [[ -n "$key" ]]; then
         echo
-        echo -e "${YELLOW}节点通信 API Key${PLAIN}（只有商城集群 Agent 模式才需要，自用可忽略）"
+        echo -e "${YELLOW}节点通信 API Key${PLAIN}（商城版 / Teyir 控制台接入使用）"
         echo -e "    ${GREEN}${key}${PLAIN}"
     fi
 
@@ -3488,7 +3466,7 @@ show_teyir_access() {
     if [[ -n "$key" ]]; then
         echo -e "API Key (Bearer) : ${GREEN}${key}${PLAIN}"
     else
-        echo -e "API Key (Bearer) : ${YELLOW}（单机模式未启用 API；要接入控制台请用第 4 项改为 Agent 模式）${PLAIN}"
+        echo -e "API Key (Bearer) : ${YELLOW}（未找到 API Key，请重新执行第 1 项或第 4 项安装）${PLAIN}"
     fi
     echo -e "${CYAN}--------------------------------------------${PLAIN}"
     echo -e "${YELLOW}以上是节点的管理凭据，请勿外传。${PLAIN}"
@@ -3676,7 +3654,7 @@ flow_reconfigure() {
     log_warn "「重新修改配置」会重新生成服务端配置，请注意："
     log_warn "  · 已发放的客户端配置若端口/证书/域名变化，将需要重新导出"
     log_warn "  · 认证密码与混淆密钥默认保留，不会被随机换掉"
-    log_warn "  · 运行模式与 API Key 默认保持当前设置"
+    log_warn "  · 节点通信 API Key 默认保持当前设置（商城版固定启用 Agent 模式）"
     local _reconf_hint=""
     read -rp "确定继续吗？[y/N]: " _reconf_hint || true
     if [[ ! "$_reconf_hint" =~ ^[Yy]$ ]]; then
@@ -3725,9 +3703,11 @@ show_menu_status() {
         return 0
     fi
     # 门户同时是 Hy2 的鉴权后端：它停了，所有用户都连不上，必须一眼看到。
-    local mode="单机模式"
-    if awk '/^auth:/{f=1;next} /^[^ ]/{f=0} f&&/type: *http/{found=1} END{exit !found}' "$HY2_CONFIG" 2>/dev/null; then
-        mode="Agent 模式（商城 / Teyir）"
+    # 本项目只有商城版；这里仍检测实际 auth 类型 —— 从旧单机版升级上来的机器
+    # 在重新安装前仍是固定密码，状态栏要如实提示，而不是一律写「商城版」。
+    local mode="商城版（Agent 模式）"
+    if ! awk '/^auth:/{f=1;next} /^[^ ]/{f=0} f&&/type: *http/{found=1} END{exit !found}' "$HY2_CONFIG" 2>/dev/null; then
+        mode="旧单机模式${YELLOW}（请用第 1 项重装为商城版）${PLAIN}"
     fi
     echo -e "门户状态: $(unit_state_text hysteria-portal) | 运行模式: ${mode}"
     if traffic_suspended; then
@@ -3766,7 +3746,7 @@ menu() {
     fi
     echo -e "  ${GREEN}2.${PLAIN} 更新 Hysteria 2 核心至最新版"
     echo -e "  ${GREEN}3.${PLAIN} 查看私密信息页地址和登录凭据"
-    echo -e "  ${GREEN}4.${PLAIN} 重新修改配置 (端口/密码/证书/域名/混淆/运行模式)"
+    echo -e "  ${GREEN}4.${PLAIN} 重新修改配置 (端口/密码/证书/域名/混淆/API Key)"
     echo -e "  ${GREEN}5.${PLAIN} 一键安装并配置 Cloudflare WARP 出口 (AI解锁)"
     echo -e "  ${GREEN}6.${PLAIN} 一键安装 gost 入站代理引擎 (SOCKS5/HTTP/HTTPS)"
     echo -e "${CYAN}----------------------------------------------------------------${PLAIN}"

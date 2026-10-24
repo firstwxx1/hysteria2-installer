@@ -217,6 +217,15 @@ class TestPasswordPreservedOnReconfigure(unittest.TestCase):
         self.assertIn(".auth_password", block)
         self.assertIn(".obfs_password", block)
 
+    def test_only_shop_mode_is_offered(self):
+        """单机私密模式已移除：安装不再询问模式，只提供商城版（Agent）。"""
+        text = INSTALL.read_text(encoding="utf-8")
+        self.assertNotIn("单机私密模式 (", text)
+        self.assertIn('NODE_MODE="agent"', text)
+        self.assertIn('HY2_NODE_MODE', text)
+        # 旧的「固定密码」分支不能再出现在生成的 config.yaml 里
+        self.assertNotIn("auth:\n  type: password\n  password:", text)
+
     def test_reuses_real_existing_password(self):
         """真跑一遍：已有 meta 时，密码必须与旧值一致。"""
         with tempfile.TemporaryDirectory() as td:
@@ -229,7 +238,7 @@ class TestPasswordPreservedOnReconfigure(unittest.TestCase):
                 'set -eo pipefail\n'
                 f'HY2_META_FILE="{meta}"\n'
                 'HY2_PASSWORD=""\n'
-                'HY2_NODE_MODE=1\n'
+                'HY2_NODE_MODE=2\n'
                 'LISTEN_PORT=12345\n'
                 'HOP_START=20000\n'
                 'HOP_END=40000\n'

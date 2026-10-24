@@ -140,7 +140,11 @@ class MenuTest(unittest.TestCase):
 
 class MenuSourceTest(unittest.TestCase):
     def test_reconfigure_defaults_to_current_mode_and_key(self):
-        self.assertIn('read -rp "请输入选项 [1-2, 默认 ${_cur_mode}]: "', INSTALL)
+        # 商城版固定启用 Agent；重装 / 改配置时必须沿用旧 Key，否则控制台凭据失效。
+        # 注释里会提到「已移除」，要断言的是菜单选项本身不再出现
+        self.assertNotIn('单机私密模式 (默认', INSTALL)
+        self.assertNotIn('请输入选项 [1-2, 默认 ${_cur_mode}]', INSTALL)
+        self.assertIn('NODE_MODE="agent"', INSTALL)
         self.assertIn('NODE_API_KEY=${NODE_API_KEY:-$_cur_api_key}', INSTALL)
 
     def test_setup_portal_adopts_when_preserving(self):

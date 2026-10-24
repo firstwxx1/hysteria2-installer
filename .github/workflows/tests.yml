@@ -86,6 +86,10 @@ jobs:
           echo "$out5" | grep -q 'HY2_CERT_TYPE' || fail "HY2_CERT_TYPE 非法值未被拦"
           out6=$(HY2_CERT_TYPE=3 bash install.sh install 2>&1 || true)
           echo "$out6" | grep -q 'HY2_DOMAIN' || fail "选了 ACME 但缺 HY2_DOMAIN 未被拦"
+          # 5) 只提供商城版（Agent）：旧脚本的 HY2_NODE_MODE=1 必须明确报错，
+          #    不能静默装成单机版（那样控制台开的用户全部连不上）。
+          out7=$(HY2_NODE_MODE=1 bash install.sh install 2>&1 || true)
+          echo "$out7" | grep -q '仅提供商城版' || fail "HY2_NODE_MODE=1 未被拦"
 
           echo "✅ 交互逻辑行为测试全部通过"
 
