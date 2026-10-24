@@ -1771,6 +1771,7 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
   <div class="subtab-bar" role="tablist" aria-label="备用通道与网络分类">
     <button class="subtab-btn active" data-subtab="reality-node" type="button">🛡️ Reality 备用节点</button>
     <button class="subtab-btn" data-subtab="vmess" type="button">🧩 VMess 兼容通道</button>
+    <button class="subtab-btn" data-subtab="vlessenc" type="button">🔐 VLESS Encryption</button>
     <button class="subtab-btn" data-subtab="cert" type="button">🔐 证书状态</button>
     <button class="subtab-btn" data-subtab="bbr" type="button">🚀 BBR 加速</button>
   </div>
@@ -1893,6 +1894,66 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
             <div style="background:#fbfcfd;border:1px solid var(--line);border-radius:12px;padding:12px">
               <div style="font-size:11px;color:var(--muted);font-weight:700;margin-bottom:2px">WS 路径</div>
               <div style="font-size:12px;font-weight:750;color:var(--ink);font-family:monospace;word-break:break-all" id="vmess-path-val">-</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+  </div>
+
+  <div class="subtab-pane" id="sub-vlessenc">
+  <!-- VLESS Encryption（2026-10-24 加）：VMess 的上游替代路线，
+       与 VMess 一样需要域名 + 可信证书，但多一层后量子密钥交换。 -->
+  <section class="card" style="margin-bottom:22px">
+    <div class="user-header">
+      <div>
+        <h2>🔐 VLESS Encryption 通道</h2>
+        <p style="font-size:13px">Xray 官方推荐的 VMess 替代方案：ML-KEM-768 后量子密钥交换 + 1-RTT 前向保密；与 Reality / VMess 共用 Xray 核心，可同时开启</p>
+      </div>
+      <div style="display:flex;gap:10px;align-items:center">
+        <span class="status-pill" id="vlessenc-badge" style="background:#f1efe8;color:#5f5e5a">检测中...</span>
+        <button class="toggle-btn off" id="btn-toggle-vlessenc" type="button" style="display:none">切换中...</button>
+      </div>
+    </div>
+    <div class="warp-switch-card" style="background:#f7f9fc;border-color:#d7e2ee">
+      <div class="warp-desc-title" style="color:#1a365d">🔐 与 Reality / VMess 的区别</div>
+      <p class="warp-desc-text" style="color:#4a5568">
+        Reality 借用大厂证书握手，无需自己的域名；VLESS Encryption 与 VMess 一样是
+        <b>真正的 TLS 服务端，必须已绑定域名且持有可被客户端校验的证书</b>。
+        相比 VMess，它带后量子密钥交换与前向保密，是上游推荐的方向。
+        <b>需要较新的客户端支持</b>，老客户端可能无法识别该加密参数。
+      </p>
+    </div>
+    <div id="vlessenc-content-box" style="display:none">
+      <div class="layout" style="margin-top:10px">
+        <section class="card qr-card" style="background:#fbfcfd;border-color:var(--line)">
+          <div class="eyebrow" style="color:#0f766e">VLESS ENCRYPTION</div>
+          <h2>VLESS Encryption 扫码</h2>
+          <p class="hint">需要支持 VLESS Encryption 的新版客户端</p>
+          <div class="qr-frame" style="max-width:220px;margin:16px auto;padding:10px"><div id="vlessenc-qr-box" style="width:100%;height:auto"></div></div>
+          <div class="tags"><span class="tag">VLESS</span><span class="tag">ML-KEM-768</span><span class="tag">TLS</span><span class="tag" id="vlessenc-port-tag">TCP --</span></div>
+        </section>
+        <div class="stack">
+          <section class="card" style="border-color:#d7e2ee">
+            <div class="card-head"><span class="step" style="background:#ccfbf1;color:#0f766e">01</span><div><h2>VLESS 直链 (URI)</h2><p>含 encryption 参数，导入即用</p></div></div>
+            <textarea class="link" id="vlessenc-uri-val" readonly style="height:86px;font-size:11.5px"></textarea>
+            <div class="actions" style="margin-top:12px">
+              <button class="button primary" id="btn-copy-vlessenc-uri" type="button">复制 VLESS 直链</button>
+            </div>
+          </section>
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px">
+            <div style="background:#fbfcfd;border:1px solid var(--line);border-radius:12px;padding:12px">
+              <div style="font-size:11px;color:var(--muted);font-weight:700;margin-bottom:2px">域名 / SNI</div>
+              <div style="font-size:13px;font-weight:750;color:var(--ink);font-family:monospace" id="vlessenc-domain-val">-</div>
+            </div>
+            <div style="background:#fbfcfd;border:1px solid var(--line);border-radius:12px;padding:12px">
+              <div style="font-size:11px;color:var(--muted);font-weight:700;margin-bottom:2px">用户 UUID</div>
+              <div style="font-size:12px;font-weight:750;color:var(--ink);font-family:monospace;word-break:break-all" id="vlessenc-uuid-val">-</div>
+            </div>
+            <div style="background:#fbfcfd;border:1px solid var(--line);border-radius:12px;padding:12px">
+              <div style="font-size:11px;color:var(--muted);font-weight:700;margin-bottom:2px">监听端口</div>
+              <div style="font-size:13px;font-weight:750;color:var(--ink);font-family:monospace" id="vlessenc-tcp-val">-</div>
             </div>
           </div>
         </div>
@@ -2959,7 +3020,11 @@ def reality_registry(data):
 # legacy 匹配兜底，升级后第一次写入即补上 tag）。
 REALITY_INBOUND_TAG = 'vless-reality-in'
 VMESS_INBOUND_TAG = 'vmess-ws-in'
-MANAGED_INBOUND_TAGS = (REALITY_INBOUND_TAG, VMESS_INBOUND_TAG)
+# VLESS Encryption（Xray v25.9.5+）：与 Reality 同为 VLESS，但**不需要偷别人的
+# 证书握手** —— 它自己用 ML-KEM-768 做后量子密钥交换，走普通 TLS。
+# 这是 VMess 被上游标记弃用后的官方替代路线（2026-10-24 加）。
+VLESSENC_INBOUND_TAG = 'vless-enc-in'
+MANAGED_INBOUND_TAGS = (REALITY_INBOUND_TAG, VMESS_INBOUND_TAG, VLESSENC_INBOUND_TAG)
 
 
 def managed_inbound_index(config, tag):
@@ -3069,6 +3134,85 @@ def vmess_uri_for_user(vcfg, user_id, public_ip, label=None):
     }
     raw = json.dumps(payload, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
     return 'vmess://' + base64.b64encode(raw).decode('ascii')
+
+
+# ---- VLESS Encryption（2026-10-24 加，VMess 的上游替代路线）----
+#
+# 与 Reality 的区别：Reality 借用大厂站点的证书握手来伪装，**不需要自己的域名**；
+# VLESS Encryption 是自己做真正的 TLS 服务端 + ML-KEM-768 后量子密钥交换，
+# 因此和 VMess 一样需要域名与可信证书。
+#
+# 密钥由 `xray vlessenc` 生成一对：
+#   decryption -> 服务端 inbound.settings.decryption
+#   encryption -> 客户端 outbound.users[].encryption
+# 两者必须来自**同一次**调用，混用会让握手直接失败（实测过）。
+
+VLESSENC_DECRYPTION_RE = re.compile(
+    r'^mlkem768x25519plus\.(native|xorpub|random)\.[0-9]+s?(-[0-9]+)?\.[A-Za-z0-9_\-]+$')
+
+
+def generate_vless_encryption_pair(binary='/usr/local/bin/xray'):
+    """调用 `xray vlessenc` 生成一对密钥，返回 (decryption, encryption)。
+
+    只取输出里**第一组**（X25519 认证那组）：后一组 ML-KEM-768 认证的
+    decryption 长度可达上千字符，塞进 config.yaml 会很难维护，
+    而 Xray 自己的提示也写明「Ephemeral key exchange is Post-Quantum safe anyway」——
+    临时密钥交换本身已是后量子安全，第一组足够。
+    """
+    out = subprocess.run([binary, 'vlessenc'], capture_output=True, text=True, timeout=10)
+    if out.returncode != 0:
+        raise RuntimeError('xray vlessenc 执行失败，无法生成 VLESS Encryption 密钥')
+    dec = enc = ''
+    for line in out.stdout.splitlines():
+        line = line.strip()
+        if not dec and line.startswith('"decryption":'):
+            dec = line.split(':', 1)[1].strip().strip(',').strip('"')
+        elif not enc and line.startswith('"encryption":'):
+            enc = line.split(':', 1)[1].strip().strip(',').strip('"')
+        if dec and enc:
+            break
+    if not (dec and enc):
+        raise RuntimeError('xray vlessenc 输出里没有找到密钥对')
+    if not VLESSENC_DECRYPTION_RE.match(dec):
+        raise RuntimeError('生成的 decryption 格式不符合预期，已放弃写入')
+    return dec, enc
+
+
+def vlessenc_clients(data):
+    """VLESS Encryption 入站的 clients。
+
+    与 Reality 用**同一个** UUID 派生（同一用户同一身份），
+    但**不带 flow**：xtls-rprx-vision 是 Reality 专用，VLESS Encryption 不能带。
+    """
+    users = data.get('users', {}) or {}
+    clients = []
+    for uid in sorted(users):
+        if not user_access_allowed(users.get(uid) or {}):
+            continue
+        clients.append({'id': reality_uuid_for_user(uid), 'email': uid})
+    if not clients:
+        clients = [{'id': str(uuid.uuid4()), 'email': 'placeholder'}]
+    return clients
+
+
+def vlessenc_uri_for_user(vcfg, user_id, public_ip, label=None):
+    """拼一条 vless:// 直链，带上 encryption 参数。
+
+    ⚠️ encryption 必须逐字照抄客户端密钥（含 `.` 分隔的各段），
+    任何字符被 URL 编码或截断都会导致握手失败。
+    """
+    if not vcfg:
+        return ''
+    host = vcfg.get('domain') or public_ip
+    port = vcfg.get('port')
+    enc = vcfg.get('encryption', '')
+    if not (host and port and enc):
+        return ''
+    tag = label or ('VLESS-Enc-' + str(user_id))
+    params = {'encryption': enc, 'security': 'tls', 'sni': str(vcfg.get('sni') or host),
+              'type': 'tcp', 'headerType': 'none', 'fp': 'chrome'}
+    return (f"vless://{reality_uuid_for_user(user_id)}@{host}:{port}"
+            f"?{urlencode(params, safe='')}#{quote(tag)}")
 
 
 _ACCESS_APPLIED = {}
@@ -3319,12 +3463,15 @@ def enforce_node_access(root, snapshot, force_ids=()):
     xcfg=json.loads(original)
     # 收回必须覆盖**所有**托管入站：只看 Reality 的话，VMess-only 节点上
     # 停用/到期/超额的用户会继续用 VMess 连（2026-10-24 接入 VMess 时的关键缺口）。
+    _client_builders={REALITY_INBOUND_TAG:reality_clients,
+                      VMESS_INBOUND_TAG:vmess_clients,
+                      VLESSENC_INBOUND_TAG:vlessenc_clients}
     wanted_by_tag={}
     for tag in MANAGED_INBOUND_TAGS:
         idx,_inbound=managed_inbound_index(xcfg,tag)
         if idx<0:
             continue
-        wanted_by_tag[tag]=reality_clients(snapshot) if tag==REALITY_INBOUND_TAG else vmess_clients(snapshot)
+        wanted_by_tag[tag]=_client_builders[tag](snapshot)
     if not wanted_by_tag:
         return True
     signature=hashlib.sha256(json.dumps(wanted_by_tag,sort_keys=True).encode()).hexdigest()
@@ -3622,7 +3769,7 @@ def reality_uri_for_user(rcfg, user_id, public_ip, label=None):
 
 
 def artifacts(m, auth_override=None, name_override=None, reality=None, user_id=None,
-              vmess=None):
+              vmess=None, vlessenc=None):
     """生成 hy2:// 直链 + Clash / Sing-box 配置。
 
     reality（可选）—— 传 rcfg 时会**额外产出一条 VLESS-Reality 节点**，
@@ -3739,11 +3886,35 @@ def artifacts(m, auth_override=None, name_override=None, reality=None, user_id=N
                           tls=dict(enabled=True, server_name=v_sni,
                                    utls=dict(enabled=True, fingerprint='chrome')))
 
+    # ---- VLESS Encryption（可选）----
+    # 同样是 TCP + 自有证书，但比 VMess 多了后量子密钥交换。
+    vlessenc_proxy = None
+    vlessenc_sing = None
+    if vlessenc and user_id and vlessenc.get('domain') and vlessenc.get('port') \
+            and vlessenc.get('encryption'):
+        e_name = name + '-VLESS-Enc'
+        e_uuid = reality_uuid_for_user(user_id)
+        e_host = vlessenc['domain']
+        e_sni = vlessenc.get('sni') or e_host
+        e_enc = vlessenc['encryption']
+        vlessenc_proxy = dict(name=e_name, type='vless', server=e_host,
+                              port=int(vlessenc['port']), uuid=e_uuid, udp=True,
+                              tls=True, servername=e_sni, network='tcp',
+                              encryption=e_enc,
+                              client_fingerprint='chrome')
+        vlessenc_sing = dict(type='vless', tag=e_name, server=e_host,
+                             server_port=int(vlessenc['port']), uuid=e_uuid,
+                             encryption=e_enc,
+                             tls=dict(enabled=True, server_name=e_sni,
+                                      utls=dict(enabled=True, fingerprint='chrome')))
+
     proxies = [proxy] + ([reality_proxy] if reality_proxy else []) + \
-              ([vmess_proxy] if vmess_proxy else [])
+              ([vmess_proxy] if vmess_proxy else []) + \
+              ([vlessenc_proxy] if vlessenc_proxy else [])
     sing_outbounds = [sing] + ([reality_sing] if reality_sing else []) + \
-                     ([vmess_sing] if vmess_sing else [])
-    alternates = [p['name'] for p in (reality_proxy, vmess_proxy) if p]
+                     ([vmess_sing] if vmess_sing else []) + \
+                     ([vlessenc_sing] if vlessenc_sing else [])
+    alternates = [p['name'] for p in (reality_proxy, vmess_proxy, vlessenc_proxy) if p]
 
     if alternates:
         # url-test：客户端定时探测多条链路，自动选延迟低的。
@@ -3764,7 +3935,7 @@ def artifacts(m, auth_override=None, name_override=None, reality=None, user_id=N
         sing_doc['outbounds'].append({
             'type': 'urltest', 'tag': 'PROXY',
             'outbounds': [sing['tag']] + [o['tag'] for o in
-                                          (reality_sing, vmess_sing) if o],
+                                          (reality_sing, vmess_sing, vlessenc_sing) if o],
             'url': 'https://www.gstatic.com/generate_204',
             'interval': '5m', 'tolerance': 50,
         })
@@ -4816,6 +4987,18 @@ if __name__ == '__main__':
             vcfg = dict(data.get('vmess_config') or {})
         return vcfg or None
 
+    def _active_vlessenc_config():
+        """VLESS Encryption 的配置，同样以托管入站是否存在为准。"""
+        try:
+            cfg = json.loads(Path('/etc/hysteria/xray.json').read_text(encoding='utf-8'))
+        except Exception:
+            return None
+        if not has_managed_inbound(cfg, VLESSENC_INBOUND_TAG):
+            return None
+        with data_lock:
+            ecfg = dict(data.get('vlessenc_config') or {})
+        return ecfg or None
+
     def regenerate_page():
         m = json.loads(meta_path.read_text(encoding='utf-8')) if meta_path.exists() else {}
         uri, clash, sing = artifacts(m)
@@ -5417,6 +5600,7 @@ if __name__ == '__main__':
                         reality_registry(data)
                         rcfg = dict(data.get('reality_config', {}) or {})
                         vcfg_active = dict(data.get('vmess_config') or {})
+                        ecfg_active = dict(data.get('vlessenc_config') or {})
                     regenerate_page()
 
                     # 受控对账开户必须确认Reality生效；失败可GET→update同值重试。
@@ -5432,13 +5616,17 @@ if __name__ == '__main__':
                     # 且 Clash / Sing-box 的策略组变成 url-test（自动择优）。
                     uri, clash_yaml, sing_json = artifacts(
                         m, auth_override=pwd, name_override=f"Teyir-Hy2-{user_id}",
-                        reality=rcfg, user_id=user_id, vmess=vcfg_active)
+                        reality=rcfg, user_id=user_id, vmess=vcfg_active,
+                        vlessenc=ecfg_active)
                     public_ip = m.get('public_ip', '127.0.0.1')
                     reality_uri = reality_uri_for_user(
                         rcfg, user_id, public_ip, label=f"Teyir-Reality-{user_id}")
                     vmess_uri = vmess_uri_for_user(
                         vcfg_active, user_id, public_ip,
                         label=f"Teyir-VMess-{user_id}") if vcfg_active else ''
+                    vlessenc_uri = vlessenc_uri_for_user(
+                        ecfg_active, user_id, public_ip,
+                        label=f"Teyir-VLESS-Enc-{user_id}") if ecfg_active else ''
                     return self.reply_json(200, {
                         'ok': True,
                         'user_id': user_id,
@@ -5451,6 +5639,8 @@ if __name__ == '__main__':
                         'reality_uuid': reality_uuid_for_user(user_id),
                         'vmess_uri': vmess_uri,
                         'vmess_uuid': vmess_uuid_for_user(user_id) if vcfg_active else '',
+                        'vlessenc_uri': vlessenc_uri,
+                        'vlessenc_uuid': reality_uuid_for_user(user_id) if ecfg_active else '',
                         'clash': clash_yaml,
                         'sing_box': sing_json
                     })
@@ -5713,6 +5903,9 @@ if __name__ == '__main__':
 
             if self.path == prefix + 'manage-vmess':
                 return self._h_post_manage_vmess(prefix)
+
+            if self.path == prefix + 'manage-vlessenc':
+                return self._h_post_manage_vlessenc(prefix)
 
             if self.path == prefix + 'set-bbr':
                 return self._h_post_set_bbr(prefix)
@@ -6535,6 +6728,88 @@ WantedBy=multi-user.target
             firewall_port(listen_port, 'tcp', open_=True)
             return new_cfg
 
+        def _apply_vlessenc_enable(self):
+            """启用 VLESS Encryption：生成/复用密钥对 → 写托管入站 → 事务重启。
+
+            与 VMess 一样需要域名 + 可信证书（它是真正的 TLS 服务端）。
+            密钥对只在**首次**生成：换掉 decryption 会让所有已下发的
+            encryption 立刻失效，等于把在用的用户全部踢下线。
+            """
+            m = json.loads(meta_path.read_text(encoding='utf-8')) if meta_path.exists() else {}
+            public_ip = m.get('public_ip', '127.0.0.1')
+            domain = (m.get('server_name') or '').strip()
+            if not domain or not _is_dns_name(domain):
+                raise RuntimeError('VLESS Encryption 需要先绑定域名（当前无可用 server_name）')
+            cert_file, key_file, sni = self._vmess_certificate(domain)
+            with data_lock:
+                old = dict(data.get('vlessenc_config') or {})
+                blocked_ports = {
+                    m.get('listen_port'), m.get('subscription_port'),
+                    (data.get('reality_config') or {}).get('port'),
+                    (data.get('vmess_config') or {}).get('port'),
+                }
+            listen_port, reason = _pick_reality_port(
+                preferred=old.get('port') or 2088, extra_blocked=blocked_ports)
+            if not listen_port:
+                raise RuntimeError(reason)
+            decryption = old.get('decryption', '')
+            encryption = old.get('encryption', '')
+            if not (decryption and encryption):
+                decryption, encryption = generate_vless_encryption_pair()
+            with data_lock:
+                clients = vlessenc_clients(data)
+            inbound = {
+                'tag': VLESSENC_INBOUND_TAG,
+                'port': listen_port,
+                'protocol': 'vless',
+                'settings': {'clients': clients, 'decryption': decryption},
+                'streamSettings': {
+                    'network': 'tcp',
+                    'security': 'tls',
+                    'tlsSettings': {
+                        'serverName': sni,
+                        'certificates': [{'certificateFile': cert_file,
+                                          'keyFile': key_file}],
+                    },
+                },
+                'sniffing': {'enabled': True,
+                             'destOverride': ['http', 'tls', 'quic']},
+            }
+            xray_path = Path('/etc/hysteria/xray.json')
+            if not Path('/usr/local/bin/xray').exists():
+                raise RuntimeError('Xray 核心未安装')
+            config = (json.loads(xray_path.read_text(encoding='utf-8'))
+                      if xray_path.exists() else {'log': {'loglevel': 'warning'},
+                                                  'outbounds': [{'protocol': 'freedom',
+                                                                 'tag': 'direct'}]})
+            config = upsert_managed_inbound(config, VLESSENC_INBOUND_TAG, inbound)
+            meter_cfg = portal_path.parent / 'usage-meter-config.json'
+            if meter_cfg.exists():
+                meter = json.loads(meter_cfg.read_text(encoding='utf-8')).get('reality') or {}
+                address = meter.get('address', '')
+                if address:
+                    if not address.startswith('127.0.0.1:'):
+                        raise ValueError('统计接口必须为回环地址')
+                    stats_path = Path(__file__).parent / 'usage-meter-xray-config-20261007-v1.py'
+                    spec = importlib.util.spec_from_file_location('portal_stats_cfg', stats_path)
+                    mod = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(mod)
+                    config = mod.add_stats(config, int(address.rsplit(':', 1)[1]))
+            with reality_apply_lock:
+                apply_xray_config_transaction(
+                    config, config_path=str(xray_path),
+                    binary='/usr/local/bin/xray',
+                    restart=not unit_suspended('xray'))
+            new_cfg = {'port': listen_port, 'domain': domain, 'sni': sni,
+                       'decryption': decryption, 'encryption': encryption}
+            new_cfg['uri'] = vlessenc_uri_for_user(new_cfg, MASTER_USER_ID, public_ip,
+                                                   label='VLESS-Enc-' + domain)
+            with data_lock:
+                data['vlessenc_config'] = new_cfg
+            save_data()
+            firewall_port(listen_port, 'tcp', open_=True)
+            return new_cfg
+
         def _h_post_manage_vmess(self, prefix):
             """POST /manage-vmess —— 独立启停 VMess，不影响 Reality。
 
@@ -6619,6 +6894,92 @@ WantedBy=multi-user.target
                     'sni': vcfg.get('sni', ''),
                     'ws_path': vcfg.get('ws_path', ''),
                     'port': vcfg.get('port', 0) if active else 0,
+                    'qr_svg': qr_svg,
+                },
+            })
+
+        def _h_post_manage_vlessenc(self, prefix):
+            """POST /manage-vlessenc —— 独立启停 VLESS Encryption。
+
+            与 VMess 同样的关键约束：关闭时只移除自己的入站并**重启** Xray
+            （restart 而非 stop），Reality / VMess 的用户只会短暂重连。
+            """
+            if not self.is_authenticated():
+                return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
+            try:
+                length = int(self.headers.get('Content-Length', 0))
+                body = self.rfile.read(length).decode('utf-8') if length > 0 else ''
+                form = parse_qs(body)
+                action = form.get('action', ['toggle'])[0]
+                xray_path = Path('/etc/hysteria/xray.json')
+                config = (json.loads(xray_path.read_text(encoding='utf-8'))
+                          if xray_path.exists() else None)
+                enabled = bool(config) and has_managed_inbound(config, VLESSENC_INBOUND_TAG)
+                if action == 'toggle':
+                    action = 'disable' if enabled else 'enable'
+                if action not in ('enable', 'disable'):
+                    return self.reply_json(400, {'ok': False, 'error': 'Invalid action'})
+                if action == 'enable':
+                    if unit_suspended('xray'):
+                        return self.reply_json(409, {'ok': False, 'error':
+                            '节点因流量超额停用中，VLESS Encryption 将在控制台恢复节点时一并恢复'})
+                    cfg = self._apply_vlessenc_enable()
+                    return self.reply_json(200, {'ok': True, 'active': True,
+                                                 'port': cfg['port'], 'uri': cfg['uri']})
+                if not enabled:
+                    return self.reply_json(200, {'ok': True, 'active': False,
+                                                 'message': 'VLESS Encryption 本来就没有启用'})
+                with data_lock:
+                    closed_port = int((data.get('vlessenc_config') or {}).get('port') or 0)
+                remove_managed_inbound(config, VLESSENC_INBOUND_TAG)
+                with reality_apply_lock:
+                    apply_xray_config_transaction(
+                        config, config_path=str(xray_path),
+                        binary='/usr/local/bin/xray',
+                        restart=not unit_suspended('xray'))
+                with data_lock:
+                    data.pop('vlessenc_config', None)
+                save_data()
+                if closed_port:
+                    firewall_port(closed_port, 'tcp', open_=False)
+                return self.reply_json(200, {'ok': True, 'active': False})
+            except Exception as exc:
+                return self.reply_json(500, {'ok': False, 'error': str(exc)})
+
+        def _h_get_vlessenc_status(self, subpath):
+            """GET /vlessenc-status —— 与 VMess 一致，以实际入站为准。"""
+            if not self.is_authenticated():
+                return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
+            installed = Path('/usr/local/bin/xray').exists()
+            xray_path = Path('/etc/hysteria/xray.json')
+            active = False
+            if xray_path.exists():
+                try:
+                    active = has_managed_inbound(
+                        json.loads(xray_path.read_text(encoding='utf-8')),
+                        VLESSENC_INBOUND_TAG)
+                except Exception:
+                    active = False
+            with data_lock:
+                ecfg = dict(data.get('vlessenc_config') or {})
+            qr_svg = ''
+            if active and ecfg.get('uri'):
+                try:
+                    qr = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'],
+                                        input=ecfg['uri'].encode('utf-8'),
+                                        capture_output=True, timeout=3)
+                    if qr.returncode == 0:
+                        qr_svg = qr.stdout.decode('utf-8')
+                except Exception as exc:
+                    _log_ignored('vlessenc_qr', exc)
+            return self.reply_json(200, {
+                'ok': True, 'installed': installed, 'active': active,
+                'config': {
+                    'uri': ecfg.get('uri', '') if active else '',
+                    'uuid': reality_uuid_for_user(MASTER_USER_ID) if active else '',
+                    'domain': ecfg.get('domain', ''),
+                    'sni': ecfg.get('sni', ''),
+                    'port': ecfg.get('port', 0) if active else 0,
                     'qr_svg': qr_svg,
                 },
             })
@@ -7091,6 +7452,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                         d_snap = {
                             'reality': dict(data.get('reality_config') or {}),
                             'vmess': dict(data.get('vmess_config') or {}),
+                            'vlessenc': dict(data.get('vlessenc_config') or {}),
                             'warp_enabled': bool(data.get('warp_enabled')),
                             'users_count': len(data.get('users', {})),
                             'proxy_services': list(data.get('proxy_services') or []),
@@ -7102,9 +7464,11 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                                            .read_text(encoding='utf-8'))
                         d_snap['vmess_inbound'] = has_managed_inbound(_xcfg, VMESS_INBOUND_TAG)
                         d_snap['reality_inbound'] = has_managed_inbound(_xcfg, REALITY_INBOUND_TAG)
+                        d_snap['vlessenc_inbound'] = has_managed_inbound(_xcfg, VLESSENC_INBOUND_TAG)
                     except Exception:
                         d_snap['vmess_inbound'] = False
                         d_snap['reality_inbound'] = False
+                        d_snap['vlessenc_inbound'] = False
 
                     def _svc_active(unit):
                         try:
@@ -7197,6 +7561,21 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                                    if d_snap['vmess'].get('ws_path') else {}),
                                 **({'sni': d_snap['vmess']['sni']}
                                    if d_snap['vmess'].get('sni') else {}),
+                            ),
+                            # VLESS Encryption：同样只暴露客户端需要的参数，
+                            # decryption（服务端私钥）绝不出现在这里。
+                            'vlessenc': dict(
+                                {
+                                    'installed': _bin('xray'),
+                                    'active': d_snap['vlessenc_inbound'],
+                                    'configured': bool(d_snap['vlessenc'].get('domain')),
+                                },
+                                **({'port': int(d_snap['vlessenc'].get('port') or 0)}
+                                   if d_snap['vlessenc'].get('port') else {}),
+                                **({'domain': d_snap['vlessenc']['domain']}
+                                   if d_snap['vlessenc'].get('domain') else {}),
+                                **({'sni': d_snap['vlessenc']['sni']}
+                                   if d_snap['vlessenc'].get('sni') else {}),
                             ),
                         },
                         'extras': {
@@ -7340,7 +7719,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 uri, clash_yaml, sing_json = artifacts(
                     m, auth_override=pwd, name_override=f"Hy2-{target_uid}",
                     reality=_active_reality_config(), user_id=target_uid,
-                    vmess=_active_vmess_config())
+                    vmess=_active_vmess_config(),
+                    vlessenc=_active_vlessenc_config())
 
                 if action_file == 'clash.yaml':
                     return self.reply(200, clash_yaml.encode('utf-8'), 'application/yaml')
@@ -7381,6 +7761,9 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
 
             if subpath == 'vmess-status':
                 return self._h_get_vmess_status(subpath)
+
+            if subpath == 'vlessenc-status':
+                return self._h_get_vlessenc_status(subpath)
 
             if subpath == 'bbr-status':
                 return self._h_get_bbr_status(subpath)
@@ -7429,7 +7812,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 uri, clash_yaml, sing_json = artifacts(
                     m, auth_override=pwd, name_override=f"Hy2-{target_uid}",
                     reality=_active_reality_config(), user_id=target_uid,
-                    vmess=_active_vmess_config())
+                    vmess=_active_vmess_config(),
+                    vlessenc=_active_vlessenc_config())
                 qr_svg = ""
                 try:
                     qr_svg = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'], input=uri.encode(), capture_output=True, check=True, timeout=10).stdout.decode('utf-8')
@@ -8203,7 +8587,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
         if Path('/etc/hysteria/xray.json').exists():
             with data_lock:
                 _want = {REALITY_INBOUND_TAG: reality_clients(data),
-                         VMESS_INBOUND_TAG: vmess_clients(data)}
+                         VMESS_INBOUND_TAG: vmess_clients(data),
+                         VLESSENC_INBOUND_TAG: vlessenc_clients(data)}
             _got = {}
             try:
                 _cfg = json.loads(Path('/etc/hysteria/xray.json').read_text(encoding='utf-8'))

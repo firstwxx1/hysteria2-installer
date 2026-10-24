@@ -84,7 +84,7 @@ class InformationArchitectureTest(unittest.TestCase):
     def test_reality_group_separates_cert_and_bbr(self):
         pane = _pane(self.page, 'reality')
         self.assertEqual(re.findall(r'data-subtab="([a-z-]+)"', pane),
-                         ['reality-node', 'vmess', 'cert', 'bbr'])
+                         ['reality-node', 'vmess', 'vlessenc', 'cert', 'bbr'])
         self.assertIn('cert-badge', _sub(pane, 'cert'))
         self.assertIn('bbr-current-text', _sub(pane, 'bbr'))
         self.assertNotIn('cert-badge', _sub(pane, 'reality-node'))
@@ -92,6 +92,8 @@ class InformationArchitectureTest(unittest.TestCase):
         # VMess 与 Reality 是两个独立开关，不能混进同一个子页。
         self.assertIn('vmess-badge', _sub(pane, 'vmess'))
         self.assertNotIn('vmess-badge', _sub(pane, 'reality-node'))
+        self.assertIn('vlessenc-badge', _sub(pane, 'vlessenc'))
+        self.assertNotIn('vlessenc-badge', _sub(pane, 'vmess'))
 
     def test_subtab_ids_are_unique(self):
         ids = re.findall(r'id="(sub-[a-z-]+)"', self.page)

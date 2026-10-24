@@ -490,6 +490,7 @@ document.querySelectorAll('[data-tab]').forEach(btn => {
     if (btn.dataset.tab === 'reality') {
       checkRealityStatus();
       checkVmessStatus();
+      checkVlessencStatus();
     }
   });
 });
@@ -502,6 +503,7 @@ document.querySelectorAll('.subtab-btn').forEach(btn => {
     switchSubtab(paneId, btn.dataset.subtab);
     // 子页状态同样可能被终端 / REST API / 整机停用改过，切进来时重新拉一次。
     if (btn.dataset.subtab === 'vmess') checkVmessStatus();
+    if (btn.dataset.subtab === 'vlessenc') checkVlessencStatus();
     if (btn.dataset.subtab === 'reality-node') checkRealityStatus();
     history.replaceState(null, null, '#' + paneId + '/' + btn.dataset.subtab);
   });
@@ -516,6 +518,7 @@ if (location.hash) {
     if (tabId === 'reality') {
       checkRealityStatus();
       checkVmessStatus();
+      checkVlessencStatus();
     }
   }
 }
@@ -1432,6 +1435,97 @@ if (btnCopyVmessUri) {
 }
 
 checkVmessStatus();
+
+// VLESS Encryption 卡片：与 VMess / Reality 各自独立一个开关。
+const vlessencBadge = document.getElementById('vlessenc-badge');
+const btnToggleVlessenc = document.getElementById('btn-toggle-vlessenc');
+const vlessencContentBox = document.getElementById('vlessenc-content-box');
+const vlessencUriVal = document.getElementById('vlessenc-uri-val');
+const vlessencQrBox = document.getElementById('vlessenc-qr-box');
+const vlessencDomainVal = document.getElementById('vlessenc-domain-val');
+const vlessencUuidVal = document.getElementById('vlessenc-uuid-val');
+const vlessencTcpVal = document.getElementById('vlessenc-tcp-val');
+const btnCopyVlessencUri = document.getElementById('btn-copy-vlessenc-uri');
+
+async function checkVlessencStatus() {
+  if (!vlessencBadge) return;
+  try {
+    const res = await fetch(location.pathname + 'vlessenc-status', { credentials: 'same-origin' });
+    if (!res.ok) return;
+    const json = await res.json();
+    if (!json.ok) return;
+    if (!json.installed) {
+      vlessencBadge.textContent = '● 未安装 Xray 核心';
+      vlessencBadge.style.background = '#fff1f0';
+      vlessencBadge.style.color = '#cf3c3c';
+      if (btnToggleVlessenc) btnToggleVlessenc.style.display = 'none';
+      if (vlessencContentBox) vlessencContentBox.style.display = 'none';
+      return;
+    }
+    if (btnToggleVlessenc) btnToggleVlessenc.style.display = 'inline-flex';
+    if (json.active) {
+      vlessencBadge.textContent = '● 运行中 (TCP ' + (json.config.port || '--') + ')';
+      vlessencBadge.style.background = '#eaf3de';
+      vlessencBadge.style.color = '#27500a';
+      btnToggleVlessenc.textContent = '已开启 (点击关闭)';
+      btnToggleVlessenc.className = 'toggle-btn on';
+      if (vlessencContentBox) vlessencContentBox.style.display = 'block';
+      const cfg = json.config || {};
+      if (vlessencUriVal) vlessencUriVal.value = cfg.uri || '';
+      if (vlessencQrBox) vlessencQrBox.innerHTML = cfg.qr_svg || '';
+      if (vlessencDomainVal) vlessencDomainVal.textContent = (cfg.domain || '-') + (cfg.sni && cfg.sni !== cfg.domain ? ' / ' + cfg.sni : '');
+      if (vlessencUuidVal) vlessencUuidVal.textContent = cfg.uuid || '-';
+      if (vlessencTcpVal) vlessencTcpVal.textContent = 'TCP ' + (cfg.port || '--');
+      const portTag = document.getElementById('vlessenc-port-tag');
+      if (portTag) portTag.textContent = 'TCP ' + (cfg.port || '--');
+    } else {
+      vlessencBadge.textContent = '○ 已关闭';
+      vlessencBadge.style.background = '#f1efe8';
+      vlessencBadge.style.color = '#5f5e5a';
+      btnToggleVlessenc.textContent = '已关闭 (点击开启)';
+      btnToggleVlessenc.className = 'toggle-btn off';
+      if (vlessencContentBox) vlessencContentBox.style.display = 'none';
+    }
+  } catch (_) {}
+}
+
+if (btnToggleVlessenc) {
+  btnToggleVlessenc.addEventListener('click', async () => {
+    btnToggleVlessenc.disabled = true;
+    const orig = btnToggleVlessenc.textContent;
+    btnToggleVlessenc.textContent = '切换中...';
+    try {
+      const res = await fetch(location.pathname + 'manage-vlessenc', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: 'action=toggle'
+      });
+      const json = await res.json();
+      if (!json.ok) alert(json.error || '切换失败');
+      await checkVlessencStatus();
+    } catch (e) {
+      alert('请求异常: ' + e.message);
+    } finally {
+      btnToggleVlessenc.disabled = false;
+      btnToggleVlessenc.textContent = orig;
+    }
+  });
+}
+
+if (btnCopyVlessencUri) {
+  btnCopyVlessencUri.addEventListener('click', () => {
+    if (vlessencUriVal && vlessencUriVal.value) {
+      navigator.clipboard.writeText(vlessencUriVal.value).then(() => {
+        const orig = btnCopyVlessencUri.textContent;
+        btnCopyVlessencUri.textContent = '✓ 已复制直链';
+        setTimeout(() => btnCopyVlessencUri.textContent = orig, 1500);
+      });
+    }
+  });
+}
+
+checkVlessencStatus();
 
 // BBR 状态获取与一键切换交互
 const bbrBadge = document.getElementById('bbr-badge');

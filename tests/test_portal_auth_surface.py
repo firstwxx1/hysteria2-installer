@@ -35,8 +35,8 @@ META = dict(
 POST_ENDPOINTS = {
     'do-upgrade', 'install-amneziawg', 'install-gost', 'install-warp',
     'install-xray', 'login', 'manage-amneziawg', 'manage-proxy',
-    'manage-outbounds', 'manage-reality', 'manage-user', 'manage-vmess', 'manage-warp',
-    'reboot-server', 'set-bbr',
+    'manage-outbounds', 'manage-reality', 'manage-user', 'manage-vlessenc',
+    'manage-vmess', 'manage-warp', 'reboot-server', 'set-bbr',
 }
 
 # 集群 API：不带 token 前缀，走 Bearer api_key

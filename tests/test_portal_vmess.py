@@ -215,5 +215,87 @@ class ManagedInboundStatusTests(unittest.TestCase):
         self.assertFalse(portal.has_managed_inbound(cfg, portal.VMESS_INBOUND_TAG))
 
 
+class VlessEncryptionTests(unittest.TestCase):
+    """VLESS Encryption 的核心不变量。
+
+    锁住两条会静默失效的规则：
+      1. 客户端 clients **不能带 flow**（那是 Reality 专用，带上会让握手失败）；
+      2. 密钥必须来自同一次 `xray vlessenc` —— 混用两组的 decryption/encryption
+         会让握手直接失败（实测过）。
+    """
+
+    CFG = {'port': 2088, 'domain': 'node.example.com', 'sni': 'node.example.com',
+           'encryption': 'mlkem768x25519plus.native.0rtt.abcDEF123_-xyz'}
+
+    def test_clients_have_no_flow_and_share_reality_uuid(self):
+        data = _data(alice=dict(ACTIVE))
+        clients = portal.vlessenc_clients(data)
+        self.assertEqual([c['email'] for c in clients], ['alice'])
+        self.assertNotIn('flow', clients[0])
+        # 同一用户与 Reality 用同一个 UUID（同一身份，两个通道）。
+        self.assertEqual(clients[0]['id'], portal.reality_uuid_for_user('alice'))
+
+    def test_disabled_and_expired_are_excluded(self):
+        import time
+        now = int(time.time())
+        data = _data(ok=dict(ACTIVE), off=dict(ACTIVE, status='disabled'),
+                     old=dict(ACTIVE, expires_at=now - 5))
+        self.assertEqual([c['email'] for c in portal.vlessenc_clients(data)], ['ok'])
+
+    def test_placeholder_when_nobody_active(self):
+        data = _data(alice=dict(ACTIVE, status='disabled'))
+        clients = portal.vlessenc_clients(data)
+        self.assertEqual(len(clients), 1)
+        self.assertEqual(clients[0]['email'], 'placeholder')
+        self.assertNotIn('flow', clients[0])
+
+    def test_uri_carries_encryption_verbatim(self):
+        from urllib.parse import parse_qs, urlsplit
+        uri = portal.vlessenc_uri_for_user(self.CFG, 'alice', '203.0.113.9')
+        self.assertTrue(uri.startswith('vless://'))
+        query = parse_qs(urlsplit(uri).query)
+        # encryption 必须逐字还原：任何截断都会导致握手失败。
+        self.assertEqual(query['encryption'][0], self.CFG['encryption'])
+        self.assertEqual(query['security'][0], 'tls')
+        self.assertIn(portal.reality_uuid_for_user('alice'), uri)
+
+    def test_uri_requires_encryption(self):
+        self.assertEqual(portal.vlessenc_uri_for_user(
+            {'port': 2088, 'domain': 'node.example.com'}, 'alice', '1.2.3.4'), '')
+
+    def test_generated_pair_matches_expected_shape(self):
+        import subprocess
+        from unittest.mock import patch
+        stdout = ('Authentication: X25519\n'
+                  '"decryption": "mlkem768x25519plus.native.600s.AAAABBBBCCCC"\n'
+                  '"encryption": "mlkem768x25519plus.native.0rtt.DDDDEEEEFFFF"\n')
+        with patch.object(subprocess, 'run',
+                          return_value=subprocess.CompletedProcess([], 0, stdout, '')):
+            dec, enc = portal.generate_vless_encryption_pair()
+        self.assertEqual(dec, 'mlkem768x25519plus.native.600s.AAAABBBBCCCC')
+        self.assertEqual(enc, 'mlkem768x25519plus.native.0rtt.DDDDEEEEFFFF')
+
+    def test_bad_decryption_is_rejected(self):
+        import subprocess
+        from unittest.mock import patch
+        stdout = '"decryption": "garbage"\n"encryption": "also-garbage"\n'
+        with patch.object(subprocess, 'run',
+                          return_value=subprocess.CompletedProcess([], 0, stdout, '')):
+            with self.assertRaises(RuntimeError):
+                portal.generate_vless_encryption_pair()
+
+    def test_subscription_includes_vlessenc(self):
+        meta = {'server_name': 'node.example.com', 'public_ip': '203.0.113.9',
+                'listen_port': 19984, 'auth_password': 'pw'}
+        _, clash, sing = portal.artifacts(meta, user_id='alice', vlessenc=self.CFG)
+        proxies = json.loads(clash)['proxies']
+        vless = next(p for p in proxies if p['type'] == 'vless')
+        self.assertEqual(vless['encryption'], self.CFG['encryption'])
+        self.assertEqual(vless['network'], 'tcp')
+        sing_doc = json.loads(sing)
+        out = next(o for o in sing_doc['outbounds'] if o.get('type') == 'vless')
+        self.assertEqual(out['encryption'], self.CFG['encryption'])
+
+
 if __name__ == '__main__':
     unittest.main()
