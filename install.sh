@@ -1362,6 +1362,8 @@ Before=hysteria-server.service
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/bin/bash -c "iptables -t nat -C PREROUTING -p udp --dport ${s_port}:${e_port} -j REDIRECT --to-ports ${l_port} 2>/dev/null || iptables -t nat -A PREROUTING -p udp --dport ${s_port}:${e_port} -j REDIRECT --to-ports ${l_port}; iptables -t nat -C OUTPUT -p udp --dport ${s_port}:${e_port} -j REDIRECT --to-ports ${l_port} 2>/dev/null || iptables -t nat -A OUTPUT -p udp --dport ${s_port}:${e_port} -j REDIRECT --to-ports ${l_port}"
+MemoryHigh=128M
+MemoryMax=256M
 
 [Install]
 WantedBy=multi-user.target
@@ -1785,6 +1787,8 @@ EOCS2
               '[Service]' \
               'Type=oneshot' \
               'ExecStart=/usr/local/bin/hy2-cert-selfheal.sh' \
+MemoryHigh=128M
+MemoryMax=256M
               > /etc/systemd/system/hy2-cert-selfheal.service
             printf '%s\n' \
               '[Unit]' \
@@ -1892,6 +1896,8 @@ Type=simple
 User=root
 WorkingDirectory=${HY2_DIR}
 ExecStart=${HY2_BIN} server -c ${HY2_CONFIG}
+MemoryHigh=128M
+MemoryMax=256M
 Restart=on-failure
 RestartSec=10
 LimitNOFILE=65535
@@ -2375,6 +2381,8 @@ Type=simple
 User=root
 WorkingDirectory=${HY2_DIR}
 ExecStart=/usr/bin/python3 ${HY2_DIR}/portal.py serve ${HY2_DIR}/portal.json
+MemoryHigh=128M
+MemoryMax=256M
 Restart=always
 RestartSec=3
 UMask=0077
@@ -2440,6 +2448,8 @@ After=network.target
 [Service]
 Type=oneshot
 ExecStart=/usr/local/bin/hy2-cert-selfheal.sh
+MemoryHigh=128M
+MemoryMax=256M
 EOCU
 
     cat > /etc/systemd/system/hy2-cert-selfheal.timer <<'EOCT'
@@ -2639,6 +2649,8 @@ Wants=network-online.target
 [Service]
 Type=simple
 ExecStart=${WP_BIN} -c ${WP_CFG}
+MemoryHigh=128M
+MemoryMax=256M
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=65535
@@ -2684,6 +2696,8 @@ After=network.target
 [Service]
 Type=oneshot
 ExecStart=/usr/local/bin/hy2-warp-watchdog.sh
+MemoryHigh=128M
+MemoryMax=256M
 EOF
 
     cat > /etc/systemd/system/hy2-warp-watchdog.timer <<EOF
@@ -2855,6 +2869,8 @@ Wants=network-online.target
 [Service]
 Type=simple
 ExecStart=${GOST_BIN} -C ${GOST_CONFIG} -R 30s
+MemoryHigh=128M
+MemoryMax=256M
 # 平滑重载: gost v3 收到 SIGHUP 会重新读取 -C 指定的配置文件
 ExecReload=/bin/kill -HUP \$MAINPID
 Restart=always

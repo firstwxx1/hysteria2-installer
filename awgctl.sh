@@ -468,6 +468,8 @@ RemainAfterExit=yes
 Environment=WG_QUICK_USERSPACE_IMPLEMENTATION=${AWG_GO_BIN}
 Environment=WG_ENDPOINT_RESOLUTION_RETRIES=infinity
 ExecStart=${AWG_QUICK_BIN} up ${AWG_LINK}
+MemoryHigh=128M
+MemoryMax=256M
 ExecStop=${AWG_QUICK_BIN} down ${AWG_LINK}
 ExecReload=/bin/bash -c 'exec ${AWG_BIN} syncconf ${AWG_LINK} <(exec ${AWG_QUICK_BIN} strip ${AWG_LINK})'
 TimeoutStopSec=20
