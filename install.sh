@@ -1454,6 +1454,16 @@ bandwidth:
   up: 1 gbps
   down: 1 gbps
 
+# QUIC 流控与移动网稳定参数（关闭 PMTUD 防 4G/5G 热点丢大包，放宽空闲超时）
+quic:
+  initStreamReceiveWindow: 8388608
+  maxStreamReceiveWindow: 8388608
+  initConnReceiveWindow: 20971520
+  maxConnReceiveWindow: 20971520
+  maxIdleTimeout: 60s
+  maxIncomingStreams: 1024
+  disablePathMTUDiscovery: true
+
 # Some IPv4-only VPS instances still receive IPv6 DNS answers but have no IPv6
 # default route. Use the default direct outbound over IPv4 so those answers do
 # not break requests to dual-stack sites such as YouTube.

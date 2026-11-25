@@ -3908,14 +3908,17 @@ def artifacts(m, auth_override=None, name_override=None, reality=None, user_id=N
     uri = f"hysteria2://{quote(password, safe='')}@{host}:{listen_port}?{urlencode(params)}#{quote(name)}"
     
     proxy = dict(name=name, type='hysteria2', server=host, port=listen_port,
-                 password=password, sni=server_name, **{'skip-cert-verify': is_insecure})
+                 password=password, sni=server_name,
+                 **{'skip-cert-verify': is_insecure, 'disable-mtu-discovery': True})
     sing = dict(type='hysteria2', tag=name, server=host, server_port=listen_port,
                 password=password, tls=dict(enabled=True, server_name=server_name, insecure=is_insecure))
     if hop_port_range:
         proxy['ports'] = str(listen_port) + ',' + hop_port_range
+        proxy['hop-interval'] = 60
         # sing-box 的 server_ports 每一项都必须是「起:止」区间（sing-quic ParsePorts），
         # 单写 "443" 会报 bad port range、整份配置加载失败。
         sing['server_ports'] = [f'{listen_port}:{listen_port}', hop_port_range.replace('-', ':')]
+        sing['hop_interval'] = '60s'
         del sing['server_port']
     if obfs_password:
         proxy.update({'obfs': 'salamander', 'obfs-password': obfs_password})
